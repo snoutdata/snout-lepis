@@ -1,0 +1,77 @@
+[package]
+name = "snout-lepis"
+description = "snout-lepis: one Postgres database spread over many plain Postgres nodes, behind a router that speaks the Postgres wire protocol."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/snoutdata/snout-lepis"
+rust-version = "1.98.1"
+publish = false
+
+[lib]
+name = "lepis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snout-lepis"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
+
+# TLS both ways: the certificate served to clients and the connections to nodes. ring is the
+# provider every other component already uses through rustls.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+
+# SCRAM-SHA-256 (scram.rs).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.4"
+
+# SQL is parsed by Postgres's own parser (L4): libpg_query, through pg_query (MIT).
+pg_query = "6"
+bytes = "1"
+# The admin API's JSON (L13) and the job log's arguments and progress.
+serde_json = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+[dev-dependencies]
+# The integration tests drive Lepis with an ordinary client.
+tokio-postgres = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+bytes = "1"
+
+
+# Written out from the stack's workspace, which this crate is published from.
+[lints.rust]
+# X13: no `unsafe` outside the pgrx boundary. The three extensions under ext/ opt out in
+# their own Cargo.toml when pgrx arrives, and nowhere else may.
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# For iterating on a build host: release speed without fat LTO's link time. Numbers that are
+# reported (sizes, the bench) come from `release`, never from this.
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+
+# Its own workspace: this repository is not part of any other.
+[workspace]

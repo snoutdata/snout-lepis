@@ -1,0 +1,2 @@
+# setup/distribute.sh runs in a Linux container: a CRLF checkout on Windows would not run.
+*.sh text eol=lf

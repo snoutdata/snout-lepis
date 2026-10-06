@@ -1,0 +1,138 @@
+# Lepis over three plain Postgres 18 servers, on one machine: one database whose tables are split
+# by a shard key across `home`, `node2` and `node3`, with a sample schema already distributed.
+#
+#   printf 'NODE_PASSWORD=%s\nLEPIS_SERVICE_PASSWORD=%s\nAPP_PASSWORD=%s\n' \
+#     "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > .env
+#   docker compose up -d --build --wait
+#
+# Every password comes from .env; there is no default one in this file, and a missing value stops
+# `docker compose up` with a sentence. The README beside the binary (../README.md, "Quick start")
+# is the guide.
+#
+# The nodes are stock `postgres:18` with the two settings Lepis's operations need (L1):
+# `wal_level = logical` (moving a range) and `max_prepared_transactions` (writes across nodes),
+# and SCRAM for every login (Lepis never holds a password; it logs into each node with the key a
+# client's SCRAM proof reveals). Only the router is published, on this machine alone: Postgres
+# on 6432 and its admin API (what `snoutdata shards` drives) on 7432, both over TLS with a
+# self-signed certificate `setup` writes to ./certs.
+
+name: lepis-example
+
+x-node: &node
+  image: docker.io/library/postgres:18
+  restart: unless-stopped
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_prepared_transactions=64
+    - -c
+    - password_encryption=scram-sha-256
+  environment:
+    POSTGRES_PASSWORD: ${NODE_PASSWORD:?NODE_PASSWORD is not set. Write .env first (README.md, Quick start)}
+    POSTGRES_DB: app
+    POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+  shm_size: 128mb
+  healthcheck:
+    test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "app"]
+    interval: 2s
+    timeout: 5s
+    retries: 60
+
+services:
+  # ---- The home node: the catalog (schema `lepis`), the global tables, and its share of the rows.
+  home:
+    <<: *node
+    volumes:
+      - home-data:/var/lib/postgresql
+
+  # ---- Two data nodes: their share of the sharded rows, and a copy of every reference table.
+  node2:
+    <<: *node
+    volumes:
+      - node2-data:/var/lib/postgresql
+
+  node3:
+    <<: *node
+    volumes:
+      - node3-data:/var/lib/postgresql
+
+  # ---- One-shot: roles, the sample schema and data, the catalog, and each node's fences.
+  # Runs on every `up` and does nothing once the cluster is distributed.
+  setup:
+    image: docker.io/library/postgres:18
+    restart: "no"
+    entrypoint: ["bash", "/setup/distribute.sh"]
+    environment:
+      PGPASSWORD: ${NODE_PASSWORD}
+      PGOPTIONS: -c client_min_messages=warning
+      APP_PASSWORD: ${APP_PASSWORD:?APP_PASSWORD is not set. Write .env first (README.md, Quick start)}
+      LEPIS_SERVICE_PASSWORD: ${LEPIS_SERVICE_PASSWORD:?LEPIS_SERVICE_PASSWORD is not set. Write .env first (README.md, Quick start)}
+      RANGES_PER_NODE: ${RANGES_PER_NODE:-4}
+    volumes:
+      - ./setup:/setup:ro
+      - ./certs:/certs
+      # The catalog's DDL is the router's own (src/catalog*.sql), never a copy of it.
+      - ../src:/lepis-src:ro
+    depends_on:
+      home:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+
+  # ---- The router. Applications connect here, and only here.
+  lepis:
+    image: ${LEPIS_IMAGE:-snout-lepis:local}
+    build:
+      context: ..
+      dockerfile: Containerfile
+    restart: unless-stopped
+    environment:
+      LEPIS_HOME: home:5432
+      # A private network of this machine's; across machines, use require or verify-full.
+      LEPIS_HOME_SSLMODE: disable
+      # A superuser on every node, with the same password everywhere (setup makes it).
+      LEPIS_SERVICE_USER: lepis
+      LEPIS_SERVICE_PASSWORD: ${LEPIS_SERVICE_PASSWORD}
+      LEPIS_SERVICE_DATABASE: app
+      LEPIS_TLS_CERT: /certs/lepis.crt
+      LEPIS_TLS_KEY: /certs/lepis.key
+      # The admin API. Off loopback it must have TLS, which the certificate above gives it.
+      LEPIS_ADMIN_ADDR: 0.0.0.0:7432
+      LEPIS_ADMIN_TOKEN: ${LEPIS_ADMIN_TOKEN:?LEPIS_ADMIN_TOKEN is not set. Write .env first (README.md, Quick start)}
+      LEPIS_LOG: ${LEPIS_LOG:-info}
+      NO_COLOR: "1"
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - ${ROUTER_BIND:-127.0.0.1}:${ROUTER_PORT:-6432}:5432
+      - ${ROUTER_BIND:-127.0.0.1}:${ADMIN_PORT:-7432}:7432
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  # ---- A write load through the router, for "Split while a load runs" (README.md). Not started
+  # by `up`: `docker compose run --rm load [seconds]`. Every transaction is one new order for a
+  # random tenant; pgbench retries one the router aborts with 40001 at a cutover, as a client
+  # should.
+  load:
+    image: docker.io/library/postgres:18
+    profiles: [load]
+    restart: "no"
+    entrypoint: ["bash", "-c", "exec pgbench -n -c 4 -j 2 --max-tries 20 -T $${1:-60} -f /setup/load.sql -P 10 \"$$URL\"", "load"]
+    environment:
+      URL: postgresql://app:${APP_PASSWORD}@lepis:5432/app?sslmode=require
+    volumes:
+      - ./setup:/setup:ro
+    depends_on:
+      lepis:
+        condition: service_started
+
+volumes:
+  home-data:
+  node2-data:
+  node3-data:

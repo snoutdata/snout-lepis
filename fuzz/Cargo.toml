@@ -1,0 +1,52 @@
+# snout-lepis's fuzz targets, run by scripts/fuzz.sh with cargo-fuzz on a pinned nightly.
+# Its own workspace, so the nightly-only libFuzzer build never touches the crate's.
+[package]
+name = "snout-lepis-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snout-lepis = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[workspace]
+
+[[bin]]
+name = "lepis_analyze"
+path = "fuzz_targets/lepis_analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lepis_copy"
+path = "fuzz_targets/lepis_copy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lepis_hash"
+path = "fuzz_targets/lepis_hash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lepis_scram"
+path = "fuzz_targets/lepis_scram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lepis_wire"
+path = "fuzz_targets/lepis_wire.rs"
+test = false
+doc = false
+bench = false
