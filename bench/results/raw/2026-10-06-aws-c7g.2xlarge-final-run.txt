@@ -1,0 +1,81 @@
+== passthrough 16
+== select via direct
+   tps=122727.933023 latency=0.130ms p50=0.123ms p99=0.312ms
+== select via lepis
+   tps=82715.112730 latency=0.193ms p50=0.174ms p99=0.435ms
+== select via pgbouncer
+   tps=58220.337593 latency=0.275ms p50=0.271ms p99=0.448ms
+== tpcb via direct
+   tps=5245.438956 latency=3.050ms p50=2.065ms p99=9.501ms
+== tpcb via lepis
+   tps=4899.140017 latency=3.266ms p50=2.801ms p99=10.538ms
+== tpcb via pgbouncer
+   tps=5103.953447 latency=3.135ms p50=2.465ms p99=9.603ms
+== connect via direct
+   tps=348.714253 latency=45.883ms p50=20.676ms p99=57.478ms
+== connect via lepis
+   tps=321.296371 latency=49.798ms p50=21.314ms p99=56.773ms
+== connect via pgbouncer
+   tps=285.397625 latency=56.062ms p50=27.869ms p99=42.761ms
+wrote /srv/snoutpod/bench/src/lepis/bench/results/2026-10-06-aws-c7g.2xlarge-final.md
+rc 0
+== passthrough select 64
+== select via direct
+   tps=111178.064610 latency=0.576ms p50=0.484ms p99=1.720ms
+== select via lepis
+   tps=90827.899457 latency=0.705ms p50=0.641ms p99=1.935ms
+== select via pgbouncer
+   tps=56119.321205 latency=1.140ms p50=1.139ms p99=1.406ms
+wrote /srv/snoutpod/bench/src/lepis/bench/results/2026-10-06-aws-c7g.2xlarge-final-c64.md
+rc 0
+== routed 16
+NOTICE:  trigger "epoch_moved" for relation "lepis.cluster" does not exist, skipping
+NOTICE:  trigger "job_created" for relation "lepis.job" does not exist, skipping
+== select via direct
+   tps=122108.570152 latency=0.131ms p50=0.124ms p99=0.311ms
+== select via lepis-passthrough
+   tps=82599.700497 latency=0.194ms p50=0.174ms p99=0.439ms
+== select via lepis-session
+   tps=66844.314106 latency=0.239ms p50=0.229ms p99=0.517ms
+== select via lepis-transaction
+   tps=65421.104434 latency=0.245ms p50=0.238ms p99=0.508ms
+== select via pgbouncer
+   tps=57524.713867 latency=0.278ms p50=0.274ms p99=0.454ms
+== tpcb via direct
+   tps=5003.502201 latency=3.198ms p50=2.355ms p99=9.888ms
+== tpcb via lepis-passthrough
+   tps=4385.257271 latency=3.649ms p50=2.937ms p99=11.454ms
+== tpcb via lepis-session
+   tps=4457.190745 latency=3.590ms p50=2.907ms p99=12.525ms
+== tpcb via lepis-transaction
+   tps=4849.226719 latency=3.299ms p50=2.869ms p99=9.639ms
+== tpcb via pgbouncer
+   tps=4850.750234 latency=3.298ms p50=2.796ms p99=10.893ms
+== connect via direct
+   tps=358.411066 latency=44.641ms p50=20.070ms p99=56.238ms
+== connect via lepis-passthrough
+   tps=322.684000 latency=49.584ms p50=20.980ms p99=56.498ms
+== connect via lepis-session
+   tps=333.067342 latency=48.038ms p50=20.713ms p99=54.047ms
+== connect via lepis-transaction
+   tps=340.576331 latency=46.979ms p50=20.102ms p99=52.693ms
+== connect via pgbouncer
+   tps=285.441982 latency=56.053ms p50=27.888ms p99=42.775ms
+wrote /srv/snoutpod/bench/src/lepis/bench/results/2026-10-06-aws-c7g.2xlarge-final-routed.md
+rc 0
+== routed select 64
+NOTICE:  trigger "epoch_moved" for relation "lepis.cluster" does not exist, skipping
+NOTICE:  trigger "job_created" for relation "lepis.job" does not exist, skipping
+== select via direct
+   tps=113452.945158 latency=0.564ms p50=0.471ms p99=1.725ms
+== select via lepis-passthrough
+   tps=91416.736052 latency=0.700ms p50=0.636ms p99=1.903ms
+== select via lepis-session
+   tps=81341.854665 latency=0.787ms p50=0.701ms p99=2.091ms
+== select via lepis-transaction
+   tps=79971.908300 latency=0.800ms p50=0.704ms p99=2.174ms
+== select via pgbouncer
+   tps=56618.541655 latency=1.130ms p50=1.126ms p99=1.401ms
+wrote /srv/snoutpod/bench/src/lepis/bench/results/2026-10-06-aws-c7g.2xlarge-final-routed-c64.md
+rc 0
+ALLDONE
