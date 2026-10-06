@@ -4454,25 +4454,32 @@ impl Settings {
 pub(crate) mod settings {
 	use std::collections::HashMap;
 	use std::sync::{Arc, Mutex, OnceLock};
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	use super::Settings;
+	use crate::backend::Backend;
 	use crate::server::App;
 
 	/// How often a session looks at the cluster's settings again.
 	pub const FRESH: Duration = Duration::from_secs(2);
-	/// How often the one reader per cluster reads them from the home node.
+	/// How old a reading may be before the next session to ask reads them again.
 	const READ_EVERY: Duration = Duration::from_secs(1);
 
-	type Cache = HashMap<String, Arc<Settings>>;
+	struct Entry {
+		settings: Arc<Settings>,
+		read_at: Instant,
+		reading: bool,
+		/// The connection the last reading used, kept for the next one.
+		conn: Option<Backend>,
+	}
 
-	fn cache() -> &'static Mutex<Cache> {
-		static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+	fn cache() -> &'static Mutex<HashMap<String, Entry>> {
+		static CACHE: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
 		CACHE.get_or_init(Default::default)
 	}
 
 	/// One reading over `b`, or None (no column yet, the node said no, or it went away).
-	async fn read(b: &mut crate::backend::Backend) -> Option<Settings> {
+	async fn read(b: &mut Backend) -> Option<Settings> {
 		let rows = b
 			.query("select settings::text from lepis.cluster where id = 1", &[])
 			.await
@@ -4485,49 +4492,60 @@ pub(crate) mod settings {
 		)
 	}
 
-	/// The cluster's settings. The first session of a cluster in this process reads them and
-	/// starts the one task that reads them again every second over one connection, so no
-	/// session waits on, or logs in for, a reading after that. A cluster without the column,
-	/// or a home node that does not answer, has the defaults.
+	/// The cluster's settings. A reading is shared by every session of the process for a
+	/// second; then the first session to ask reads them again (over the connection the last
+	/// reading kept) while the others go on with the reading they have. A cluster without the
+	/// column, or a home node that does not answer, has the defaults.
 	pub async fn get(app: &Arc<App>) -> Arc<Settings> {
 		let key = format!("{}/{}", app.config.home, app.config.service.database);
-		if let Some(s) = cache().lock().expect("settings").get(&key) {
-			return s.clone();
-		}
-		let mut conn = crate::twopc::home_service(app, "settings").await.ok();
-		let first = match conn.as_mut() {
-			Some(b) => read(b).await.unwrap_or_default(),
-			None => Settings::default(),
-		};
-		let first = Arc::new(first);
-		{
+		let conn = {
 			let mut c = cache().lock().expect("settings");
-			if let Some(s) = c.get(&key) {
-				// Another session got there first, and its reader runs.
-				return s.clone();
+			match c.get_mut(&key) {
+				// A reading under way is left to itself (unless its session went away mid-read
+				// and left it marked for 10 s).
+				Some(e)
+					if e.read_at.elapsed() < READ_EVERY
+						|| (e.reading && e.read_at.elapsed() < Duration::from_secs(10)) =>
+				{
+					return e.settings.clone();
+				}
+				Some(e) => {
+					e.reading = true;
+					e.conn.take()
+				}
+				None => None,
 			}
-			c.insert(key.clone(), first.clone());
+		};
+		let mut conn = match conn {
+			Some(b) => Some(b),
+			None => crate::twopc::home_service(app, "settings").await.ok(),
+		};
+		let mut fresh = match conn.as_mut() {
+			Some(b) => read(b).await,
+			None => None,
+		};
+		if fresh.is_none() && conn.is_some() {
+			// The kept connection went away (or belonged to a runtime that ended): once more.
+			conn = crate::twopc::home_service(app, "settings").await.ok();
+			if let Some(b) = conn.as_mut() {
+				fresh = read(b).await;
+			}
 		}
-		let app = app.clone();
-		tokio::spawn(async move {
-			loop {
-				tokio::time::sleep(READ_EVERY).await;
-				if conn.is_none() {
-					conn = crate::twopc::home_service(&app, "settings").await.ok();
-				}
-				let Some(b) = conn.as_mut() else { continue };
-				match read(b).await {
-					Some(s) => {
-						let mut c = cache().lock().expect("settings");
-						if c.get(&key).is_none_or(|old| **old != s) {
-							c.insert(key.clone(), Arc::new(s));
-						}
-					}
-					None => conn = None,
-				}
-			}
-		});
-		first
+		if fresh.is_none() {
+			conn = None;
+		}
+		let settings = Arc::new(fresh.unwrap_or_default());
+		let mut c = cache().lock().expect("settings");
+		c.insert(
+			key,
+			Entry {
+				settings: settings.clone(),
+				read_at: Instant::now(),
+				reading: false,
+				conn,
+			},
+		);
+		settings
 	}
 }
 
