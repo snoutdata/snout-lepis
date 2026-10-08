@@ -47,7 +47,9 @@ pub async fn run(app: Arc<App>, kick: Arc<Notify>) {
 /// Makes the catalog's Phase 4 tables when a catalog from before them is found.
 pub async fn ensure_jobs_schema(h: &mut Pg) -> Result<bool, OpError> {
 	let rows = h
-		.simple("select to_regclass('lepis.cluster') is not null, to_regclass('lepis.job') is not null")
+		.simple(
+			"select to_regclass('lepis.cluster') is not null, to_regclass('lepis.job') is not null",
+		)
 		.await?;
 	let r = rows.first().cloned().unwrap_or_default();
 	if r.first().cloned().flatten().as_deref() != Some("t") {
@@ -106,7 +108,10 @@ async fn lead(app: &Arc<App>, kick: &Arc<Notify>, me: &str) -> Result<(), OpErro
 fn passing(e: &OpError) -> bool {
 	match e.code.as_deref() {
 		None => true,
-		Some(c) => matches!(c, "40001" | "40P01" | "55P03" | "57P01" | "57P03" | "08006" | "08001"),
+		Some(c) => matches!(
+			c,
+			"40001" | "40P01" | "55P03" | "57P01" | "57P03" | "08006" | "08001"
+		),
 	}
 }
 
@@ -204,7 +209,8 @@ async fn run_job(app: &Arc<App>, h: &mut Pg, id: i64, me: &str) -> Result<(), Op
 					&[
 						&id.to_string(),
 						&n.to_string(),
-						&json!({"step_attempts": attempts, "last_error": e.to_string()}).to_string(),
+						&json!({"step_attempts": attempts, "last_error": e.to_string()})
+							.to_string(),
 					],
 				)
 				.await?;
@@ -222,7 +228,10 @@ async fn run_job(app: &Arc<App>, h: &mut Pg, id: i64, me: &str) -> Result<(), Op
 	cancelling = cancelling || state_of(h, id).await? == "cancelling";
 	h.query(
 		"update lepis.job set state = $2, updated_at = now(), finished_at = now() where id = $1",
-		&[&id.to_string(), if cancelling { "cancelled" } else { "done" }],
+		&[
+			&id.to_string(),
+			if cancelling { "cancelled" } else { "done" },
+		],
 	)
 	.await?;
 	tracing::info!(job = id, "job finished");
@@ -230,10 +239,12 @@ async fn run_job(app: &Arc<App>, h: &mut Pg, id: i64, me: &str) -> Result<(), Op
 }
 
 async fn state_of(h: &mut Pg, id: i64) -> Result<String, OpError> {
-	Ok(h
-		.value("select state from lepis.job where id = $1", &[&id.to_string()])
-		.await?
-		.unwrap_or_default())
+	Ok(h.value(
+		"select state from lepis.job where id = $1",
+		&[&id.to_string()],
+	)
+	.await?
+	.unwrap_or_default())
 }
 
 async fn fail(h: &mut Pg, id: i64, n: i32, e: &OpError) -> Result<(), OpError> {
@@ -261,7 +272,8 @@ pub async fn submit(
 ) -> Result<(i64, Value), OpError> {
 	if !ensure_jobs_schema(h).await? {
 		return Err(OpError::refused(
-			Kind::NoCatalog, "this database has no Lepis catalog (schema lepis)",
+			Kind::NoCatalog,
+			"this database has no Lepis catalog (schema lepis)",
 		));
 	}
 	let cluster: Value = h
@@ -272,7 +284,10 @@ pub async fn submit(
 	let settings = Settings::from_json(&cluster, args);
 	let planned = plan::plan(app, h, op, settings).await?;
 	if planned.steps.is_empty() {
-		return Err(OpError::refused(Kind::NothingToDo, "there is nothing to do"));
+		return Err(OpError::refused(
+			Kind::NothingToDo,
+			"there is nothing to do",
+		));
 	}
 	let mut sql = format!(
 		"begin; insert into lepis.job (op, args, plan) values ({}, {}::jsonb, {}::jsonb) returning id;",
@@ -322,12 +337,17 @@ pub async fn cancel(h: &mut Pg, id: i64) -> Result<String, OpError> {
 
 /// Runs a failed job again from the step that failed.
 pub async fn resume(h: &mut Pg, id: i64) -> Result<String, OpError> {
-	if h
-		.value("select state from lepis.job where id = $1", &[&id.to_string()])
-		.await?
-		.is_none()
+	if h.value(
+		"select state from lepis.job where id = $1",
+		&[&id.to_string()],
+	)
+	.await?
+	.is_none()
 	{
-		return Err(OpError::refused(Kind::NoSuchJob, format!("there is no job {id}")));
+		return Err(OpError::refused(
+			Kind::NoSuchJob,
+			format!("there is no job {id}"),
+		));
 	}
 	let rows = h
 		.query(
@@ -340,9 +360,12 @@ pub async fn resume(h: &mut Pg, id: i64) -> Result<String, OpError> {
 		)
 		.await?;
 	if rows.is_empty() {
-		return Err(OpError::refused(Kind::JobNotFailed, format!(
-			"job {id} is not a failed job; only a failed job is resumed (a running one resumes by itself)"
-		)));
+		return Err(OpError::refused(
+			Kind::JobNotFailed,
+			format!(
+				"job {id} is not a failed job; only a failed job is resumed (a running one resumes by itself)"
+			),
+		));
 	}
 	Ok("running".into())
 }
@@ -357,7 +380,10 @@ pub async fn show(h: &mut Pg, id: i64) -> Result<Value, OpError> {
 		)
 		.await?;
 	let Some(text) = job.first().and_then(|r| r.first().cloned().flatten()) else {
-		return Err(OpError::refused(Kind::NoSuchJob, format!("there is no job {id}")));
+		return Err(OpError::refused(
+			Kind::NoSuchJob,
+			format!("there is no job {id}"),
+		));
 	};
 	let mut v: Value = serde_json::from_str(&text).map_err(|e| OpError::new(e.to_string()))?;
 	let steps = h

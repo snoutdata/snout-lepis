@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use super::Kind;
 use super::spec::{NodeSpec, Step, sslmode_name};
 use super::{
-	OpError, Pg, Settings, Target, change_catalog, load_catalog, qualified, schema,
-	state_name, transfer,
+	OpError, Pg, Settings, Target, change_catalog, load_catalog, qualified, schema, state_name,
+	transfer,
 };
 use crate::catalog::{
 	self, Catalog, NodeId, NodeState, RelationKind, RelationName, owns_check, quote_ident,
@@ -40,7 +40,11 @@ impl StepCtx {
 		}
 		h.query(
 			"update lepis.job_step set detail = detail || $1::jsonb where job_id = $2 and n = $3",
-			&[&patch.to_string(), &self.job.to_string(), &self.n.to_string()],
+			&[
+				&patch.to_string(),
+				&self.job.to_string(),
+				&self.n.to_string(),
+			],
 		)
 		.await?;
 		Ok(())
@@ -69,13 +73,12 @@ impl StepCtx {
 
 	/// Whether someone asked for this job to stop.
 	pub async fn cancelling(&self, h: &mut Pg) -> Result<bool, OpError> {
-		Ok(h
-			.value(
-				"select state from lepis.job where id = $1",
-				&[&self.job.to_string()],
-			)
-			.await?
-			.as_deref()
+		Ok(h.value(
+			"select state from lepis.job where id = $1",
+			&[&self.job.to_string()],
+		)
+		.await?
+		.as_deref()
 			== Some("cancelling"))
 	}
 }
@@ -177,7 +180,8 @@ pub fn owns_expr(
 				.keyspaces
 				.get(keyspace)
 				.ok_or_else(|| OpError::new(format!("no keyspace {keyspace}")))?;
-			owns_check(&column(key_column), ks, node, version).map_err(|e| OpError::refused(Kind::NodeUnsuitable, e.0))
+			owns_check(&column(key_column), ks, node, version)
+				.map_err(|e| OpError::refused(Kind::NodeUnsuitable, e.0))
 		}
 		Some(RelationKind::Reference) => Ok("true".into()),
 		_ => Ok(if c.home().map(|n| n.id) == Some(node) {
@@ -188,11 +192,7 @@ pub fn owns_expr(
 	}
 }
 
-pub async fn run(
-	cx: &mut StepCtx,
-	h: &mut Pg,
-	step: &Step,
-) -> Result<(), OpError> {
+pub async fn run(cx: &mut StepCtx, h: &mut Pg, step: &Step) -> Result<(), OpError> {
 	match step {
 		Step::NodeCheck(spec) => node_check(cx, h, spec).await,
 		Step::NodeInsert { id, spec } => node_insert(cx, h, *id, spec).await,
@@ -226,9 +226,11 @@ pub async fn run(
 		}
 		Step::Verify { keyspace } => verify(cx, h, keyspace.as_deref()).await,
 		Step::Cleanup { node } => cleanup(cx, h, *node).await,
-		Step::NodeAttach { id, spec, standby_of } => {
-			super::attach::run(cx, h, *id, spec, *standby_of).await
-		}
+		Step::NodeAttach {
+			id,
+			spec,
+			standby_of,
+		} => super::attach::run(cx, h, *id, spec, *standby_of).await,
 		Step::RestorePoint { name } => super::restore_point::run(cx, h, name).await,
 	}
 }
@@ -269,23 +271,32 @@ pub async fn check_node(pg: &mut Pg) -> Result<Value, OpError> {
 		return Err(OpError::refused(Kind::NodeUnsuitable, m));
 	}
 	if get(1) != "logical" {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{} has wal_level = {}; moves need wal_level = logical (on RDS, rds.logical_replication = 1), then a restart",
-			pg.label,
-			get(1)
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{} has wal_level = {}; moves need wal_level = logical (on RDS, rds.logical_replication = 1), then a restart",
+				pg.label,
+				get(1)
+			),
+		));
 	}
 	if get(2) == "0" {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{} has max_prepared_transactions = 0; two-phase commit needs it above 0, then a restart",
-			pg.label
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{} has max_prepared_transactions = 0; two-phase commit needs it above 0, then a restart",
+				pg.label
+			),
+		));
 	}
 	if get(3) != "t" {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{}: Lepis's service login needs SUPERUSER, or REPLICATION and the right to create subscriptions",
-			pg.label
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{}: Lepis's service login needs SUPERUSER, or REPLICATION and the right to create subscriptions",
+				pg.label
+			),
+		));
 	}
 	let mut warnings = Vec::new();
 	let idle = get(5);
@@ -373,7 +384,10 @@ async fn table_create(
 			}
 		}
 		if !made {
-			return Err(OpError::refused(Kind::NoSuchTable, format!("no node has {table}")));
+			return Err(OpError::refused(
+				Kind::NoSuchTable,
+				format!("no node has {table}"),
+			));
 		}
 	}
 	let v = version(&mut dst).await?;
@@ -484,10 +498,13 @@ async fn verify(cx: &mut StepCtx, h: &mut Pg, keyspace: Option<&str>) -> Result<
 	if ok {
 		Ok(())
 	} else {
-		Err(OpError::refused(Kind::VerifyFailed, format!(
-			"verify found a problem (a missing fence, or reference copies that differ: {})",
-			mismatched.join(", ")
-		)))
+		Err(OpError::refused(
+			Kind::VerifyFailed,
+			format!(
+				"verify found a problem (a missing fence, or reference copies that differ: {})",
+				mismatched.join(", ")
+			),
+		))
 	}
 }
 
@@ -503,9 +520,12 @@ async fn cleanup(cx: &mut StepCtx, h: &mut Pg, node: Option<NodeId>) -> Result<(
 		.first()
 		.and_then(|r| r.first().cloned().flatten());
 	if let Some(jobs) = unverified {
-		return Err(OpError::refused(Kind::UnverifiedMoves, format!(
-			"job {jobs} moved rows that were never verified; resume or inspect it before cleaning up"
-		)));
+		return Err(OpError::refused(
+			Kind::UnverifiedMoves,
+			format!(
+				"job {jobs} moved rows that were never verified; resume or inspect it before cleaning up"
+			),
+		));
 	}
 	let c = load_catalog(h).await?;
 	let mut deleted = serde_json::Map::new();
@@ -571,10 +591,9 @@ pub fn node_json(c: &Catalog) -> Vec<Value> {
 				.keyspaces
 				.values()
 				.flat_map(|k| {
-					k.ranges
-						.iter()
-						.filter(|r| r.node == n.id)
-						.map(move |r| json!({"keyspace": k.name, "lo": r.lo.to_string(), "hi": r.hi.to_string()}))
+					k.ranges.iter().filter(|r| r.node == n.id).map(
+						move |r| json!({"keyspace": k.name, "lo": r.lo.to_string(), "hi": r.hi.to_string()}),
+					)
 				})
 				.collect();
 			json!({

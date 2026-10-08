@@ -62,15 +62,18 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, name: &str) -> Result<(), OpError
 		return Ok(());
 	}
 	h.simple(RESTORE_POINT_SQL).await?;
-	if h
-		.value("select count(*) from lepis.restore_point where name = $1", &[name])
-		.await?
-		.as_deref()
+	if h.value(
+		"select count(*) from lepis.restore_point where name = $1",
+		&[name],
+	)
+	.await?
+	.as_deref()
 		!= Some("0")
 	{
-		return Err(OpError::refused(Kind::AlreadyDone, format!(
-			"the cluster already has a restore point named {name}"
-		)));
+		return Err(OpError::refused(
+			Kind::AlreadyDone,
+			format!("the cluster already has a restore point named {name}"),
+		));
 	}
 	let c = load_catalog(h).await?;
 	let home = c
@@ -79,7 +82,11 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, name: &str) -> Result<(), OpError
 		.ok_or_else(|| OpError::new("the catalog has no home node"))?;
 	// Every connection is open before the lock is taken.
 	let mut nodes = Vec::new();
-	for n in c.nodes.values().filter(|n| n.state != NodeState::Removed && n.id != home) {
+	for n in c
+		.nodes
+		.values()
+		.filter(|n| n.state != NodeState::Removed && n.id != home)
+	{
 		nodes.push((n.id, n.name.clone(), connect_node(&cx.app, &c, n.id).await?));
 	}
 	let lit = quote_literal(name);

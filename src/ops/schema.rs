@@ -74,7 +74,10 @@ pub async fn ddl(src: &mut Pg, rel: &RelationName) -> Result<Vec<String>, OpErro
 		)
 		.await?;
 	if columns.is_empty() {
-		return Err(OpError::refused(Kind::NoSuchTable, format!("{rel} has no columns, or does not exist")));
+		return Err(OpError::refused(
+			Kind::NoSuchTable,
+			format!("{rel} has no columns, or does not exist"),
+		));
 	}
 	let cols: Vec<String> = columns
 		.iter()
@@ -198,11 +201,7 @@ fn grantee(r: &str) -> String {
 
 /// Makes `rel` on `dst` from `src`'s definition if `dst` does not have it. Returns whether it
 /// was made.
-pub async fn ensure_table(
-	src: &mut Pg,
-	dst: &mut Pg,
-	rel: &RelationName,
-) -> Result<bool, OpError> {
+pub async fn ensure_table(src: &mut Pg, dst: &mut Pg, rel: &RelationName) -> Result<bool, OpError> {
 	if exists(dst, rel).await? {
 		return Ok(false);
 	}
@@ -232,10 +231,10 @@ pub async fn check_movable(
 ) -> Result<(), OpError> {
 	let t = qualified(rel);
 	if !exists(pg, rel).await? {
-		return Err(OpError::refused(Kind::NoSuchTable, format!(
-			"{rel} does not exist on {}",
-			pg.label
-		)));
+		return Err(OpError::refused(
+			Kind::NoSuchTable,
+			format!("{rel} does not exist on {}", pg.label),
+		));
 	}
 	let ident = pg
 		.query(
@@ -247,9 +246,12 @@ pub async fn check_movable(
 	let ident = ident.first().cloned().unwrap_or_default();
 	match (text(&ident, 0).as_str(), text(&ident, 1).as_str()) {
 		("n", _) | ("d", "f") => {
-			return Err(OpError::refused(Kind::TableNotMovable, format!(
-				"{rel} has no primary key: a move replays its updates and deletes by key; add one, or set REPLICA IDENTITY FULL"
-			)));
+			return Err(OpError::refused(
+				Kind::TableNotMovable,
+				format!(
+					"{rel} has no primary key: a move replays its updates and deletes by key; add one, or set REPLICA IDENTITY FULL"
+				),
+			));
 		}
 		_ => {}
 	}
@@ -263,14 +265,19 @@ pub async fn check_movable(
 			&[&t, key],
 		)
 		.await?
-		.ok_or_else(|| OpError::refused(Kind::NoSuchColumn, format!("{rel} has no column {key}")))?;
+		.ok_or_else(|| {
+			OpError::refused(Kind::NoSuchColumn, format!("{rel} has no column {key}"))
+		})?;
 	let base = ty.split('(').next().unwrap_or_default().trim().to_string();
 	if KeyType::from_sql_name(&base) != Some(ks.key_type) {
-		return Err(OpError::refused(Kind::TableNotShardable, format!(
-			"{rel}.{key} is {ty}, and keyspace {} is keyed by {}",
-			ks.name,
-			ks.key_type.sql_name()
-		)));
+		return Err(OpError::refused(
+			Kind::TableNotShardable,
+			format!(
+				"{rel}.{key} is {ty}, and keyspace {} is keyed by {}",
+				ks.name,
+				ks.key_type.sql_name()
+			),
+		));
 	}
 	let missing = pg
 		.query(
@@ -281,10 +288,13 @@ pub async fn check_movable(
 		)
 		.await?;
 	if let Some(r) = missing.first() {
-		return Err(OpError::refused(Kind::TableNotShardable, format!(
-			"constraint {} on {rel} does not include the shard key {key}: a node can only check uniqueness over what it holds (L15)",
-			text(r, 0)
-		)));
+		return Err(OpError::refused(
+			Kind::TableNotShardable,
+			format!(
+				"constraint {} on {rel} does not include the shard key {key}: a node can only check uniqueness over what it holds (L15)",
+				text(r, 0)
+			),
+		));
 	}
 	let sequences = pg
 		.query(
@@ -296,10 +306,13 @@ pub async fn check_movable(
 		)
 		.await?;
 	if let Some(r) = sequences.first() {
-		return Err(OpError::refused(Kind::TableNotShardable, format!(
-			"{rel}.{} is filled by a sequence, which is not global across nodes (L15): use uuidv7(), or a per-node sequence striped by node",
-			text(r, 0)
-		)));
+		return Err(OpError::refused(
+			Kind::TableNotShardable,
+			format!(
+				"{rel}.{} is filled by a sequence, which is not global across nodes (L15): use uuidv7(), or a per-node sequence striped by node",
+				text(r, 0)
+			),
+		));
 	}
 	let fks = pg
 		.query(
@@ -330,11 +343,14 @@ pub async fn check_movable(
 			_ => false,
 		};
 		if !ok {
-			return Err(OpError::refused(Kind::TableNotShardable, format!(
-				"foreign key {} links {rel} to {other}, which will not be on the same node: colocate {other} in keyspace {}, make it a reference table, or drop the key (L9)",
-				text(&r, 0),
-				ks.name
-			)));
+			return Err(OpError::refused(
+				Kind::TableNotShardable,
+				format!(
+					"foreign key {} links {rel} to {other}, which will not be on the same node: colocate {other} in keyspace {}, make it a reference table, or drop the key (L9)",
+					text(&r, 0),
+					ks.name
+				),
+			));
 		}
 	}
 	Ok(())

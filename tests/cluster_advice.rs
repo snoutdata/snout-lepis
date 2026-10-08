@@ -65,7 +65,10 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 	let nodes = node_ids(&b);
 	for (_, a) in &nodes {
 		let admin = connect(a, "postgres", "x").await;
-		admin.batch_execute("drop schema if exists advx cascade").await.unwrap();
+		admin
+			.batch_execute("drop schema if exists advx cascade")
+			.await
+			.unwrap();
 	}
 	let home = connect(&b.home, "postgres", "x").await;
 	home.batch_execute(
@@ -110,8 +113,20 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 	// The skew: 400,000 candidate keys, and only the third of them that hash into node 2's range
 	// is written, straight to node 2 (its fence admits exactly those).
 	let (_, st) = admin.call("GET", "/v1/status", None).await;
-	let ks = st["keyspaces"].as_array().unwrap().iter().find(|k| k["name"] == "advk").unwrap().clone();
-	let range = ks["ranges"].as_array().unwrap().iter().find(|r| r["node"] == 2).unwrap().clone();
+	let ks = st["keyspaces"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|k| k["name"] == "advk")
+		.unwrap()
+		.clone();
+	let range = ks["ranges"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|r| r["node"] == 2)
+		.unwrap()
+		.clone();
 	let lo: i64 = range["lo"].as_str().unwrap().parse().unwrap();
 	let hi: i64 = range["hi"].as_str().unwrap().parse().unwrap();
 	let n2 = connect(&nodes[1].1, "postgres", "x").await;
@@ -120,7 +135,9 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 		.await
 		.unwrap()
 		.get(0);
-	let expr = KeyType::Int8.sql_expression("g", SEED, version as u32).unwrap();
+	let expr = KeyType::Int8
+		.sql_expression("g", SEED, version as u32)
+		.unwrap();
 	n2.batch_execute(&format!(
 		"insert into advx.t select g, 0, repeat('x', 200) from generate_series(1000000, 1400000) g \
 		where {expr} between {lo} and {hi}"
@@ -128,19 +145,37 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 	.await
 	.unwrap();
 	for (_, a) in &nodes {
-		connect(a, "postgres", "x").await.batch_execute("analyze advx.t").await.unwrap();
+		connect(a, "postgres", "x")
+			.await
+			.batch_execute("analyze advx.t")
+			.await
+			.unwrap();
 	}
 
 	// The defaults leave a test-sized keyspace alone; the threshold is a setting.
-	let (code, v) = admin.call("POST", "/v1/settings", Some(&json!({"advice_min_bytes": 1}))).await;
+	let (code, v) = admin
+		.call(
+			"POST",
+			"/v1/settings",
+			Some(&json!({"advice_min_bytes": 1})),
+		)
+		.await;
 	assert_eq!(code, 200, "{v}");
 	let (code, e) = admin.call("GET", "/v1/advice?sample_ms=soon", None).await;
-	assert_eq!((code, e["error"]["kind"].as_str()), (400, Some("bad_setting")), "{e}");
+	assert_eq!(
+		(code, e["error"]["kind"].as_str()),
+		(400, Some("bad_setting")),
+		"{e}"
+	);
 
 	let t = Instant::now();
 	let (code, advice) = admin.call("GET", "/v1/advice?sample_ms=0", None).await;
 	assert_eq!(code, 200, "{advice}");
-	eprintln!("advice in {} ms: {}", t.elapsed().as_millis(), advice["summary"]);
+	eprintln!(
+		"advice in {} ms: {}",
+		t.elapsed().as_millis(),
+		advice["summary"]
+	);
 	for a in advice["advice"].as_array().unwrap() {
 		eprintln!("  {}: {}", a["op"], a["reason"]);
 	}
@@ -150,8 +185,15 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 		.iter()
 		.filter(|r| r["keyspace"] == "advk")
 		.collect();
-	let heavy = facts.iter().find(|r| r["lo"] == json!(lo.to_string())).unwrap();
-	let others: u64 = facts.iter().filter(|r| r["node"] != 2).map(|r| r["bytes"].as_u64().unwrap()).sum();
+	let heavy = facts
+		.iter()
+		.find(|r| r["lo"] == json!(lo.to_string()))
+		.unwrap();
+	let others: u64 = facts
+		.iter()
+		.filter(|r| r["node"] != 2)
+		.map(|r| r["bytes"].as_u64().unwrap())
+		.sum();
 	assert!(heavy["bytes"].as_u64().unwrap() > 10 * others, "{facts:?}");
 	assert!(heavy["sampled_rows"].as_u64().unwrap() > 1000, "{heavy}");
 
@@ -175,11 +217,27 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 	assert_eq!(plan["moves"][0]["source"], 2, "{plan}");
 	let moving = plan["estimated_rows"].as_u64().unwrap();
 	let rows = heavy["rows"].as_u64().unwrap();
-	assert!(moving > rows / 5 && moving < rows * 4 / 5, "moving {moving} of {rows}");
+	assert!(
+		moving > rows / 5 && moving < rows * 4 / 5,
+		"moving {moving} of {rows}"
+	);
 	// And nothing ran.
 	let (_, jobs) = admin.call("GET", "/v1/jobs", None).await;
-	assert!(jobs["jobs"].as_array().unwrap().iter().all(|j| j["op"] != "range.split"), "{jobs}");
+	assert!(
+		jobs["jobs"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.all(|j| j["op"] != "range.split"),
+		"{jobs}"
+	);
 
-	let (code, _) = admin.call("POST", "/v1/settings", Some(&json!({"advice_min_bytes": 268_435_456}))).await;
+	let (code, _) = admin
+		.call(
+			"POST",
+			"/v1/settings",
+			Some(&json!({"advice_min_bytes": 268_435_456})),
+		)
+		.await;
 	assert_eq!(code, 200);
 }

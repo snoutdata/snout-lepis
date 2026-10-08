@@ -79,7 +79,11 @@ async fn generated_queries_answer_like_one_postgres() {
 			failures.push(format!(
 				"{verdict}: seed={seed:#x} index={i} ({}, {})\n  {}\n  {}",
 				q.family,
-				if q.ordered { "ordered" } else { "as a multiset" },
+				if q.ordered {
+					"ordered"
+				} else {
+					"as a multiset"
+				},
 				q.sql,
 				difference(&want, &got)
 			));
@@ -107,7 +111,8 @@ fn difference(want: &Answer, got: &Answer) -> String {
 		(Ok(w), Ok(g)) => {
 			let at = w.iter().zip(g.iter()).position(|(a, b)| a != b);
 			let row = |rows: &Vec<Vec<Option<String>>>, i: usize| {
-				rows.get(i).map_or("(none)".to_string(), |r| format!("{r:?}"))
+				rows.get(i)
+					.map_or("(none)".to_string(), |r| format!("{r:?}"))
 			};
 			let i = at.unwrap_or(w.len().min(g.len()));
 			format!(

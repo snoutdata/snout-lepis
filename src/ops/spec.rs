@@ -28,23 +28,32 @@ impl NodeSpec {
 		Ok(NodeSpec {
 			name: s(v, "name")?,
 			host: s(v, "host")?,
-			port: u16::try_from(port).map_err(|_| OpError::refused(Kind::BadRequest, "port: not a port"))?,
+			port: u16::try_from(port)
+				.map_err(|_| OpError::refused(Kind::BadRequest, "port: not a port"))?,
 			dbname: v
 				.get("dbname")
 				.and_then(Value::as_str)
 				.unwrap_or("postgres")
 				.to_string(),
-			sslmode: match v.get("sslmode").and_then(Value::as_str).unwrap_or("verify-full") {
+			sslmode: match v
+				.get("sslmode")
+				.and_then(Value::as_str)
+				.unwrap_or("verify-full")
+			{
 				"disable" => SslMode::Disable,
 				"require" => SslMode::Require,
 				"verify-full" => SslMode::VerifyFull,
 				other => {
-					return Err(OpError::refused(Kind::BadRequest, format!(
-						"sslmode {other}: one of disable, require, verify-full"
-					)));
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						format!("sslmode {other}: one of disable, require, verify-full"),
+					));
 				}
 			},
-			peer_host: v.get("peer_host").and_then(Value::as_str).map(str::to_string),
+			peer_host: v
+				.get("peer_host")
+				.and_then(Value::as_str)
+				.map(str::to_string),
 		})
 	}
 
@@ -88,7 +97,8 @@ impl NodeRef {
 			NodeRef::Id(n) => c.nodes.get(&NodeId(*n)).map(|n| n.id),
 			NodeRef::Name(name) => c.nodes.values().find(|n| &n.name == name).map(|n| n.id),
 		};
-		found.ok_or_else(|| OpError::refused(Kind::NoSuchNode, format!("there is no node {self:?}")))
+		found
+			.ok_or_else(|| OpError::refused(Kind::NoSuchNode, format!("there is no node {self:?}")))
 	}
 }
 
@@ -188,9 +198,12 @@ pub const OPS: [&str; 17] = [
 ];
 
 fn node_ref(v: &Value, k: &str) -> Result<NodeRef, OpError> {
-	v.get(k)
-		.and_then(NodeRef::from_json)
-		.ok_or_else(|| OpError::refused(Kind::BadRequest, format!("{k} is required (a node id or name)")))
+	v.get(k).and_then(NodeRef::from_json).ok_or_else(|| {
+		OpError::refused(
+			Kind::BadRequest,
+			format!("{k} is required (a node id or name)"),
+		)
+	})
 }
 
 fn opt_node(v: &Value, k: &str) -> Option<NodeRef> {
@@ -291,10 +304,10 @@ impl Op {
 				name: opt_str(v, "name"),
 			},
 			other => {
-				return Err(OpError::refused(Kind::UnknownOperation, format!(
-					"unknown operation {other}; one of {}",
-					OPS.join(", ")
-				)));
+				return Err(OpError::refused(
+					Kind::UnknownOperation,
+					format!("unknown operation {other}; one of {}", OPS.join(", ")),
+				));
 			}
 		})
 	}
@@ -417,7 +430,11 @@ impl Step {
 			Step::Fences { keyspace } => json!({"keyspace": keyspace}),
 			Step::Verify { keyspace } => json!({"keyspace": keyspace}),
 			Step::Cleanup { node } => json!({"node": node.map(|n| n.0)}),
-			Step::NodeAttach { id, spec, standby_of } => {
+			Step::NodeAttach {
+				id,
+				spec,
+				standby_of,
+			} => {
 				json!({"id": id.0, "spec": spec.to_json(), "standby_of": standby_of.0})
 			}
 			Step::RestorePoint { name } => json!({"name": name}),
@@ -467,9 +484,7 @@ impl Step {
 				tables: tables(a.get("tables"))?,
 				change: Change::from_json(a.get("change").unwrap_or(&Value::Null))?,
 			}),
-			"catalog" => Step::Catalog(Change::from_json(
-				a.get("change").unwrap_or(&Value::Null),
-			)?),
+			"catalog" => Step::Catalog(Change::from_json(a.get("change").unwrap_or(&Value::Null))?),
 			"fences" => Step::Fences {
 				keyspace: s(a, "keyspace")?,
 			},

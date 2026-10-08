@@ -118,7 +118,10 @@ impl Pg {
 		let params = vec![
 			("user".to_string(), s.user.clone()),
 			("database".to_string(), t.dbname.clone()),
-			("application_name".to_string(), "snout-lepis ops".to_string()),
+			(
+				"application_name".to_string(),
+				"snout-lepis ops".to_string(),
+			),
 		];
 		let b = backend::connect(
 			&t.address,

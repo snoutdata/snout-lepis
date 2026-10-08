@@ -77,26 +77,31 @@ pub async fn select(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<bo
 		[] => false,
 		[(_, of)] if t.targets.len() == 1 && *of == t.source => true,
 		[(n, of), ..] => {
-			return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-				"{n} is a physical standby of {of}: until a move from {of} promotes it, it can only take rows from {of}, and alone"
-			)));
+			return Err(OpError::refused(
+				Kind::NodeUnsuitable,
+				format!(
+					"{n} is a physical standby of {of}: until a move from {of} promotes it, it can only take rows from {of}, and alone"
+				),
+			));
 		}
 	};
-	cx.save(h, json!({"strategy": if physical { "physical" } else { "logical" }}))
-		.await?;
+	cx.save(
+		h,
+		json!({"strategy": if physical { "physical" } else { "logical" }}),
+	)
+	.await?;
 	Ok(physical)
 }
 
 /// The node `n` follows as a standby, from its catalog labels.
 pub async fn standby_of(h: &mut Pg, n: NodeId) -> Result<Option<NodeId>, OpError> {
-	Ok(h
-		.value(
-			"select labels->>'standby_of' from lepis.node where id = $1",
-			&[&n.0.to_string()],
-		)
-		.await?
-		.and_then(|v| v.parse::<i32>().ok())
-		.map(NodeId))
+	Ok(h.value(
+		"select labels->>'standby_of' from lepis.node where id = $1",
+		&[&n.0.to_string()],
+	)
+	.await?
+	.and_then(|v| v.parse::<i32>().ok())
+	.map(NodeId))
 }
 
 pub async fn run(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpError> {
@@ -130,7 +135,12 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 }
 
 /// The standby is what `node.attach` said it is, and the source can be copied physically.
-async fn check(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId) -> Result<(), OpError> {
+async fn check(
+	cx: &mut StepCtx,
+	h: &mut Pg,
+	t: &TransferSpec,
+	target: NodeId,
+) -> Result<(), OpError> {
 	let c = load_catalog(h).await?;
 	let mut after = c.clone();
 	t.change.apply(&mut after)?;
@@ -145,17 +155,24 @@ async fn check(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId) -
 		.await?
 		.unwrap_or_default();
 	if subscriptions != "0" {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{} has {subscriptions} logical subscription(s); a physical copy would start them a second time on {}, so move these rows with the logical path (a node that is not a standby)",
-			src.label, dst.label
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{} has {subscriptions} logical subscription(s); a physical copy would start them a second time on {}, so move these rows with the logical path (a node that is not a standby)",
+				src.label, dst.label
+			),
+		));
 	}
-	if c.keyspaces.values().any(|k| {
-		k.ranges.iter().any(|r| r.node == target) || k.pins.values().any(|n| *n == target)
-	}) {
-		return Err(OpError::refused(Kind::NodeNotEmpty, format!(
-			"{target} already owns rows; a physical standby must own nothing before its first move"
-		)));
+	if c.keyspaces
+		.values()
+		.any(|k| k.ranges.iter().any(|r| r.node == target) || k.pins.values().any(|n| *n == target))
+	{
+		return Err(OpError::refused(
+			Kind::NodeNotEmpty,
+			format!(
+				"{target} already owns rows; a physical standby must own nothing before its first move"
+			),
+		));
 	}
 	let mut patch = report;
 	patch["phase"] = json!("standby");
@@ -166,25 +183,38 @@ async fn check(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId) -
 pub async fn standby_report(src: &mut Pg, dst: &mut Pg) -> Result<Value, OpError> {
 	let in_recovery = dst.value("select pg_is_in_recovery()", &[]).await?;
 	if in_recovery.as_deref() != Some("t") {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{} is not in recovery: a physical move needs it to be a standby of {}",
-			dst.label, src.label
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{} is not in recovery: a physical move needs it to be a standby of {}",
+				dst.label, src.label
+			),
+		));
 	}
 	let sysid = "select system_identifier::text from pg_control_system()";
 	let a = src.value(sysid, &[]).await?.unwrap_or_default();
 	let b = dst.value(sysid, &[]).await?.unwrap_or_default();
 	if a.is_empty() || a != b {
-		return Err(OpError::refused(Kind::NodeUnsuitable, format!(
-			"{} (system {b}) is not a copy of {} (system {a})",
-			dst.label, src.label
-		)));
+		return Err(OpError::refused(
+			Kind::NodeUnsuitable,
+			format!(
+				"{} (system {b}) is not a copy of {} (system {a})",
+				dst.label, src.label
+			),
+		));
 	}
-	let sv = src.value("select current_setting('server_version_num')", &[]).await?;
-	let dv = dst.value("select current_setting('server_version_num')", &[]).await?;
+	let sv = src
+		.value("select current_setting('server_version_num')", &[])
+		.await?;
+	let dv = dst
+		.value("select current_setting('server_version_num')", &[])
+		.await?;
 	// A standby is always the primary's major; a minor difference is allowed by Postgres.
 	let receiver = dst
-		.value("select coalesce((select status from pg_stat_wal_receiver), 'none')", &[])
+		.value(
+			"select coalesce((select status from pg_stat_wal_receiver), 'none')",
+			&[],
+		)
 		.await?
 		.unwrap_or_default();
 	let mut warnings = Vec::new();
@@ -203,7 +233,11 @@ pub async fn standby_report(src: &mut Pg, dst: &mut Pg) -> Result<Value, OpError
 }
 
 /// How long the standby takes to replay up to the source's current position.
-async fn replay_gap(src: &mut Pg, dst: &mut Pg, limit: Duration) -> Result<Option<Duration>, OpError> {
+async fn replay_gap(
+	src: &mut Pg,
+	dst: &mut Pg,
+	limit: Duration,
+) -> Result<Option<Duration>, OpError> {
 	let start = Instant::now();
 	let lsn = src
 		.value("select pg_current_wal_lsn()::text", &[])
@@ -226,7 +260,12 @@ async fn wait_replay(
 				&[lsn],
 			)
 			.await?;
-		if done.first().and_then(|r| r.first().cloned().flatten()).as_deref() == Some("t") {
+		if done
+			.first()
+			.and_then(|r| r.first().cloned().flatten())
+			.as_deref()
+			== Some("t")
+		{
 			return Ok(Some(start.elapsed()));
 		}
 		if start.elapsed() > limit {
@@ -236,7 +275,12 @@ async fn wait_replay(
 	}
 }
 
-async fn catch_up(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId) -> Result<(), OpError> {
+async fn catch_up(
+	cx: &mut StepCtx,
+	h: &mut Pg,
+	t: &TransferSpec,
+	target: NodeId,
+) -> Result<(), OpError> {
 	let c = load_catalog(h).await?;
 	let mut src = connect_node(&cx.app, &c, t.source).await?;
 	let mut dst = connect_node(&cx.app, &c, target).await?;
@@ -265,11 +309,17 @@ async fn catch_up(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId
 				.await?
 				.unwrap_or_default();
 			let replayed = dst
-				.value("select coalesce(pg_last_wal_replay_lsn()::text, '0/0')", &[])
+				.value(
+					"select coalesce(pg_last_wal_replay_lsn()::text, '0/0')",
+					&[],
+				)
 				.await?
 				.unwrap_or_default();
 			let bytes = src
-				.query("select pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint", &[&lag, &replayed])
+				.query(
+					"select pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint",
+					&[&lag, &replayed],
+				)
 				.await?
 				.first()
 				.and_then(|r| r.first().cloned().flatten());
@@ -312,8 +362,14 @@ async fn cutover(
 		match try_cutover(cx, h, t, target, attempt).await? {
 			Attempt::Done(held) => return Ok(Some(*held)),
 			Attempt::Retry(why) => {
-				tracing::info!(job = cx.job, step = cx.n, attempt, "physical cutover postponed: {why}");
-				cx.save(h, json!({"attempts": attempt, "postponed": why})).await?;
+				tracing::info!(
+					job = cx.job,
+					step = cx.n,
+					attempt,
+					"physical cutover postponed: {why}"
+				);
+				cx.save(h, json!({"attempts": attempt, "postponed": why}))
+					.await?;
 				let wait = Duration::from_millis(250 * (1u64 << attempt.min(7)));
 				tokio::time::sleep(wait.min(Duration::from_secs(30))).await;
 			}
@@ -371,7 +427,8 @@ async fn try_cutover(
 		match tokio::time::timeout(budget, &mut fut).await {
 			Ok(r) => r.map(|_| true),
 			Err(_) => {
-				aborted = super::transfer::abort_blockers(&mut side, lock_pid, s.drain_timeout).await?;
+				aborted =
+					super::transfer::abort_blockers(&mut side, lock_pid, s.drain_timeout).await?;
 				canceller.cancel().await;
 				let _ = fut.await;
 				Ok(false)
@@ -417,8 +474,11 @@ async fn try_cutover(
 
 	// The point of no return. Written down first, so a crash from here on is finished by
 	// `resume_promoting` and never retried as if the target were still a standby.
-	h.simple(&format!("begin; {} commit", cx.save_sql(&json!({"phase": "promoting", "promoting_lsn": lsn}))))
-		.await?;
+	h.simple(&format!(
+		"begin; {} commit",
+		cx.save_sql(&json!({"phase": "promoting", "promoting_lsn": lsn}))
+	))
+	.await?;
 	if let Some(d) = cx.detail.as_object_mut() {
 		d.insert("phase".into(), json!("promoting"));
 	}
@@ -426,12 +486,17 @@ async fn try_cutover(
 	if promoted.as_deref() != Some("t") {
 		// Still a standby: nothing changed anywhere, so this attempt is given up like any other.
 		let _ = lock.simple("rollback").await;
-		h.simple(&format!("begin; {} commit", cx.save_sql(&json!({"phase": "synced"}))))
-			.await?;
+		h.simple(&format!(
+			"begin; {} commit",
+			cx.save_sql(&json!({"phase": "synced"}))
+		))
+		.await?;
 		if let Some(d) = cx.detail.as_object_mut() {
 			d.insert("phase".into(), json!("synced"));
 		}
-		return Ok(Attempt::Retry("the standby did not finish promoting within 60 s".into()));
+		return Ok(Attempt::Retry(
+			"the standby did not finish promoting within 60 s".into(),
+		));
 	}
 	let promote_done = t0.elapsed();
 	// Jobs run on the home node (Phase 7); a copy of them here would run twice.
@@ -533,7 +598,12 @@ async fn resume_promoting(
 		return cx.save(h, json!({"phase": "cut"})).await;
 	}
 	let mut dst = connect_node(&cx.app, &c, target).await?;
-	if dst.value("select pg_is_in_recovery()", &[]).await?.as_deref() == Some("t") {
+	if dst
+		.value("select pg_is_in_recovery()", &[])
+		.await?
+		.as_deref()
+		== Some("t")
+	{
 		return cx.save(h, json!({"phase": "synced"})).await;
 	}
 	cx.save(h, json!({"phase": "fallback"})).await
@@ -642,7 +712,10 @@ async fn verify(
 				let _ = held.source.simple("rollback").await;
 				let _ = held.target.simple("rollback").await;
 				return cx
-					.save(h, json!({"phase": "unverified", "verify": format!("skipped: {e}")}))
+					.save(
+						h,
+						json!({"phase": "unverified", "verify": format!("skipped: {e}")}),
+					)
 					.await;
 			}
 		};
@@ -687,7 +760,8 @@ async fn settle(cx: &mut StepCtx, h: &mut Pg, target: NodeId) -> Result<(), OpEr
 		dst.simple("drop schema if exists lepis_move cascade; drop schema if exists lepis cascade")
 			.await?;
 	}
-	cx.save(h, json!({"phase": "settled", "target_fences": fenced})).await
+	cx.save(h, json!({"phase": "settled", "target_fences": fenced}))
+		.await
 }
 
 fn sharded(c: &Catalog) -> Vec<RelationName> {
@@ -703,7 +777,12 @@ fn sharded(c: &Catalog) -> Vec<RelationName> {
 
 /// After a verified move: the source deletes what it gave away; the target deletes everything
 /// it holds and does not own.
-async fn cleanup(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId) -> Result<(), OpError> {
+async fn cleanup(
+	cx: &mut StepCtx,
+	h: &mut Pg,
+	t: &TransferSpec,
+	target: NodeId,
+) -> Result<(), OpError> {
 	if !cx.get("verify").is_some_and(Value::is_array) {
 		return cx
 			.save(h, json!({"phase": "cleaned", "cleanup": "skipped: the move was not verified; run cleanup once it is"}))
@@ -749,7 +828,8 @@ async fn cleanup(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, target: NodeId)
 		}
 		deleted.insert(format!("target:{rel}"), json!(n));
 	}
-	cx.save(h, json!({"phase": "cleaned", "cleanup": deleted})).await
+	cx.save(h, json!({"phase": "cleaned", "cleanup": deleted}))
+		.await
 }
 
 #[cfg(test)]

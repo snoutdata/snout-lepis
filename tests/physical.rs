@@ -122,7 +122,11 @@ fn ranges(status: &Value, keyspace: &str) -> Vec<(i64, i64, i64)> {
 		.unwrap()
 		.iter()
 		.map(|r| {
-			let n = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap();
+			let n = |v: &Value| {
+				v.as_i64()
+					.or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+					.unwrap()
+			};
 			(n(&r["lo"]), n(&r["hi"]), n(&r["node"]))
 		})
 		.collect()
@@ -136,7 +140,13 @@ struct Stats {
 
 /// Inserts through Lepis until stopped, retrying what a cutover refuses; an insert that meets
 /// its own key on a retry had landed the first time.
-async fn load(lepis: String, w: u64, stop: Arc<AtomicBool>, next: Arc<AtomicI64>, stats: Arc<Mutex<Stats>>) {
+async fn load(
+	lepis: String,
+	w: u64,
+	stop: Arc<AtomicBool>,
+	next: Arc<AtomicI64>,
+	stats: Arc<Mutex<Stats>>,
+) {
 	let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ (w + 1).wrapping_mul(0x2545_f491_4f6c_dd1d);
 	let mut client = connect(&lepis, "phys_app", "app-pw").await;
 	while !stop.load(Ordering::Relaxed) {
@@ -145,7 +155,8 @@ async fn load(lepis: String, w: u64, stop: Arc<AtomicBool>, next: Arc<AtomicI64>
 		x ^= x << 17;
 		let acct = (x % 1000) as i64 + 1;
 		let id = next.fetch_add(1, Ordering::Relaxed);
-		let sql = format!("insert into physx.ledger (acct, id, note) values ({acct}, {id}, 'w{w}')");
+		let sql =
+			format!("insert into physx.ledger (acct, id, note) values ({acct}, {id}, 'w{w}')");
 		let mut attempt = 0;
 		loop {
 			attempt += 1;
@@ -190,7 +201,8 @@ async fn rows(c: &Client) -> Vec<(i64, i64)> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_standby_takes_half_a_keyspace_by_promotion() {
-	let (Some(primary), Some(standby)) = (env("LEPIS_PHYS_PRIMARY"), env("LEPIS_PHYS_STANDBY")) else {
+	let (Some(primary), Some(standby)) = (env("LEPIS_PHYS_PRIMARY"), env("LEPIS_PHYS_STANDBY"))
+	else {
 		eprintln!("LEPIS_PHYS_PRIMARY / LEPIS_PHYS_STANDBY not set; skipped");
 		return;
 	};
@@ -221,12 +233,27 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	.expect("setup");
 	// The standby has the setup before anything reads it there.
 	let sb = admin_of(&standby).await;
-	assert_eq!(one(&sb, "select pg_is_in_recovery()").await, "t", "{standby} is not a standby");
+	assert_eq!(
+		one(&sb, "select pg_is_in_recovery()").await,
+		"t",
+		"{standby} is not a standby"
+	);
 	let deadline = Instant::now() + Duration::from_secs(60);
-	while one(&sb, "select count(*) from pg_namespace where nspname = 'lepis'").await != "1"
-		|| one(&sb, "select coalesce((select count(*) from physx.ledger), 0)").await != SEED_ROWS.to_string()
+	while one(
+		&sb,
+		"select count(*) from pg_namespace where nspname = 'lepis'",
+	)
+	.await != "1"
+		|| one(
+			&sb,
+			"select coalesce((select count(*) from physx.ledger), 0)",
+		)
+		.await != SEED_ROWS.to_string()
 	{
-		assert!(Instant::now() < deadline, "the standby did not replay the setup");
+		assert!(
+			Instant::now() < deadline,
+			"the standby did not replay the setup"
+		);
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
 
@@ -259,7 +286,9 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		.op(json!({"op": "keyspace.create", "name": "acct", "key_type": "bigint", "seed": SEED, "ranges": 2, "nodes": [1]}))
 		.await;
 	admin
-		.op(json!({"op": "table.distribute", "table": "physx.ledger", "column": "acct", "keyspace": "acct"}))
+		.op(
+			json!({"op": "table.distribute", "table": "physx.ledger", "column": "acct", "keyspace": "acct"}),
+		)
 		.await;
 
 	// A standby of a node it is not attached as is refused, and so is a name already taken.
@@ -269,12 +298,22 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	let (code, e) = admin
 		.call("POST", "/v1/plan", Some(&json!({"op": "node.attach", "name": "n1", "host": sh, "port": 5432, "sslmode": "disable", "standby_of": 1})))
 		.await;
-	assert_eq!((code, e["error"]["kind"].as_str()), (409, Some("node_name_taken")), "{e}");
+	assert_eq!(
+		(code, e["error"]["kind"].as_str()),
+		(409, Some("node_name_taken")),
+		"{e}"
+	);
 	let (code, e) = admin
 		.call("POST", "/v1/plan", Some(&json!({"op": "node.attach", "name": "n9", "host": phost, "port": pport.parse::<u16>().unwrap(), "sslmode": "disable", "standby_of": 1})))
 		.await;
 	assert_eq!(code, 409, "the primary itself is not a standby: {e}");
-	assert!(e["error"]["message"].as_str().unwrap().contains("not in recovery"), "{e}");
+	assert!(
+		e["error"]["message"]
+			.as_str()
+			.unwrap()
+			.contains("not in recovery"),
+		"{e}"
+	);
 
 	// The load, through Lepis, for the rest of the test.
 	let stop = Arc::new(AtomicBool::new(false));
@@ -282,23 +321,44 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	let stats = Arc::new(Mutex::new(Stats::default()));
 	let mut workers = Vec::new();
 	for w in 0..WORKERS {
-		workers.push(tokio::spawn(load(lepis.clone(), w as u64, stop.clone(), next.clone(), stats.clone())));
+		workers.push(tokio::spawn(load(
+			lepis.clone(),
+			w as u64,
+			stop.clone(),
+			next.clone(),
+			stats.clone(),
+		)));
 	}
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	let j = admin.op(attach.clone()).await;
-	assert_eq!(j["steps"][0]["detail"]["attached"]["wal_receiver"], "streaming", "{j:#}");
+	assert_eq!(
+		j["steps"][0]["detail"]["attached"]["wal_receiver"], "streaming",
+		"{j:#}"
+	);
 	let st = admin.status().await;
-	let n2 = st["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "n2").unwrap();
+	let n2 = st["nodes"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|n| n["name"] == "n2")
+		.unwrap();
 	assert_eq!(n2["state"], "joining", "{st}");
 
 	// The upper range moves to the standby, which is promoted to take it.
 	let r = ranges(&st, "acct");
 	let upper = *r.iter().max_by_key(|x| x.0).unwrap();
 	let j = admin
-		.op(json!({"op": "range.move", "keyspace": "acct", "range": upper.0.to_string(), "to": "n2"}))
+		.op(
+			json!({"op": "range.move", "keyspace": "acct", "range": upper.0.to_string(), "to": "n2"}),
+		)
 		.await;
-	let step = j["steps"].as_array().unwrap().iter().find(|s| s["kind"] == "transfer").unwrap();
+	let step = j["steps"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|s| s["kind"] == "transfer")
+		.unwrap();
 	let d = &step["detail"];
 	assert_eq!(d["strategy"], "physical", "{j:#}");
 	assert_eq!(d["phase"], "cleaned", "{j:#}");
@@ -307,7 +367,11 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	}
 	eprintln!("physical cutover: {}", d["cutover"]);
 	eprintln!("cleanup: {}", d["cleanup"]);
-	assert_eq!(one(&sb, "select pg_is_in_recovery()").await, "f", "the standby was not promoted");
+	assert_eq!(
+		one(&sb, "select pg_is_in_recovery()").await,
+		"f",
+		"the standby was not promoted"
+	);
 
 	tokio::time::sleep(Duration::from_secs(2)).await;
 	stop.store(true, Ordering::Relaxed);
@@ -315,49 +379,89 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		w.await.unwrap();
 	}
 	let stats = std::mem::take(&mut *stats.lock().unwrap());
-	eprintln!("{} inserts through Lepis, refusals retried: {:?}", stats.inserted.len(), stats.errors);
+	eprintln!(
+		"{} inserts through Lepis, refusals retried: {:?}",
+		stats.inserted.len(),
+		stats.errors
+	);
 
 	// Catalog: n2 is active, owns the upper range, is no longer labelled a standby.
 	let st = admin.status().await;
 	assert!(ranges(&st, "acct").contains(&(upper.0, upper.1, 2)), "{st}");
-	let n2 = st["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "n2").unwrap();
+	let n2 = st["nodes"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|n| n["name"] == "n2")
+		.unwrap();
 	assert_eq!(n2["state"], "active", "{st}");
 	assert_eq!(
-		one(&home, "select coalesce(labels->>'standby_of', 'none') from lepis.node where id = 2").await,
+		one(
+			&home,
+			"select coalesce(labels->>'standby_of', 'none') from lepis.node where id = 2"
+		)
+		.await,
 		"none"
 	);
 
 	// Every row exactly once, each on its owner; nothing left on a node that does not own it.
 	let owner = |acct: i64| {
-		let h = KeyType::Int8.hash_text_value(&acct.to_string(), SEED).unwrap();
-		if (upper.0..=upper.1).contains(&h) { 2 } else { 1 }
+		let h = KeyType::Int8
+			.hash_text_value(&acct.to_string(), SEED)
+			.unwrap();
+		if (upper.0..=upper.1).contains(&h) {
+			2
+		} else {
+			1
+		}
 	};
 	let on1 = rows(&home).await;
 	let on2 = rows(&sb).await;
-	assert!(on1.iter().all(|(a, _)| owner(*a) == 1), "node 1 holds rows it does not own");
-	assert!(on2.iter().all(|(a, _)| owner(*a) == 2), "node 2 holds rows it does not own");
+	assert!(
+		on1.iter().all(|(a, _)| owner(*a) == 1),
+		"node 1 holds rows it does not own"
+	);
+	assert!(
+		on2.iter().all(|(a, _)| owner(*a) == 2),
+		"node 2 holds rows it does not own"
+	);
 	assert!(!on2.is_empty() && !on1.is_empty());
 	let all: BTreeSet<(i64, i64)> = on1.iter().chain(on2.iter()).copied().collect();
 	assert_eq!(all.len(), on1.len() + on2.len(), "a row is on both nodes");
 	let mut want: BTreeSet<(i64, i64)> = (1..=SEED_ROWS).map(|g| ((g % 500) + 1, g)).collect();
 	want.extend(stats.inserted.iter().copied());
 	let lost: Vec<_> = want.difference(&all).take(5).collect();
-	assert!(lost.is_empty(), "{} committed rows are missing, e.g. {lost:?}", want.difference(&all).count());
+	assert!(
+		lost.is_empty(),
+		"{} committed rows are missing, e.g. {lost:?}",
+		want.difference(&all).count()
+	);
 
 	// The promoted node: its copy of the global table and of Lepis's catalog are gone, its
 	// fence refuses a key it does not own, and the old owner's fence refuses the moved keys.
 	assert_eq!(one(&sb, "select count(*) from physx.plans").await, "0");
 	assert_eq!(one(&home, "select count(*) from physx.plans").await, "2");
-	assert_eq!(one(&sb, "select count(*) from pg_namespace where nspname = 'lepis'").await, "0");
+	assert_eq!(
+		one(
+			&sb,
+			"select count(*) from pg_namespace where nspname = 'lepis'"
+		)
+		.await,
+		"0"
+	);
 	let moved = (1..10_000).find(|a| owner(*a) == 2).unwrap();
 	let kept = (1..10_000).find(|a| owner(*a) == 1).unwrap();
 	let e = home
-		.simple_query(&format!("insert into physx.ledger values ({moved}, -1, 'direct')"))
+		.simple_query(&format!(
+			"insert into physx.ledger values ({moved}, -1, 'direct')"
+		))
 		.await
 		.unwrap_err();
 	assert_eq!(e.as_db_error().unwrap().code().code(), "23514", "{e}");
 	let e = sb
-		.simple_query(&format!("insert into physx.ledger values ({kept}, -1, 'direct')"))
+		.simple_query(&format!(
+			"insert into physx.ledger values ({kept}, -1, 'direct')"
+		))
 		.await
 		.unwrap_err();
 	assert_eq!(e.as_db_error().unwrap().code().code(), "23514", "{e}");
@@ -367,20 +471,44 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	let j = admin
 		.op(json!({"op": "range.merge", "keyspace": "acct", "a": lower.0.to_string(), "b": upper.0.to_string()}))
 		.await;
-	let step = j["steps"].as_array().unwrap().iter().find(|s| s["kind"] == "transfer").unwrap();
+	let step = j["steps"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|s| s["kind"] == "transfer")
+		.unwrap();
 	assert_eq!(step["detail"]["strategy"], "logical", "{j:#}");
 	let st = admin.status().await;
 	assert_eq!(ranges(&st, "acct"), vec![(i64::MIN, i64::MAX, 1)], "{st}");
 	admin.op(json!({"op": "verify", "keyspace": "acct"})).await;
 
 	// And a cluster restore point lands on every node, with the LSN each one wrote it at.
-	let j = admin.op(json!({"op": "restore_point", "name": "phys-test"})).await;
+	let j = admin
+		.op(json!({"op": "restore_point", "name": "phys-test"}))
+		.await;
 	let lsns = &j["steps"][0]["detail"]["lsns"];
-	assert!(lsns["1"]["lsn"].as_str().is_some_and(|s| s.contains('/')), "{j:#}");
-	assert!(lsns["2"]["lsn"].as_str().is_some_and(|s| s.contains('/')), "{j:#}");
-	assert_eq!(one(&home, "select count(*) from lepis.restore_point where name = 'phys-test'").await, "1");
+	assert!(
+		lsns["1"]["lsn"].as_str().is_some_and(|s| s.contains('/')),
+		"{j:#}"
+	);
+	assert!(
+		lsns["2"]["lsn"].as_str().is_some_and(|s| s.contains('/')),
+		"{j:#}"
+	);
+	assert_eq!(
+		one(
+			&home,
+			"select count(*) from lepis.restore_point where name = 'phys-test'"
+		)
+		.await,
+		"1"
+	);
 	let (code, e) = admin
-		.call("POST", "/v1/plan", Some(&json!({"op": "restore_point", "name": "Not Valid"})))
+		.call(
+			"POST",
+			"/v1/plan",
+			Some(&json!({"op": "restore_point", "name": "Not Valid"})),
+		)
 		.await;
 	assert_eq!(code, 400, "{e}");
 }

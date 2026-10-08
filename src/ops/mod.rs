@@ -152,9 +152,9 @@ pub enum Change {
 }
 
 fn ks_mut<'a>(c: &'a mut Catalog, name: &str) -> Result<&'a mut Keyspace, OpError> {
-	c.keyspaces
-		.get_mut(name)
-		.ok_or_else(|| OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}")))
+	c.keyspaces.get_mut(name).ok_or_else(|| {
+		OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}"))
+	})
 }
 
 impl Change {
@@ -173,9 +173,10 @@ impl Change {
 					.iter_mut()
 					.find(|r| r.lo == *lo && r.hi == *hi)
 					.ok_or_else(|| {
-						OpError::refused(Kind::NoSuchRange, format!(
-							"keyspace {keyspace} has no range [{lo}, {hi}] any more"
-						))
+						OpError::refused(
+							Kind::NoSuchRange,
+							format!("keyspace {keyspace} has no range [{lo}, {hi}] any more"),
+						)
 					})?;
 				r.node = *to;
 			}
@@ -186,7 +187,10 @@ impl Change {
 			} => {
 				let ks = ks_mut(c, keyspace)?;
 				let p = ks.pins.get_mut(value).ok_or_else(|| {
-					OpError::refused(Kind::NoSuchPin, format!("keyspace {keyspace} has no pin {value}"))
+					OpError::refused(
+						Kind::NoSuchPin,
+						format!("keyspace {keyspace} has no pin {value}"),
+					)
 				})?;
 				*p = *to;
 			}
@@ -200,8 +204,7 @@ impl Change {
 			}
 			Change::Split { keyspace, lo, at } => {
 				let ks = ks_mut(c, keyspace)?;
-				if ks.ranges.iter().any(|r| r.lo == *at) && ks.ranges.iter().any(|r| r.lo == *lo)
-				{
+				if ks.ranges.iter().any(|r| r.lo == *at) && ks.ranges.iter().any(|r| r.lo == *lo) {
 					return Ok(());
 				}
 				let i = ks
@@ -209,9 +212,12 @@ impl Change {
 					.iter()
 					.position(|r| r.lo == *lo && r.hi >= *at && *at > *lo)
 					.ok_or_else(|| {
-						OpError::refused(Kind::NoSuchRange, format!(
-							"keyspace {keyspace} has no range starting at {lo} that {at} falls inside"
-						))
+						OpError::refused(
+							Kind::NoSuchRange,
+							format!(
+								"keyspace {keyspace} has no range starting at {lo} that {at} falls inside"
+							),
+						)
 					})?;
 				let r = ks.ranges[i];
 				ks.ranges[i].hi = at - 1;
@@ -227,27 +233,35 @@ impl Change {
 			Change::Merge { keyspace, a, b } => {
 				let ks = ks_mut(c, keyspace)?;
 				let ia = ks.ranges.iter().position(|r| r.lo == *a).ok_or_else(|| {
-					OpError::refused(Kind::NoSuchRange, format!("keyspace {keyspace} has no range starting at {a}"))
+					OpError::refused(
+						Kind::NoSuchRange,
+						format!("keyspace {keyspace} has no range starting at {a}"),
+					)
 				})?;
 				let Some(ib) = ks.ranges.iter().position(|r| r.lo == *b) else {
 					// Already merged when a's range reaches past b.
 					if ks.ranges[ia].hi >= *b {
 						return Ok(());
 					}
-					return Err(OpError::refused(Kind::NoSuchRange, format!(
-						"keyspace {keyspace} has no range starting at {b}"
-					)));
+					return Err(OpError::refused(
+						Kind::NoSuchRange,
+						format!("keyspace {keyspace} has no range starting at {b}"),
+					));
 				};
 				let (ra, rb) = (ks.ranges[ia], ks.ranges[ib]);
 				if ra.hi.checked_add(1) != Some(rb.lo) {
-					return Err(OpError::refused(Kind::NotAdjacent, format!(
-						"ranges {a} and {b} of {keyspace} are not adjacent"
-					)));
+					return Err(OpError::refused(
+						Kind::NotAdjacent,
+						format!("ranges {a} and {b} of {keyspace} are not adjacent"),
+					));
 				}
 				if ra.node != rb.node {
-					return Err(OpError::refused(Kind::RangesOnDifferentNodes, format!(
-						"ranges {a} and {b} of {keyspace} are on different nodes; move one first"
-					)));
+					return Err(OpError::refused(
+						Kind::RangesOnDifferentNodes,
+						format!(
+							"ranges {a} and {b} of {keyspace} are on different nodes; move one first"
+						),
+					));
 				}
 				ks.ranges[ia].hi = rb.hi;
 				ks.ranges.remove(ib);
@@ -263,9 +277,10 @@ impl Change {
 			} => match c.keyspaces.get(name) {
 				Some(k) if k.key_type == *key_type && k.seed == *seed => {}
 				Some(_) => {
-					return Err(OpError::refused(Kind::KeyspaceExists, format!(
-						"keyspace {name} exists with another key type or seed"
-					)));
+					return Err(OpError::refused(
+						Kind::KeyspaceExists,
+						format!("keyspace {name} exists with another key type or seed"),
+					));
 				}
 				None => {
 					c.keyspaces.insert(
@@ -284,7 +299,9 @@ impl Change {
 			Change::NodeState { node, state } => {
 				c.nodes
 					.get_mut(node)
-					.ok_or_else(|| OpError::refused(Kind::NoSuchNode, format!("there is no {node}")))?
+					.ok_or_else(|| {
+						OpError::refused(Kind::NoSuchNode, format!("there is no {node}"))
+					})?
 					.state = *state;
 			}
 			Change::Many(all) => {
@@ -304,7 +321,9 @@ impl Change {
 				lo,
 				hi,
 				to,
-			} => json!({"range_owner": {"keyspace": keyspace, "lo": lo.to_string(), "hi": hi.to_string(), "to": to.0}}),
+			} => {
+				json!({"range_owner": {"keyspace": keyspace, "lo": lo.to_string(), "hi": hi.to_string(), "to": to.0}})
+			}
 			Change::PinOwner {
 				keyspace,
 				value,
@@ -337,7 +356,9 @@ impl Change {
 			Change::NodeState { node, state } => {
 				json!({"node_state": {"node": node.0, "state": state_name(*state)}})
 			}
-			Change::Many(all) => json!({"many": all.iter().map(Change::to_json).collect::<Vec<_>>()}),
+			Change::Many(all) => {
+				json!({"many": all.iter().map(Change::to_json).collect::<Vec<_>>()})
+			}
 		}
 	}
 
@@ -412,7 +433,11 @@ impl Change {
 			},
 			"many" => Change::Many(
 				a.as_array()
-					.map(|x| x.iter().map(Change::from_json).collect::<Result<Vec<_>, _>>())
+					.map(|x| {
+						x.iter()
+							.map(Change::from_json)
+							.collect::<Result<Vec<_>, _>>()
+					})
 					.transpose()?
 					.unwrap_or_default(),
 			),
@@ -447,7 +472,12 @@ pub fn parse_state(s: &str) -> Result<NodeState, OpError> {
 		"active" => NodeState::Active,
 		"draining" => NodeState::Draining,
 		"removed" => NodeState::Removed,
-		_ => return Err(OpError::refused(Kind::BadRequest, format!("unknown node state {s}"))),
+		_ => {
+			return Err(OpError::refused(
+				Kind::BadRequest,
+				format!("unknown node state {s}"),
+			));
+		}
 	})
 }
 
@@ -456,9 +486,10 @@ pub fn parse_state(s: &str) -> Result<NodeState, OpError> {
 pub fn relation_name(s: &str) -> Result<RelationName, OpError> {
 	let (schema, table) = s.split_once('.').unwrap_or(("public", s));
 	if schema.is_empty() || table.is_empty() || table.contains('.') {
-		return Err(OpError::refused(Kind::BadRequest, format!(
-			"{s}: name a table as schema.table"
-		)));
+		return Err(OpError::refused(
+			Kind::BadRequest,
+			format!("{s}: name a table as schema.table"),
+		));
 	}
 	Ok(RelationName {
 		schema: schema.to_string(),
@@ -473,11 +504,15 @@ pub fn qualified(r: &RelationName) -> String {
 /// A 64-bit number from JSON, as a string (how Lepis sends them: JavaScript loses precision
 /// past 2^53) or as a number.
 pub fn i64_of(v: &Value) -> Option<i64> {
-	v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok()))
+	v.as_i64()
+		.or_else(|| v.as_str().and_then(|t| t.parse().ok()))
 }
 
 pub fn u64_of(v: Option<&Value>) -> Option<u64> {
-	v.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|t| t.parse().ok())))
+	v.and_then(|v| {
+		v.as_u64()
+			.or_else(|| v.as_str().and_then(|t| t.parse().ok()))
+	})
 }
 
 pub(crate) fn s(v: &Value, k: &str) -> Result<String, OpError> {
@@ -530,9 +565,12 @@ pub async fn write_catalog(
 	after: &Catalog,
 	extra: &str,
 ) -> Result<i64, OpError> {
-	after
-		.validate()
-		.map_err(|e| OpError::refused(Kind::CatalogInvalid, format!("the change would break the catalog: {e}")))?;
+	after.validate().map_err(|e| {
+		OpError::refused(
+			Kind::CatalogInvalid,
+			format!("the change would break the catalog: {e}"),
+		)
+	})?;
 	let mut sql = String::from("begin;\n");
 	sql.push_str(&format!(
 		"do $$ declare e bigint; begin \

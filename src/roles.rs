@@ -816,7 +816,9 @@ mod tests {
 		);
 		assert_eq!(
 			add.apply,
-			vec!["grant \"readers\" to \"app\" with admin true, inherit true, set true".to_string()]
+			vec![
+				"grant \"readers\" to \"app\" with admin true, inherit true, set true".to_string()
+			]
 		);
 		let take = plan(
 			&scope(&["app"]),

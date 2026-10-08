@@ -323,8 +323,9 @@ impl Gen<'_> {
 					6 => single(format!("{c} = {k}::bigint")),
 					7 => single(format!("{k} = {c}")),
 					8 => {
-						let ks: Vec<String> =
-							(0..self.r.int(2, 5)).map(|_| self.tenant().to_string()).collect();
+						let ks: Vec<String> = (0..self.r.int(2, 5))
+							.map(|_| self.tenant().to_string())
+							.collect();
 						many(format!("{c} in ({})", ks.join(", ")))
 					}
 					9 => {
@@ -749,10 +750,12 @@ impl Gen<'_> {
 				.chain(left.cols.iter())
 				.find(|c| c.group)
 				.copied();
-			let group_on = |alias_of: &str| if right.cols.iter().any(|c| c.name == alias_of) {
-				ra
-			} else {
-				la
+			let group_on = |alias_of: &str| {
+				if right.cols.iter().any(|c| c.name == alias_of) {
+					ra
+				} else {
+					la
+				}
 			};
 			let mut aggs = self.aggregates(left, la);
 			aggs.extend(self.aggregates(right, ra));
@@ -928,7 +931,11 @@ impl Gen<'_> {
 
 	/// UNION, UNION ALL, INTERSECT and EXCEPT of two filtered reads of one table.
 	fn set_operation(&mut self) -> Query {
-		let t = if self.r.chance(0.8) { &ORDERS } else { &TENANTS };
+		let t = if self.r.chance(0.8) {
+			&ORDERS
+		} else {
+			&TENANTS
+		};
 		let a = t.alias;
 		let pk = t.pk.iter().map(|p| format!("{a}.{p}")).collect::<Vec<_>>();
 		let side = |g: &mut Self| {

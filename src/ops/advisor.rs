@@ -309,9 +309,20 @@ pub fn decide(f: &Facts, s: &AdviceSettings) -> Vec<Advice> {
 			match least_loaded(&rs, &members, r.node, Metric::Bytes) {
 				Some(to) => {
 					touched.insert((k.to_string(), r.lo));
-					out.push(split_or_pin(f, s, r, r.bytes / 2.0, to, Metric::Bytes, &why));
+					out.push(split_or_pin(
+						f,
+						s,
+						r,
+						r.bytes / 2.0,
+						to,
+						Metric::Bytes,
+						&why,
+					));
 				}
-				None => add_reasons.push((format!("{why}, and there is no other node to take half"), "size")),
+				None => add_reasons.push((
+					format!("{why}, and there is no other node to take half"),
+					"size",
+				)),
 			}
 		}
 	}
@@ -326,7 +337,9 @@ pub fn decide(f: &Facts, s: &AdviceSettings) -> Vec<Advice> {
 			0,
 			Advice {
 				request: json!({"op": "node.add", "name": format!("n{}", f.next_node), "host": null}),
-				reason: format!("{reason}: add a node (it needs an address), then rebalance onto it"),
+				reason: format!(
+					"{reason}: add a node (it needs an address), then rebalance onto it"
+				),
 				metric: add_reasons[0].1,
 				needs: vec!["host"],
 			},
@@ -336,7 +349,11 @@ pub fn decide(f: &Facts, s: &AdviceSettings) -> Vec<Advice> {
 }
 
 /// The cluster as a whole out of room: the data against the nodes' disk, and connections.
-fn cluster_headroom(f: &Facts, s: &AdviceSettings, members: &[NodeId]) -> Vec<(String, &'static str)> {
+fn cluster_headroom(
+	f: &Facts,
+	s: &AdviceSettings,
+	members: &[NodeId],
+) -> Vec<(String, &'static str)> {
 	let live: Vec<&NodeFacts> = f.nodes.iter().filter(|n| members.contains(&n.id)).collect();
 	let mut why = Vec::new();
 	if live.is_empty() {
@@ -533,7 +550,13 @@ fn dominant(r: &RangeFacts, m: Metric) -> Option<(String, f64)> {
 
 /// The bound above which about `want` of the range's `m` lies, by its samples (sorted by hash).
 /// Always inside `(lo, hi]`; None when the samples cannot place one.
-pub fn split_bound_of(samples: &[Sample], lo: i64, hi: i64, weight: impl Fn(&Sample) -> f64, fraction: f64) -> Option<i64> {
+pub fn split_bound_of(
+	samples: &[Sample],
+	lo: i64,
+	hi: i64,
+	weight: impl Fn(&Sample) -> f64,
+	fraction: f64,
+) -> Option<i64> {
 	let total: f64 = samples.iter().map(&weight).sum();
 	if total <= 0.0 || lo >= hi {
 		return None;
@@ -570,14 +593,22 @@ fn midpoint(r: &RangeFacts) -> i64 {
 
 /// A node over its share of its own disk, when other nodes are not: the range that fits the
 /// emptiest node's room moves there, or the biggest is split to it.
-fn node_disk(f: &Facts, s: &AdviceSettings, members: &[NodeId], touched: &mut HashSet<(String, i64)>) -> Vec<Advice> {
+fn node_disk(
+	f: &Facts,
+	s: &AdviceSettings,
+	members: &[NodeId],
+	touched: &mut HashSet<(String, i64)>,
+) -> Vec<Advice> {
 	let mut out = Vec::new();
 	if s.node_disk_bytes == 0 {
 		return out;
 	}
 	let limit = s.node_disk_bytes as f64 * s.disk_pct as f64 / 100.0;
 	let live: Vec<&NodeFacts> = f.nodes.iter().filter(|n| members.contains(&n.id)).collect();
-	let Some(roomiest) = live.iter().min_by(|a, b| a.db_bytes.cmp(&b.db_bytes).then(a.id.cmp(&b.id))) else {
+	let Some(roomiest) = live
+		.iter()
+		.min_by(|a, b| a.db_bytes.cmp(&b.db_bytes).then(a.id.cmp(&b.id)))
+	else {
 		return out;
 	};
 	let room = limit - roomiest.db_bytes as f64;
@@ -597,7 +628,9 @@ fn node_disk(f: &Facts, s: &AdviceSettings, members: &[NodeId], touched: &mut Ha
 		let mut mine: Vec<&RangeFacts> = f
 			.ranges
 			.iter()
-			.filter(|r| r.node == n.id && !touched.contains(&(r.keyspace.clone(), r.lo)) && r.bytes > 0.0)
+			.filter(|r| {
+				r.node == n.id && !touched.contains(&(r.keyspace.clone(), r.lo)) && r.bytes > 0.0
+			})
 			.collect();
 		mine.sort_by(|a, b| b.bytes.total_cmp(&a.bytes));
 		let Some(biggest) = mine.first() else {
@@ -606,18 +639,34 @@ fn node_disk(f: &Facts, s: &AdviceSettings, members: &[NodeId], touched: &mut Ha
 		let a = match mine.iter().find(|r| r.bytes < room) {
 			Some(r) => Advice {
 				request: json!({"op": "range.move", "keyspace": r.keyspace, "range": r.lo.to_string(), "to": roomiest.id.0}),
-				reason: format!("{why}: moving range {}:{} ({}) there", r.keyspace, r.lo, bytes(r.bytes)),
+				reason: format!(
+					"{why}: moving range {}:{} ({}) there",
+					r.keyspace,
+					r.lo,
+					bytes(r.bytes)
+				),
 				metric: "disk",
 				needs: vec![],
 			},
 			None => {
-				let mut a = split_or_pin(f, s, biggest, room / 2.0, roomiest.id, Metric::Bytes, &why);
+				let mut a =
+					split_or_pin(f, s, biggest, room / 2.0, roomiest.id, Metric::Bytes, &why);
 				a.metric = "disk";
 				a
 			}
 		};
-		let r = a.request.get("range").and_then(Value::as_str).and_then(|t| t.parse().ok()).unwrap_or(biggest.lo);
-		let k = a.request.get("keyspace").and_then(Value::as_str).unwrap_or_default().to_string();
+		let r = a
+			.request
+			.get("range")
+			.and_then(Value::as_str)
+			.and_then(|t| t.parse().ok())
+			.unwrap_or(biggest.lo);
+		let k = a
+			.request
+			.get("keyspace")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_string();
 		touched.insert((k, r));
 		out.push(a);
 	}
@@ -712,7 +761,9 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 	for name in names {
 		let ks = &c.keyspaces[name];
 		for rel in tables_of(c, name) {
-			let Some(crate::catalog::RelationKind::Sharded { key_column, .. }) = c.relations.get(&rel) else {
+			let Some(crate::catalog::RelationKind::Sharded { key_column, .. }) =
+				c.relations.get(&rel)
+			else {
 				continue;
 			};
 			for (id, (pg, version)) in conns.iter_mut() {
@@ -743,11 +794,17 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 						.and_then(|v| v.parse().ok())
 						.unwrap_or(0.0);
 				}
-				let Ok(expr) = ks.key_type.sql_expression(&quote_ident(key_column), ks.seed, *version) else {
+				let Ok(expr) =
+					ks.key_type
+						.sql_expression(&quote_ident(key_column), ks.seed, *version)
+				else {
 					continue;
 				};
 				let sample_clause = if tuples > SAMPLE_ROWS {
-					format!(" tablesample system ({:.6})", (SAMPLE_ROWS * 100.0 / tuples).max(0.000_001))
+					format!(
+						" tablesample system ({:.6})",
+						(SAMPLE_ROWS * 100.0 / tuples).max(0.000_001)
+					)
 				} else {
 					String::new()
 				};
@@ -790,7 +847,10 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 		for (id, (pg, _)) in conns.iter_mut() {
 			let after = write_counters(pg).await?;
 			let was = before.get(id).cloned().unwrap_or_default();
-			let rate = |name: &str| (after.get(name).copied().unwrap_or(0.0) - was.get(name).copied().unwrap_or(0.0)).max(0.0) / seconds;
+			let rate = |name: &str| {
+				(after.get(name).copied().unwrap_or(0.0) - was.get(name).copied().unwrap_or(0.0))
+					.max(0.0) / seconds
+			};
 			if let Some(n) = nodes.iter_mut().find(|n| n.id == *id) {
 				n.writes_per_s = after.keys().map(|k| rate(k)).sum();
 			}
@@ -847,7 +907,9 @@ fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<Ran
 		})
 		.collect();
 	for t in tables {
-		let owned: Vec<usize> = (0..ranges.len()).filter(|i| ranges[*i].node == t.node).collect();
+		let owned: Vec<usize> = (0..ranges.len())
+			.filter(|i| ranges[*i].node == t.node)
+			.collect();
 		if owned.is_empty() {
 			continue;
 		}
@@ -863,7 +925,10 @@ fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<Ran
 			continue;
 		}
 		for (h, key) in &t.sample {
-			let Some(&i) = owned.iter().find(|i| ranges[**i].lo <= *h && *h <= ranges[**i].hi) else {
+			let Some(&i) = owned
+				.iter()
+				.find(|i| ranges[**i].lo <= *h && *h <= ranges[**i].hi)
+			else {
 				continue;
 			};
 			out[i].rows += t.tuples / n;
@@ -902,7 +967,10 @@ fn facts_json(f: &Facts) -> Value {
 /// `GET /v1/advice`: the facts, the recommendations, and each one's plan. Runs nothing.
 pub async fn advise(app: &Arc<App>, h: &mut Pg, sample_ms: Option<u64>) -> Result<Value, OpError> {
 	if !engine::ensure_jobs_schema(h).await? {
-		return Err(OpError::refused(Kind::NoCatalog, "the home node has no Lepis catalog (schema lepis)"));
+		return Err(OpError::refused(
+			Kind::NoCatalog,
+			"the home node has no Lepis catalog (schema lepis)",
+		));
 	}
 	let cluster: Value = h
 		.value("select settings::text from lepis.cluster where id = 1", &[])
@@ -922,13 +990,16 @@ pub async fn advise(app: &Arc<App>, h: &mut Pg, sample_ms: Option<u64>) -> Resul
 		});
 		if a.needs.is_empty() {
 			let planned = match Op::from_json(&a.request) {
-				Ok(op) => plan::plan(app, h, &op, op_settings).await.map(|p| p.summary),
+				Ok(op) => plan::plan(app, h, &op, op_settings)
+					.await
+					.map(|p| p.summary),
 				Err(e) => Err(e),
 			};
 			match planned {
 				Ok(p) => v["plan"] = p,
 				Err(e) => {
-					v["plan_error"] = json!({"kind": e.kind.map_or("failed", Kind::name), "message": e.message});
+					v["plan_error"] =
+						json!({"kind": e.kind.map_or("failed", Kind::name), "message": e.message});
 				}
 			}
 		}
@@ -1031,7 +1102,10 @@ mod tests {
 	fn a_small_keyspace_is_left_alone_however_skewed() {
 		let f = facts(&[1, 2, 3], ranges(3, &[1, 2, 3], &[100e6, 1e6, 1e6]));
 		assert_eq!(decide(&f, &AdviceSettings::default()), vec![]);
-		let s = AdviceSettings { min_bytes: 1, ..Default::default() };
+		let s = AdviceSettings {
+			min_bytes: 1,
+			..Default::default()
+		};
 		assert_eq!(decide(&f, &s).len(), 1);
 	}
 
@@ -1055,9 +1129,16 @@ mod tests {
 		let at: i64 = req["at"].as_str().unwrap().parse().unwrap();
 		assert!(at > lo && at <= hi);
 		// The gap is 8 GB; half of it, 4 GB, is 44 of the 100 sampled rows, all in the bottom tenth.
-		assert!(at < lo + (hi - lo) / 10, "{at} should be near the rows, low in the range");
+		assert!(
+			at < lo + (hi - lo) / 10,
+			"{at} should be near the rows, low in the range"
+		);
 		assert_eq!(a[0].metric, "size");
-		assert!(a[0].reason.contains("node 2 holds 9.0 GB"), "{}", a[0].reason);
+		assert!(
+			a[0].reason.contains("node 2 holds 9.0 GB"),
+			"{}",
+			a[0].reason
+		);
 		// The request is one the admin API takes.
 		Op::from_json(req).unwrap();
 	}
@@ -1065,10 +1146,17 @@ mod tests {
 	#[test]
 	fn a_whole_range_moves_when_one_fits_the_gap() {
 		// Node 1 holds two ranges (3 GB + 3 GB), node 2 one (0.5 GB): a 3 GB range fits the 5.5 GB gap.
-		let f = facts(&[1, 2], ranges(3, &[1, 1, 2], &[3.0 * GB, 3.0 * GB, 0.5 * GB]).into_iter().enumerate().map(|(i, mut r)| {
-			r.node = NodeId(if i < 2 { 1 } else { 2 });
-			r
-		}).collect());
+		let f = facts(
+			&[1, 2],
+			ranges(3, &[1, 1, 2], &[3.0 * GB, 3.0 * GB, 0.5 * GB])
+				.into_iter()
+				.enumerate()
+				.map(|(i, mut r)| {
+					r.node = NodeId(if i < 2 { 1 } else { 2 });
+					r
+				})
+				.collect(),
+		);
 		let a = decide(&f, &AdviceSettings::default());
 		assert_eq!(a.len(), 1, "{a:?}");
 		assert_eq!(a[0].request["op"], "range.move");
@@ -1094,7 +1182,10 @@ mod tests {
 		// Already pinned: a split instead.
 		let mut f = facts(&[1, 2], rs);
 		f.pins.insert(("k".into(), "4242".into()));
-		assert_eq!(decide(&f, &AdviceSettings::default())[0].request["op"], "range.split");
+		assert_eq!(
+			decide(&f, &AdviceSettings::default())[0].request["op"],
+			"range.split"
+		);
 	}
 
 	#[test]
@@ -1112,7 +1203,10 @@ mod tests {
 		assert_eq!(a[0].metric, "writes");
 		assert_eq!(a[0].request["op"], "range.split");
 		// Below the floor, nothing.
-		let s = AdviceSettings { min_writes_per_s: 5_000, ..Default::default() };
+		let s = AdviceSettings {
+			min_writes_per_s: 5_000,
+			..Default::default()
+		};
 		assert_eq!(decide(&f, &s), vec![]);
 	}
 
@@ -1163,7 +1257,10 @@ mod tests {
 
 	#[test]
 	fn unreachable_and_draining_nodes_are_not_targets() {
-		let mut f = facts(&[1, 2, 3], ranges(3, &[1, 2, 3], &[9.0 * GB, 2.0 * GB, 0.0]));
+		let mut f = facts(
+			&[1, 2, 3],
+			ranges(3, &[1, 2, 3], &[9.0 * GB, 2.0 * GB, 0.0]),
+		);
 		f.nodes[2].error = Some("refused".into());
 		let a = decide(&f, &AdviceSettings::default());
 		assert_eq!(a[0].request["to"], 2, "{a:?}");
@@ -1174,22 +1271,41 @@ mod tests {
 
 	#[test]
 	fn the_bound_is_always_inside_the_range() {
-		let s = |h: i64| Sample { hash: h, key: h.to_string(), bytes: 1.0, writes: 0.0 };
+		let s = |h: i64| Sample {
+			hash: h,
+			key: h.to_string(),
+			bytes: 1.0,
+			writes: 0.0,
+		};
 		let all_low = vec![s(10), s(10), s(10), s(20)];
-		assert_eq!(split_bound_of(&all_low, 10, 100, |x| x.bytes, 0.9), Some(20));
-		assert_eq!(split_bound_of(&[s(10), s(10)], 10, 100, |x| x.bytes, 0.5), None);
+		assert_eq!(
+			split_bound_of(&all_low, 10, 100, |x| x.bytes, 0.9),
+			Some(20)
+		);
+		assert_eq!(
+			split_bound_of(&[s(10), s(10)], 10, 100, |x| x.bytes, 0.5),
+			None
+		);
 		assert_eq!(split_bound_of(&[], 10, 100, |x| x.bytes, 0.5), None);
 		let spread: Vec<Sample> = (1..=10).map(|i| s(i * 10)).collect();
 		assert_eq!(split_bound_of(&spread, 0, 1000, |x| x.bytes, 0.3), Some(80));
-		assert_eq!(split_bound_of(&spread, i64::MIN, i64::MAX, |x| x.bytes, 1.0), Some(10));
+		assert_eq!(
+			split_bound_of(&spread, i64::MIN, i64::MAX, |x| x.bytes, 1.0),
+			Some(10)
+		);
 	}
 
 	#[test]
 	fn settings_read_back_and_stay_sane() {
 		let d = AdviceSettings::default();
 		assert_eq!(AdviceSettings::from_json(&d.to_json()), d);
-		let s = AdviceSettings::from_json(&json!({"advice_skew_pct": 50, "advice_sample_ms": 999_999, "advice_min_bytes": 1}));
-		assert_eq!((s.skew_pct, s.sample_ms, s.min_bytes), (101, MAX_SAMPLE_MS, 1));
+		let s = AdviceSettings::from_json(
+			&json!({"advice_skew_pct": 50, "advice_sample_ms": 999_999, "advice_min_bytes": 1}),
+		);
+		assert_eq!(
+			(s.skew_pct, s.sample_ms, s.min_bytes),
+			(101, MAX_SAMPLE_MS, 1)
+		);
 		let mut names: Vec<String> = d.to_json().as_object().unwrap().keys().cloned().collect();
 		names.sort();
 		let mut want: Vec<String> = SETTING_NAMES.iter().map(|s| s.to_string()).collect();
@@ -1200,8 +1316,16 @@ mod tests {
 	#[test]
 	fn attribution_follows_the_sampled_hashes() {
 		let r = vec![
-			Range { lo: i64::MIN, hi: -1, node: NodeId(1) },
-			Range { lo: 0, hi: i64::MAX, node: NodeId(1) },
+			Range {
+				lo: i64::MIN,
+				hi: -1,
+				node: NodeId(1),
+			},
+			Range {
+				lo: 0,
+				hi: i64::MAX,
+				node: NodeId(1),
+			},
 		];
 		let t = TableRead {
 			node: NodeId(1),
@@ -1209,7 +1333,12 @@ mod tests {
 			size: 1000.0,
 			tuples: 100.0,
 			writes_per_s: 10.0,
-			sample: vec![(-5, "a".into()), (5, "b".into()), (6, "c".into()), (7, "d".into())],
+			sample: vec![
+				(-5, "a".into()),
+				(5, "b".into()),
+				(6, "c".into()),
+				(7, "d".into()),
+			],
 		};
 		let out = attribute("k", &r, &[&t]);
 		assert_eq!(out[0].bytes, 250.0);
@@ -1217,7 +1346,10 @@ mod tests {
 		assert_eq!(out[1].rows, 75.0);
 		assert_eq!(out[1].samples.len(), 3);
 		// Nothing sampled: by width.
-		let t = TableRead { sample: vec![], ..t };
+		let t = TableRead {
+			sample: vec![],
+			..t
+		};
 		let out = attribute("k", &r, &[&t]);
 		assert!((out[0].bytes - 500.0).abs() < 1e-6);
 	}

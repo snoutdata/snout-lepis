@@ -42,13 +42,16 @@ pub async fn precheck(
 	standby_of: NodeId,
 ) -> Result<serde_json::Value, OpError> {
 	if c.nodes.values().any(|n| n.name == spec.name) {
-		return Err(OpError::refused(Kind::NodeNameTaken, format!(
-			"a node named {} is already in the cluster",
-			spec.name
-		)));
+		return Err(OpError::refused(
+			Kind::NodeNameTaken,
+			format!("a node named {} is already in the cluster", spec.name),
+		));
 	}
 	if !c.nodes.contains_key(&standby_of) {
-		return Err(OpError::refused(Kind::NoSuchNode, format!("there is no {standby_of}")));
+		return Err(OpError::refused(
+			Kind::NoSuchNode,
+			format!("there is no {standby_of}"),
+		));
 	}
 	let mut dst = Pg::connect(app, &target_of(app, spec)).await?;
 	let mut src = connect_node(app, c, standby_of).await?;
@@ -70,7 +73,9 @@ pub async fn run(
 	let c = load_catalog(h).await?;
 	if !c.nodes.contains_key(&id) {
 		let report = precheck(&cx.app, &c, spec, standby_of).await?;
-		let version = report["settings"]["server_version_num"].as_u64().unwrap_or(0);
+		let version = report["settings"]["server_version_num"]
+			.as_u64()
+			.unwrap_or(0);
 		let mut labels = json!({ STANDBY_LABEL: standby_of.0 });
 		if let Some(p) = &spec.peer_host {
 			labels["peer_host"] = json!(p);

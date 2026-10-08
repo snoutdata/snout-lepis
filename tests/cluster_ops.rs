@@ -53,7 +53,14 @@ impl Admin {
 	async fn plan(&self, op: Value) -> Value {
 		let (status, plan) = self.call("POST", "/v1/plan", Some(&op)).await;
 		assert_eq!(status, 200, "plan {op}: {plan}");
-		for k in ["steps", "moves", "estimated_rows", "estimated_copy_seconds", "expected_pause_ms", "max_write_pause_ms"] {
+		for k in [
+			"steps",
+			"moves",
+			"estimated_rows",
+			"estimated_copy_seconds",
+			"expected_pause_ms",
+			"max_write_pause_ms",
+		] {
 			assert!(plan.get(k).is_some(), "plan {op} has no {k}: {plan}");
 		}
 		plan
@@ -83,13 +90,20 @@ impl Admin {
 		let id = self.start(op.clone()).await;
 		let j = self.wait(id).await;
 		assert_eq!(j["state"], "done", "{op} failed: {j:#}");
-		eprintln!("  (finished at {:.1}s)", T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
+		eprintln!(
+			"  (finished at {:.1}s)",
+			T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64())
+		);
 		for s in j["steps"].as_array().unwrap() {
 			let d = &s["detail"];
 			if d.get("prepare_ms").is_some() {
 				eprintln!(
 					"    move: tables {} ms, prepared {} ms, copy {} s, mark {} ms, cutover {}",
-					d["tables_ms"], d["prepare_ms"], d["copy_seconds"], d["mark_rtt_ms"], d["cutover"]
+					d["tables_ms"],
+					d["prepare_ms"],
+					d["copy_seconds"],
+					d["mark_rtt_ms"],
+					d["cutover"]
 				);
 			}
 		}
@@ -99,7 +113,10 @@ impl Admin {
 			plan["cutovers"],
 			plan["estimated_rows"],
 			plan["estimated_copy_seconds"].as_f64().unwrap_or(0.0),
-			pauses(&j).iter().map(|p| p.round() as i64).collect::<Vec<_>>(),
+			pauses(&j)
+				.iter()
+				.map(|p| p.round() as i64)
+				.collect::<Vec<_>>(),
 		);
 		j
 	}
@@ -222,14 +239,24 @@ async fn write(
 					continue;
 				}
 				if begun.elapsed() > Duration::from_secs(2) {
-					eprint!("t={:.1}s ", T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64()));
-					eprintln!("slow write: {} ms, {attempt} attempts {trail:?}: {sql}", begun.elapsed().as_millis());
+					eprint!(
+						"t={:.1}s ",
+						T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64())
+					);
+					eprintln!(
+						"slow write: {} ms, {attempt} attempts {trail:?}: {sql}",
+						begun.elapsed().as_millis()
+					);
 				}
 				return Outcome::Done;
 			}
 			Err(e) => {
 				let code = e.as_db_error().map(|d| d.code().code().to_string());
-				trail.push(format!("{} {}", begun.elapsed().as_millis(), code.clone().unwrap_or_else(|| e.to_string())));
+				trail.push(format!(
+					"{} {}",
+					begun.elapsed().as_millis(),
+					code.clone().unwrap_or_else(|| e.to_string())
+				));
 				if insert && attempt > 1 && code.as_deref() == Some("23505") {
 					return Outcome::Done;
 				}
@@ -249,7 +276,14 @@ async fn write(
 	}
 }
 
-async fn load(lepis: String, w: usize, stop: Arc<AtomicBool>, next: Arc<AtomicI64>, stats: Arc<StdMutex<Stats>>, t0: Instant) {
+async fn load(
+	lepis: String,
+	w: usize,
+	stop: Arc<AtomicBool>,
+	next: Arc<AtomicI64>,
+	stats: Arc<StdMutex<Stats>>,
+	t0: Instant,
+) {
 	let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (w as u64 + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
 	let mut client = try_connect(&lepis).await;
 	let mut mine: Vec<(i64, i64)> = Vec::new();
@@ -259,7 +293,9 @@ async fn load(lepis: String, w: usize, stop: Arc<AtomicBool>, next: Arc<AtomicI6
 		if mine.is_empty() || rng.next() % 10 < 6 {
 			let acct = (rng.next() % 1000) as i64 + 1;
 			let id = next.fetch_add(1, Ordering::Relaxed);
-			let sql = format!("insert into opsx.ledger (acct, id, n, note) values ({acct}, {id}, 0, 'w{w}')");
+			let sql = format!(
+				"insert into opsx.ledger (acct, id, n, note) values ({acct}, {id}, 0, 'w{w}')"
+			);
 			write(&lepis, &mut client, &sql, true, &stats).await;
 			mine.push((acct, id));
 			let mut s = stats.lock().unwrap();
@@ -295,7 +331,10 @@ async fn operations_under_write_load_lose_nothing() {
 	let home = connect(&b.home, "postgres", "x").await;
 	for (_, a) in &nodes {
 		let admin = connect(a, "postgres", "x").await;
-		admin.batch_execute("drop schema if exists opsx cascade").await.unwrap();
+		admin
+			.batch_execute("drop schema if exists opsx cascade")
+			.await
+			.unwrap();
 	}
 	home.batch_execute(&format!(
 		"create schema opsx;
@@ -336,35 +375,91 @@ async fn operations_under_write_load_lose_nothing() {
 
 	// The API refuses without the token, and names what it cannot do.
 	let mut s = tokio::net::TcpStream::connect(&admin.addr).await.unwrap();
-	s.write_all(b"GET /v1/status HTTP/1.1\r\n\r\n").await.unwrap();
+	s.write_all(b"GET /v1/status HTTP/1.1\r\n\r\n")
+		.await
+		.unwrap();
 	let mut out = String::new();
 	s.read_to_string(&mut out).await.unwrap();
 	assert!(out.starts_with("HTTP/1.1 401"), "{out}");
-	let (code, e) = admin.call("POST", "/v1/plan", Some(&json!({"op": "range.move", "keyspace": "nope", "range": 0, "to": 2}))).await;
-	assert_eq!((code, e["error"]["kind"].as_str()), (404, Some("no_such_keyspace")), "{e}");
-	assert!(e["error"]["message"].as_str().unwrap().contains("no keyspace nope"), "{e}");
+	let (code, e) = admin
+		.call(
+			"POST",
+			"/v1/plan",
+			Some(&json!({"op": "range.move", "keyspace": "nope", "range": 0, "to": 2})),
+		)
+		.await;
+	assert_eq!(
+		(code, e["error"]["kind"].as_str()),
+		(404, Some("no_such_keyspace")),
+		"{e}"
+	);
+	assert!(
+		e["error"]["message"]
+			.as_str()
+			.unwrap()
+			.contains("no keyspace nope"),
+		"{e}"
+	);
 	// 404 for what does not exist, 400 for input that cannot be right, 409 for what the
 	// cluster's state refuses; `kind` is the machine-readable reason.
 	for (method, path, body, status, kind) in [
 		("GET", "/v1/jobs/99999", None, 404, "no_such_job"),
 		("POST", "/v1/jobs/99999/cancel", None, 404, "no_such_job"),
 		("POST", "/v1/jobs/99999/resume", None, 404, "no_such_job"),
-		("POST", "/v1/plan", Some(json!({"op": "range.teleport"})), 400, "unknown_operation"),
-		("POST", "/v1/plan", Some(json!({"op": "range.move", "keyspace": "tenant"})), 400, "bad_request"),
-		("POST", "/v1/plan", Some(json!({"op": "node.remove", "node": 1})), 409, "home_node"),
-		("POST", "/v1/plan", Some(json!({"op": "node.remove", "node": 2})), 409, "node_not_empty"),
+		(
+			"POST",
+			"/v1/plan",
+			Some(json!({"op": "range.teleport"})),
+			400,
+			"unknown_operation",
+		),
+		(
+			"POST",
+			"/v1/plan",
+			Some(json!({"op": "range.move", "keyspace": "tenant"})),
+			400,
+			"bad_request",
+		),
+		(
+			"POST",
+			"/v1/plan",
+			Some(json!({"op": "node.remove", "node": 1})),
+			409,
+			"home_node",
+		),
+		(
+			"POST",
+			"/v1/plan",
+			Some(json!({"op": "node.remove", "node": 2})),
+			409,
+			"node_not_empty",
+		),
 		("POST", "/v1/nothing", None, 404, "no_such_route"),
 	] {
 		let (code, e) = admin.call(method, path, body.as_ref()).await;
-		assert_eq!((code, e["error"]["kind"].as_str()), (status, Some(kind)), "{method} {path}: {e}");
-		assert!(e["error"]["message"].as_str().is_some_and(|m| !m.is_empty()), "{e}");
+		assert_eq!(
+			(code, e["error"]["kind"].as_str()),
+			(status, Some(kind)),
+			"{method} {path}: {e}"
+		);
+		assert!(
+			e["error"]["message"]
+				.as_str()
+				.is_some_and(|m| !m.is_empty()),
+			"{e}"
+		);
 	}
 	// A plan's 64-bit bounds are strings.
 	let first = ranges(&admin.status().await, "tenant")[0].0;
-	let p = admin.plan(json!({"op": "range.split", "keyspace": "tenant", "range": first.to_string()})).await;
+	let p = admin
+		.plan(json!({"op": "range.split", "keyspace": "tenant", "range": first.to_string()}))
+		.await;
 	let split = &p["steps"][0]["args"]["change"]["split"];
 	assert_eq!(split["lo"], json!(first.to_string()), "{p}");
-	assert!(p["moves"][0]["change"]["range_owner"]["hi"].is_string(), "{p}");
+	assert!(
+		p["moves"][0]["change"]["range_owner"]["hi"].is_string(),
+		"{p}"
+	);
 
 	admin
 		.op(json!({"op": "keyspace.create", "name": "acct", "key_type": "bigint", "seed": 4242, "ranges": 2, "nodes": [1, 2]}))
@@ -379,35 +474,80 @@ async fn operations_under_write_load_lose_nothing() {
 	let sampler = tokio::spawn(sample_stalls(nodes.clone(), stop.clone(), t0));
 	let mut workers = Vec::new();
 	for w in 0..WORKERS {
-		workers.push(tokio::spawn(load(lepis.clone(), w, stop.clone(), next.clone(), stats.clone(), t0)));
+		workers.push(tokio::spawn(load(
+			lepis.clone(),
+			w,
+			stop.clone(),
+			next.clone(),
+			stats.clone(),
+			t0,
+		)));
 	}
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	let mut jobs = Vec::new();
-	jobs.push(admin.op(json!({"op": "table.distribute", "table": "opsx.ledger", "column": "acct", "keyspace": "acct"})).await);
+	jobs.push(
+		admin
+			.op(
+				json!({"op": "table.distribute", "table": "opsx.ledger", "column": "acct", "keyspace": "acct"}),
+			)
+			.await,
+	);
 
 	// Split node 2's range and move the upper half to node 3.
 	let st = admin.status().await;
 	let (lo2, hi2, _) = *ranges(&st, "acct").iter().find(|r| r.2 == 2).unwrap();
-	jobs.push(admin.op(json!({"op": "range.split", "keyspace": "acct", "range": lo2.to_string(), "to": 3})).await);
+	jobs.push(
+		admin
+			.op(json!({"op": "range.split", "keyspace": "acct", "range": lo2.to_string(), "to": 3}))
+			.await,
+	);
 	let st = admin.status().await;
 	let r = ranges(&st, "acct");
-	assert!(r.iter().any(|x| x.0 == lo2 && x.2 == 2) && r.iter().any(|x| x.1 == hi2 && x.2 == 3), "{r:?}");
+	assert!(
+		r.iter().any(|x| x.0 == lo2 && x.2 == 2) && r.iter().any(|x| x.1 == hi2 && x.2 == 3),
+		"{r:?}"
+	);
 	let upper = r.iter().find(|x| x.1 == hi2).unwrap().0;
 
 	// Node 1's range moves to node 3.
 	let (lo1, _, _) = *r.iter().find(|x| x.2 == 1).unwrap();
-	jobs.push(admin.op(json!({"op": "range.move", "keyspace": "acct", "range": lo1.to_string(), "to": "n3"})).await);
+	jobs.push(
+		admin
+			.op(
+				json!({"op": "range.move", "keyspace": "acct", "range": lo1.to_string(), "to": "n3"}),
+			)
+			.await,
+	);
 
 	// The two halves of the split come back together (the upper half moves to node 2 first).
-	jobs.push(admin.op(json!({"op": "range.merge", "keyspace": "acct", "a": lo2.to_string(), "b": upper.to_string()})).await);
+	jobs.push(
+		admin
+			.op(
+				json!({"op": "range.merge", "keyspace": "acct", "a": lo2.to_string(), "b": upper.to_string()}),
+			)
+			.await,
+	);
 	let st = admin.status().await;
-	assert!(ranges(&st, "acct").contains(&(lo2, hi2, 2)), "{:?}", ranges(&st, "acct"));
+	assert!(
+		ranges(&st, "acct").contains(&(lo2, hi2, 2)),
+		"{:?}",
+		ranges(&st, "acct")
+	);
 
 	// A tenant on a node of its own.
-	jobs.push(admin.op(json!({"op": "tenant.pin", "keyspace": "acct", "value": "7", "node": 3})).await);
+	jobs.push(
+		admin
+			.op(json!({"op": "tenant.pin", "keyspace": "acct", "value": "7", "node": 3}))
+			.await,
+	);
 	let st = admin.status().await;
-	let pins = &st["keyspaces"].as_array().unwrap().iter().find(|k| k["name"] == "acct").unwrap()["pins"];
+	let pins = &st["keyspaces"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|k| k["name"] == "acct")
+		.unwrap()["pins"];
 	assert_eq!(pins, &json!([{"value": "7", "node": 3}]));
 
 	// Node 3 gives everything back (every keyspace, the pin included) and leaves.
@@ -421,13 +561,19 @@ async fn operations_under_write_load_lose_nothing() {
 			.await,
 	);
 	let st = admin.status().await;
-	assert!(ranges(&st, "acct").iter().any(|r| r.2 == 4), "{:?}", ranges(&st, "acct"));
+	assert!(
+		ranges(&st, "acct").iter().any(|r| r.2 == 4),
+		"{:?}",
+		ranges(&st, "acct")
+	);
 
 	// A move cancelled at once: rolled back before its cutover, or finished after it.
 	let st = admin.status().await;
 	let (lo, _, owner) = ranges(&st, "acct")[0];
 	let to = if owner == 1 { 2 } else { 1 };
-	let id = admin.start(json!({"op": "range.move", "keyspace": "acct", "range": lo.to_string(), "to": to})).await;
+	let id = admin
+		.start(json!({"op": "range.move", "keyspace": "acct", "range": lo.to_string(), "to": to}))
+		.await;
 	// Cancelled once its copy is under way, so the rollback is what is tested.
 	let deadline = Instant::now() + Duration::from_secs(60);
 	while Instant::now() < deadline {
@@ -437,15 +583,23 @@ async fn operations_under_write_load_lose_nothing() {
 		}
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
-	let (code, c) = admin.call("POST", &format!("/v1/jobs/{id}/cancel"), None).await;
+	let (code, c) = admin
+		.call("POST", &format!("/v1/jobs/{id}/cancel"), None)
+		.await;
 	assert_eq!(code, 200, "{c}");
 	let j = admin.wait(id).await;
 	assert_eq!(j["state"], "cancelled", "{j:#}");
 	let st = admin.status().await;
 	if j["steps"][0]["detail"]["phase"] == "rolled_back" {
-		assert!(ranges(&st, "acct").contains(&(lo, ranges(&st, "acct")[0].1, owner)), "a rolled back move changed the owner");
+		assert!(
+			ranges(&st, "acct").contains(&(lo, ranges(&st, "acct")[0].1, owner)),
+			"a rolled back move changed the owner"
+		);
 	}
-	eprintln!("cancel             job {id}: phase {}", j["steps"][0]["detail"]["phase"]);
+	eprintln!(
+		"cancel             job {id}: phase {}",
+		j["steps"][0]["detail"]["phase"]
+	);
 	jobs.push(j);
 
 	tokio::time::sleep(Duration::from_secs(2)).await;
@@ -466,7 +620,10 @@ async fn operations_under_write_load_lose_nothing() {
 	let mut dup = 0;
 	for (id, a) in &nodes {
 		let c = connect(a, "postgres", "x").await;
-		let rows = c.query("select acct, id, n from opsx.ledger", &[]).await.unwrap();
+		let rows = c
+			.query("select acct, id, n from opsx.ledger", &[])
+			.await
+			.unwrap();
 		eprintln!("node {}: {} ledger rows", id.0, rows.len());
 		for r in rows {
 			if seen.insert((r.get(0), r.get(1)), r.get(2)).is_some() {
@@ -493,9 +650,16 @@ async fn operations_under_write_load_lose_nothing() {
 	slow.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
 	eprintln!(
 		"slowest writes (started at, took): {:?}",
-		slow.iter().take(5).map(|(s, d)| (s.as_secs_f64(), d.as_millis())).collect::<Vec<_>>()
+		slow.iter()
+			.take(5)
+			.map(|(s, d)| (s.as_secs_f64(), d.as_millis()))
+			.collect::<Vec<_>>()
 	);
-	let mut all: Vec<f64> = stats.latency.iter().map(|(_, d)| d.as_secs_f64() * 1000.0).collect();
+	let mut all: Vec<f64> = stats
+		.latency
+		.iter()
+		.map(|(_, d)| d.as_secs_f64() * 1000.0)
+		.collect();
 	let writes = all.len();
 	let p50 = percentile(&mut all, 0.50);
 	let p99 = percentile(&mut all, 0.99);
@@ -524,7 +688,10 @@ async fn operations_under_write_load_lose_nothing() {
 		stats.errors, stats.stale_updates
 	);
 	assert_eq!((lost, dup, extra, wrong_updates), (0, 0, 0, 0));
-	assert!(cut_max <= 2000.0, "a cutover paused writes for {cut_max} ms");
+	assert!(
+		cut_max <= 2000.0,
+		"a cutover paused writes for {cut_max} ms"
+	);
 	assert!(p99 <= 2000.0, "p99 write latency {p99} ms");
 
 	// Nothing a job made is left on any node.
@@ -540,10 +707,20 @@ async fn operations_under_write_load_lose_nothing() {
 			.await
 			.unwrap()
 			.get(0);
-		assert_eq!(left, 0, "{a} still has a slot, publication or subscription a job made");
+		assert_eq!(
+			left, 0,
+			"{a} still has a slot, publication or subscription a job made"
+		);
 	}
 	let st = admin.status().await;
-	assert!(st["routers"].as_array().unwrap().iter().any(|r| r["current"] == true), "{st:#}");
+	assert!(
+		st["routers"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.any(|r| r["current"] == true),
+		"{st:#}"
+	);
 }
 
 /// Every 200 ms, on every node: client statements running for over a second, what they wait on,
@@ -575,7 +752,11 @@ async fn sample_stalls(nodes: Vec<(NodeId, String)>, stop: Arc<AtomicBool>, t0: 
 			};
 			for m in rows {
 				if let SimpleQueryMessage::Row(r) = m {
-					let key = (*n, r.get(0).unwrap_or("").to_string(), r.get(1).unwrap_or("").to_string());
+					let key = (
+						*n,
+						r.get(0).unwrap_or("").to_string(),
+						r.get(1).unwrap_or("").to_string(),
+					);
 					if seen.insert(key) {
 						eprintln!(
 							"STALL t={:.1}s node {n} pid {} waiting {}s on {}/{}: {} | blocked by {} = {}",

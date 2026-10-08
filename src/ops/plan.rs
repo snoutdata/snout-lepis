@@ -16,9 +16,7 @@ use super::Kind;
 use super::spec::{NodeSpec, Op, Step, TransferSpec};
 use super::steps::{check_node, connect_node, tables_of};
 use super::{Change, OpError, Pg, Settings, Target, load_catalog, qualified, schema};
-use crate::catalog::{
-	Catalog, Keyspace, NodeId, NodeState, Range, RelationKind, RelationName,
-};
+use crate::catalog::{Catalog, Keyspace, NodeId, NodeState, Range, RelationKind, RelationName};
 use crate::hash::KeyType;
 use crate::server::App;
 
@@ -42,9 +40,9 @@ fn active(c: &Catalog) -> Vec<NodeId> {
 }
 
 fn ks<'a>(c: &'a Catalog, name: &str) -> Result<&'a Keyspace, OpError> {
-	c.keyspaces
-		.get(name)
-		.ok_or_else(|| OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}")))
+	c.keyspaces.get(name).ok_or_else(|| {
+		OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}"))
+	})
 }
 
 /// Moves that even out a keyspace's share of the hash space over `members`, splitting a range
@@ -68,9 +66,15 @@ pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Ran
 				None => outsider = Some(r.node),
 			}
 		}
-		let (&b, &lb) = load.iter().min_by_key(|(n, l)| (**l, **n)).expect("members");
+		let (&b, &lb) = load
+			.iter()
+			.min_by_key(|(n, l)| (**l, **n))
+			.expect("members");
 		if let Some(a) = outsider {
-			let i = ranges.iter().position(|r| r.node == a).expect("outsider range");
+			let i = ranges
+				.iter()
+				.position(|r| r.node == a)
+				.expect("outsider range");
 			ranges[i].node = b;
 			continue;
 		}
@@ -198,7 +202,15 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 		.map(|n| n.id)
 		.ok_or_else(|| OpError::refused(Kind::CatalogInvalid, "the catalog has no home node"))?;
 	Ok(match op {
-		Op::NodeAdd(spec) => node_add(app, c, spec, c.nodes.keys().map(|n| n.0).max().unwrap_or(0) + 1).await?,
+		Op::NodeAdd(spec) => {
+			node_add(
+				app,
+				c,
+				spec,
+				c.nodes.keys().map(|n| n.0).max().unwrap_or(0) + 1,
+			)
+			.await?
+		}
 		Op::NodeDrain { node, to } => {
 			let node = node.resolve(c)?;
 			let mut targets: Vec<NodeId> = if to.is_empty() {
@@ -208,9 +220,10 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			};
 			targets.retain(|n| *n != node);
 			if targets.is_empty() {
-				return Err(OpError::refused(Kind::NoTargetNode, format!(
-					"there is no other active node to drain {node} to"
-				)));
+				return Err(OpError::refused(
+					Kind::NoTargetNode,
+					format!("there is no other active node to drain {node} to"),
+				));
 			}
 			let mut steps = vec![Step::Catalog(Change::NodeState {
 				node,
@@ -223,16 +236,19 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			let node = node.resolve(c)?;
 			if node == home {
 				return Err(OpError::refused(
-					Kind::HomeNode, "the home node holds the catalog and cannot be removed",
+					Kind::HomeNode,
+					"the home node holds the catalog and cannot be removed",
 				));
 			}
 			for k in c.keyspaces.values() {
-				if k.ranges.iter().any(|r| r.node == node) || k.pins.values().any(|n| *n == node)
-				{
-					return Err(OpError::refused(Kind::NodeNotEmpty, format!(
-						"{node} still owns rows of keyspace {}; drain it first",
-						k.name
-					)));
+				if k.ranges.iter().any(|r| r.node == node) || k.pins.values().any(|n| *n == node) {
+					return Err(OpError::refused(
+						Kind::NodeNotEmpty,
+						format!(
+							"{node} still owns rows of keyspace {}; drain it first",
+							k.name
+						),
+					));
 				}
 			}
 			vec![Step::Catalog(Change::NodeState {
@@ -248,18 +264,27 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			nodes,
 		} => {
 			let kt = KeyType::from_sql_name(key_type).ok_or_else(|| {
-				OpError::refused(Kind::BadKeyType, format!(
-					"key type {key_type}: one of {}",
-					KeyType::ALL.map(|k| k.sql_name()).join(", ")
-				))
+				OpError::refused(
+					Kind::BadKeyType,
+					format!(
+						"key type {key_type}: one of {}",
+						KeyType::ALL.map(|k| k.sql_name()).join(", ")
+					),
+				)
 			})?;
 			let owners: Vec<NodeId> = if nodes.is_empty() {
 				active(c)
 			} else {
-				nodes.iter().map(|n| n.resolve(c)).collect::<Result<_, _>>()?
+				nodes
+					.iter()
+					.map(|n| n.resolve(c))
+					.collect::<Result<_, _>>()?
 			};
 			if owners.is_empty() {
-				return Err(OpError::refused(Kind::NoTargetNode, "no active node to own the ranges"));
+				return Err(OpError::refused(
+					Kind::NoTargetNode,
+					"no active node to own the ranges",
+				));
 			}
 			let n = ranges.unwrap_or(owners.len()).max(1);
 			vec![Step::Catalog(Change::Keyspace {
@@ -278,9 +303,10 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				c.relations.get(table),
 				Some(RelationKind::Sharded { .. } | RelationKind::Reference)
 			) {
-				return Err(OpError::refused(Kind::AlreadyDistributed, format!(
-					"{table} is already distributed; it must be global to be distributed"
-				)));
+				return Err(OpError::refused(
+					Kind::AlreadyDistributed,
+					format!("{table} is already distributed; it must be global to be distributed"),
+				));
 			}
 			let k = ks(c, keyspace)?;
 			let mut h = connect_node(app, c, home).await?;
@@ -292,7 +318,11 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 					key_column: column.clone(),
 				},
 			};
-			let targets: Vec<NodeId> = c.nodes_of(keyspace).into_iter().filter(|n| *n != home).collect();
+			let targets: Vec<NodeId> = c
+				.nodes_of(keyspace)
+				.into_iter()
+				.filter(|n| *n != home)
+				.collect();
 			if targets.is_empty() {
 				vec![
 					Step::Catalog(change),
@@ -310,10 +340,14 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			}
 		}
 		Op::TableReference { table } => {
-			if c.relations.get(table).is_some_and(|k| *k != RelationKind::Global) {
-				return Err(OpError::refused(Kind::NotGlobal, format!(
-					"{table} is not a global table"
-				)));
+			if c.relations
+				.get(table)
+				.is_some_and(|k| *k != RelationKind::Global)
+			{
+				return Err(OpError::refused(
+					Kind::NotGlobal,
+					format!("{table} is not a global table"),
+				));
 			}
 			let mut h = connect_node(app, c, home).await?;
 			schema::check_movable(&mut h, table, None, c).await?;
@@ -346,20 +380,27 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			to,
 		} => {
 			let k = ks(c, keyspace)?;
-			let r = *k
-				.ranges
-				.iter()
-				.find(|r| r.lo == *range)
-				.ok_or_else(|| OpError::refused(Kind::NoSuchRange, format!("keyspace {keyspace} has no range starting at {range}")))?;
+			let r = *k.ranges.iter().find(|r| r.lo == *range).ok_or_else(|| {
+				OpError::refused(
+					Kind::NoSuchRange,
+					format!("keyspace {keyspace} has no range starting at {range}"),
+				)
+			})?;
 			if r.lo == r.hi {
-				return Err(OpError::refused(Kind::BadBound, "a range of one value cannot be split"));
+				return Err(OpError::refused(
+					Kind::BadBound,
+					"a range of one value cannot be split",
+				));
 			}
 			let at = at.unwrap_or((r.lo as i128 + (r.hi as i128 - r.lo as i128) / 2 + 1) as i64);
 			if at <= r.lo || at > r.hi {
-				return Err(OpError::refused(Kind::BadBound, format!(
-					"{at} is not inside the range [{}, {}] (the upper half starts at it)",
-					r.lo, r.hi
-				)));
+				return Err(OpError::refused(
+					Kind::BadBound,
+					format!(
+						"{at} is not inside the range [{}, {}] (the upper half starts at it)",
+						r.lo, r.hi
+					),
+				));
 			}
 			let target = match to {
 				Some(t) => Some(t.resolve(c)?),
@@ -388,12 +429,23 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 		Op::RangeMerge { keyspace, a, b } => {
 			let k = ks(c, keyspace)?;
 			let (a, b) = if a < b { (*a, *b) } else { (*b, *a) };
-			let ra = *k.ranges.iter().find(|r| r.lo == a).ok_or_else(|| OpError::refused(Kind::NoSuchRange, format!("keyspace {keyspace} has no range starting at {a}")))?;
-			let rb = *k.ranges.iter().find(|r| r.lo == b).ok_or_else(|| OpError::refused(Kind::NoSuchRange, format!("keyspace {keyspace} has no range starting at {b}")))?;
+			let ra = *k.ranges.iter().find(|r| r.lo == a).ok_or_else(|| {
+				OpError::refused(
+					Kind::NoSuchRange,
+					format!("keyspace {keyspace} has no range starting at {a}"),
+				)
+			})?;
+			let rb = *k.ranges.iter().find(|r| r.lo == b).ok_or_else(|| {
+				OpError::refused(
+					Kind::NoSuchRange,
+					format!("keyspace {keyspace} has no range starting at {b}"),
+				)
+			})?;
 			if ra.hi.checked_add(1) != Some(rb.lo) {
-				return Err(OpError::refused(Kind::NotAdjacent, format!(
-					"ranges {a} and {b} are not adjacent"
-				)));
+				return Err(OpError::refused(
+					Kind::NotAdjacent,
+					format!("ranges {a} and {b} are not adjacent"),
+				));
 			}
 			let mut steps = Vec::new();
 			if ra.node != rb.node {
@@ -422,10 +474,18 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			to,
 		} => {
 			let k = ks(c, keyspace)?;
-			let r = *k.ranges.iter().find(|r| r.lo == *range).ok_or_else(|| OpError::refused(Kind::NoSuchRange, format!("keyspace {keyspace} has no range starting at {range}")))?;
+			let r = *k.ranges.iter().find(|r| r.lo == *range).ok_or_else(|| {
+				OpError::refused(
+					Kind::NoSuchRange,
+					format!("keyspace {keyspace} has no range starting at {range}"),
+				)
+			})?;
 			let to = to.resolve(c)?;
 			if to == r.node {
-				return Err(OpError::refused(Kind::AlreadyDone, format!("{to} already owns that range")));
+				return Err(OpError::refused(
+					Kind::AlreadyDone,
+					format!("{to} already owns that range"),
+				));
 			}
 			vec![Step::Transfer(TransferSpec {
 				source: r.node,
@@ -445,7 +505,9 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			node,
 		} => {
 			let k = ks(c, keyspace)?;
-			let owner = c.owner(keyspace, value).map_err(|e| OpError::refused(Kind::BadKey, e.0))?;
+			let owner = c
+				.owner(keyspace, value)
+				.map_err(|e| OpError::refused(Kind::BadKey, e.0))?;
 			let mut steps = Vec::new();
 			if !k.pins.contains_key(value) {
 				steps.push(Step::Catalog(Change::Pin {
@@ -473,7 +535,10 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				}
 			}
 			if steps.is_empty() {
-				return Err(OpError::refused(Kind::AlreadyDone, format!("{value} is already pinned there")));
+				return Err(OpError::refused(
+					Kind::AlreadyDone,
+					format!("{value} is already pinned there"),
+				));
 			}
 			steps
 		}
@@ -508,7 +573,9 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			}]
 		}
 		Op::RestorePoint { name } => {
-			let name = name.clone().unwrap_or_else(super::restore_point::default_name);
+			let name = name
+				.clone()
+				.unwrap_or_else(super::restore_point::default_name);
 			super::restore_point::check_name(&name)?;
 			vec![Step::RestorePoint { name }]
 		}
@@ -522,10 +589,10 @@ async fn node_add(
 	id: i32,
 ) -> Result<Vec<Step>, OpError> {
 	if c.nodes.values().any(|n| n.name == spec.name) {
-		return Err(OpError::refused(Kind::NodeNameTaken, format!(
-			"a node named {} is already in the cluster",
-			spec.name
-		)));
+		return Err(OpError::refused(
+			Kind::NodeNameTaken,
+			format!("a node named {} is already in the cluster", spec.name),
+		));
 	}
 	// Refused now, with the setting to change, rather than when the job reaches it.
 	let t = Target {
@@ -601,21 +668,35 @@ fn drain_moves(c: &Catalog, node: NodeId, targets: &[NodeId]) -> Result<Vec<Step
 		}
 		let mut final_ranges = k.ranges.clone();
 		for r in final_ranges.iter_mut().filter(|r| r.node == node) {
-			let (&t, _) = load.iter().min_by_key(|(n, l)| (**l, **n)).expect("targets");
+			let (&t, _) = load
+				.iter()
+				.min_by_key(|(n, l)| (**l, **n))
+				.expect("targets");
 			r.node = t;
 			*load.get_mut(&t).expect("target") += width(r);
 		}
 		steps.extend(moves_to(c, name, &[], &final_ranges)?);
-		let mut pins: Vec<(&String, &NodeId)> = k.pins.iter().filter(|(_, n)| **n == node).collect();
+		let mut pins: Vec<(&String, &NodeId)> =
+			k.pins.iter().filter(|(_, n)| **n == node).collect();
 		pins.sort();
 		for (value, _) in pins {
-			let h = k.key_type.hash_text_value(value, k.seed).map_err(|e| OpError::refused(Kind::BadKey, e.to_string()))?;
-			let to = final_ranges.iter().find(|r| r.lo <= h && h <= r.hi).map_or(targets[0], |r| r.node);
+			let h = k
+				.key_type
+				.hash_text_value(value, k.seed)
+				.map_err(|e| OpError::refused(Kind::BadKey, e.to_string()))?;
+			let to = final_ranges
+				.iter()
+				.find(|r| r.lo <= h && h <= r.hi)
+				.map_or(targets[0], |r| r.node);
 			steps.push(Step::Transfer(TransferSpec {
 				source: node,
 				targets: vec![to],
 				tables: tables_of(c, name),
-				change: Change::PinOwner { keyspace: name.clone(), value: value.clone(), to },
+				change: Change::PinOwner {
+					keyspace: name.clone(),
+					value: value.clone(),
+					to,
+				},
 			}));
 		}
 	}
@@ -630,36 +711,69 @@ fn table_global(c: &Catalog, table: &RelationName, home: NodeId) -> Result<Vec<S
 	match c.relations.get(table) {
 		Some(RelationKind::Reference) => {
 			let mut steps = vec![change];
-			for n in c.nodes.values().filter(|n| !n.home && n.state != NodeState::Removed) {
-				steps.push(Step::TableDrop { node: n.id, table: table.clone() });
+			for n in c
+				.nodes
+				.values()
+				.filter(|n| !n.home && n.state != NodeState::Removed)
+			{
+				steps.push(Step::TableDrop {
+					node: n.id,
+					table: table.clone(),
+				});
 			}
 			Ok(steps)
 		}
 		Some(RelationKind::Sharded { keyspace, .. }) => {
-			let others: Vec<RelationName> = tables_of(c, keyspace).into_iter().filter(|t| t != table).collect();
+			let others: Vec<RelationName> = tables_of(c, keyspace)
+				.into_iter()
+				.filter(|t| t != table)
+				.collect();
 			if !others.is_empty() {
-				return Err(OpError::refused(Kind::TableNotShardable, format!(
-					"{table} shares keyspace {keyspace} with {}; its rows cannot go home alone",
-					others.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")
-				)));
+				return Err(OpError::refused(
+					Kind::TableNotShardable,
+					format!(
+						"{table} shares keyspace {keyspace} with {}; its rows cannot go home alone",
+						others
+							.iter()
+							.map(|t| t.to_string())
+							.collect::<Vec<_>>()
+							.join(", ")
+					),
+				));
 			}
 			let k = ks(c, keyspace)?;
-			let all_home: Vec<Range> = k.ranges.iter().map(|r| Range { node: home, ..*r }).collect();
+			let all_home: Vec<Range> = k
+				.ranges
+				.iter()
+				.map(|r| Range { node: home, ..*r })
+				.collect();
 			let mut steps = moves_to(c, keyspace, &[], &all_home)?;
-			let mut pins: Vec<&String> = k.pins.iter().filter(|(_, n)| **n != home).map(|(v, _)| v).collect();
+			let mut pins: Vec<&String> = k
+				.pins
+				.iter()
+				.filter(|(_, n)| **n != home)
+				.map(|(v, _)| v)
+				.collect();
 			pins.sort();
 			for v in pins {
 				steps.push(Step::Transfer(TransferSpec {
 					source: k.pins[v],
 					targets: vec![home],
 					tables: vec![table.clone()],
-					change: Change::PinOwner { keyspace: keyspace.clone(), value: v.clone(), to: home },
+					change: Change::PinOwner {
+						keyspace: keyspace.clone(),
+						value: v.clone(),
+						to: home,
+					},
 				}));
 			}
 			steps.push(change);
 			Ok(steps)
 		}
-		_ => Err(OpError::refused(Kind::AlreadyDone, format!("{table} is already global"))),
+		_ => Err(OpError::refused(
+			Kind::AlreadyDone,
+			format!("{table} is already global"),
+		)),
 	}
 }
 
@@ -671,7 +785,10 @@ async fn scale(
 	home: NodeId,
 ) -> Result<Vec<Step>, OpError> {
 	if !add.is_empty() && remove > 0 {
-		return Err(OpError::refused(Kind::BadRequest, "scale either adds nodes or removes them, not both at once"));
+		return Err(OpError::refused(
+			Kind::BadRequest,
+			"scale either adds nodes or removes them, not both at once",
+		));
 	}
 	let mut steps = Vec::new();
 	if !add.is_empty() {
@@ -691,7 +808,7 @@ async fn scale(
 					home: false,
 					state: NodeState::Active,
 					server_version_num: None,
-					},
+				},
 			);
 		}
 		let members = active(&after);
@@ -708,22 +825,37 @@ async fn scale(
 		.into_iter()
 		.filter(|n| *n != home)
 		.map(|n| {
-			let w: u128 = c.keyspaces.values().flat_map(|k| k.ranges.iter()).filter(|r| r.node == n).map(width).sum();
+			let w: u128 = c
+				.keyspaces
+				.values()
+				.flat_map(|k| k.ranges.iter())
+				.filter(|r| r.node == n)
+				.map(width)
+				.sum();
 			(w, n)
 		})
 		.collect();
 	load.sort();
 	if remove > load.len() {
-		return Err(OpError::refused(Kind::NoTargetNode, format!(
-			"only {} data nodes can be removed (the home node stays)",
-			load.len()
-		)));
+		return Err(OpError::refused(
+			Kind::NoTargetNode,
+			format!(
+				"only {} data nodes can be removed (the home node stays)",
+				load.len()
+			),
+		));
 	}
 	let going: Vec<NodeId> = load.iter().take(remove).map(|(_, n)| *n).collect();
-	let staying: Vec<NodeId> = active(c).into_iter().filter(|n| !going.contains(n)).collect();
+	let staying: Vec<NodeId> = active(c)
+		.into_iter()
+		.filter(|n| !going.contains(n))
+		.collect();
 	let mut layout = c.clone();
 	for &n in &going {
-		steps.push(Step::Catalog(Change::NodeState { node: n, state: NodeState::Draining }));
+		steps.push(Step::Catalog(Change::NodeState {
+			node: n,
+			state: NodeState::Draining,
+		}));
 		steps.extend(drain_moves(&layout, n, &staying)?);
 		// Later drains plan against the layout this one leaves.
 		for st in &steps {
@@ -735,7 +867,10 @@ async fn scale(
 		}
 	}
 	for n in going {
-		steps.push(Step::Catalog(Change::NodeState { node: n, state: NodeState::Removed }));
+		steps.push(Step::Catalog(Change::NodeState {
+			node: n,
+			state: NodeState::Removed,
+		}));
 	}
 	Ok(steps)
 }
@@ -773,7 +908,13 @@ pub async fn summarize(
 							)
 							.await?;
 						let row = r.first().cloned().unwrap_or_default();
-						let num = |i: usize| row.get(i).cloned().flatten().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+						let num = |i: usize| {
+							row.get(i)
+								.cloned()
+								.flatten()
+								.and_then(|v| v.parse::<f64>().ok())
+								.unwrap_or(0.0)
+						};
 						let mut tuples = num(1);
 						if tuples <= 0.0 && num(0) > 0.0 && num(0) < 1e9 {
 							// Never analyzed (-1): count it, when that is cheap.
@@ -788,10 +929,17 @@ pub async fn summarize(
 					let (r, b) = sizes[&key];
 					let share = share_moving(&layout, &after, rel, t.source, &t.targets);
 					let pinned = match (&t.change, layout.relations.get(rel)) {
-						(Change::PinOwner { value, .. }, Some(RelationKind::Sharded { key_column, .. })) => {
+						(
+							Change::PinOwner { value, .. },
+							Some(RelationKind::Sharded { key_column, .. }),
+						) => {
 							let mut pg = connect_node(app, &layout, t.source).await?;
 							pg.value(
-								&format!("select count(*) from {} where {} = $1", qualified(rel), crate::catalog::quote_ident(key_column)),
+								&format!(
+									"select count(*) from {} where {} = $1",
+									qualified(rel),
+									crate::catalog::quote_ident(key_column)
+								),
 								&[value],
 							)
 							.await?
@@ -855,10 +1003,19 @@ fn expected_pause_ms(tables: usize) -> u64 {
 }
 
 /// The fraction of the source's rows of `rel` that move to the targets.
-fn share_moving(before: &Catalog, after: &Catalog, rel: &RelationName, source: NodeId, targets: &[NodeId]) -> f64 {
+fn share_moving(
+	before: &Catalog,
+	after: &Catalog,
+	rel: &RelationName,
+	source: NodeId,
+	targets: &[NodeId],
+) -> f64 {
 	let held = |c: &Catalog, n: NodeId| -> Option<u128> {
 		match c.relations.get(rel) {
-			Some(RelationKind::Sharded { keyspace, .. }) => c.keyspaces.get(keyspace).map(|k| k.ranges.iter().filter(|r| r.node == n).map(width).sum()),
+			Some(RelationKind::Sharded { keyspace, .. }) => c
+				.keyspaces
+				.get(keyspace)
+				.map(|k| k.ranges.iter().filter(|r| r.node == n).map(width).sum()),
 			_ => None,
 		}
 	};
@@ -875,7 +1032,12 @@ fn share_moving(before: &Catalog, after: &Catalog, rel: &RelationName, source: N
 }
 
 /// Plans `op` against the catalog as it is now.
-pub async fn plan(app: &Arc<App>, h: &mut Pg, op: &Op, settings: Settings) -> Result<Planned, OpError> {
+pub async fn plan(
+	app: &Arc<App>,
+	h: &mut Pg,
+	op: &Op,
+	settings: Settings,
+) -> Result<Planned, OpError> {
 	let c = load_catalog(h).await?;
 	let steps = expand(app, &c, op).await?;
 	let summary = summarize(app, &c, op, &steps, settings).await?;
@@ -945,8 +1107,16 @@ mod tests {
 			}
 		}
 		after.validate().unwrap();
-		assert!(after.keyspaces["k"].ranges.iter().all(|r| r.node != NodeId(3)));
-		let moved: usize = steps.iter().filter(|s| matches!(s, Step::Transfer(_))).count();
+		assert!(
+			after.keyspaces["k"]
+				.ranges
+				.iter()
+				.all(|r| r.node != NodeId(3))
+		);
+		let moved: usize = steps
+			.iter()
+			.filter(|s| matches!(s, Step::Transfer(_)))
+			.count();
 		assert!((1..=2).contains(&moved), "{steps:?}");
 	}
 }

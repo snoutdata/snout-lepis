@@ -1078,7 +1078,9 @@ mod tests {
 	fn numeric_normalises_as_postgres_stores() {
 		let h = |v: &str| KeyType::Numeric.hash_text_value(v, 5).unwrap();
 		let one = h("1");
-		for v in ["1.0", "1.00", "+1", " 1e0 ", "0.1e1", "10e-1", "0001.000", "-1", "1_0e-1"] {
+		for v in [
+			"1.0", "1.00", "+1", " 1e0 ", "0.1e1", "10e-1", "0001.000", "-1", "1_0e-1",
+		] {
 			assert_eq!(h(v), one, "{v}");
 		}
 		// Digits are grouped in fours from the point, so these differ only by weight.
@@ -1099,7 +1101,9 @@ mod tests {
 		for v in ["NaN", "nan ", "Infinity", "-inf"] {
 			assert_eq!(h(v), 5, "{v}");
 		}
-		for v in ["", ".", "1..2", "1._2", "+-1", "-NaN", "0x", "1e", "1 2", "1__0", "1e-20000"] {
+		for v in [
+			"", ".", "1..2", "1._2", "+-1", "-NaN", "0x", "1e", "1 2", "1__0", "1e-20000",
+		] {
 			assert!(parse_numeric(v).is_err(), "{v}");
 		}
 	}
@@ -1125,8 +1129,16 @@ mod tests {
 		assert_eq!(bin(send(0, 0, 1, &[1, 5678])), txt("1.5"));
 		assert_eq!(bin(send(-1, 0, 2, &[99])), txt("0"));
 		assert_eq!(bin(send(0, 0xc000, 0, &[])), txt("NaN"));
-		assert!(KeyType::Numeric.hash_binary_value(&send(0, 0, 0, &[10000]), 9).is_err());
-		assert!(KeyType::Numeric.hash_binary_value(&[0, 1, 0, 0], 9).is_err());
+		assert!(
+			KeyType::Numeric
+				.hash_binary_value(&send(0, 0, 0, &[10000]), 9)
+				.is_err()
+		);
+		assert!(
+			KeyType::Numeric
+				.hash_binary_value(&[0, 1, 0, 0], 9)
+				.is_err()
+		);
 	}
 
 	#[test]
@@ -1137,8 +1149,14 @@ mod tests {
 		assert_eq!(h("   "), hash_text("", 3));
 		assert_ne!(h("CA"), h(" CA"));
 		assert_ne!(h("CA"), h("CA\t"));
-		assert_eq!(KeyType::Bpchar.hash_binary_value(b"CA  ", 3).unwrap(), h("CA"));
-		assert_eq!(KeyType::from_sql_name("character(3)"), Some(KeyType::Bpchar));
+		assert_eq!(
+			KeyType::Bpchar.hash_binary_value(b"CA  ", 3).unwrap(),
+			h("CA")
+		);
+		assert_eq!(
+			KeyType::from_sql_name("character(3)"),
+			Some(KeyType::Bpchar)
+		);
 		assert_eq!(KeyType::from_sql_name("bpchar"), Some(KeyType::Bpchar));
 		assert_eq!(KeyType::from_sql_name("numeric"), Some(KeyType::Numeric));
 		assert_eq!(KeyType::from_sql_name("numeric(10,2)"), None);

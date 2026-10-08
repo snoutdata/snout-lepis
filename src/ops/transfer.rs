@@ -91,7 +91,8 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 			"rolled_back" => return Err(cancelled()),
 			"verify_failed" => {
 				return Err(OpError::refused(
-					Kind::VerifyFailed, "verify found the copy differs from the source; nothing was cleaned up",
+					Kind::VerifyFailed,
+					"verify found the copy differs from the source; nothing was cleaned up",
 				));
 			}
 			other => return Err(OpError::new(format!("unknown phase {other}"))),
@@ -162,7 +163,12 @@ fn plan_from(cx: &StepCtx, target: NodeId, table: &RelationName) -> Plan {
 		.and_then(|p| p.get(table.to_string()))
 		.cloned()
 		.unwrap_or(Value::Null);
-	let s = |k: &str| x.get(k).and_then(Value::as_str).unwrap_or("false").to_string();
+	let s = |k: &str| {
+		x.get(k)
+			.and_then(Value::as_str)
+			.unwrap_or("false")
+			.to_string()
+	};
 	let o = |k: &str| x.get(k).and_then(Value::as_str).map(str::to_string);
 	Plan {
 		slice_source: s("slice_source"),
@@ -217,10 +223,13 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 					// Rows of the slice on a node that does not own them are old copies.
 					stale.push((rel.clone(), p.slice_target.clone()));
 				} else if schema::has_rows(pg, rel).await? {
-					return Err(OpError::refused(Kind::TableHasRows, format!(
-						"{} already holds rows in {rel}, a table the cluster does not manage; Lepis will not overwrite it",
-						pg.label
-					)));
+					return Err(OpError::refused(
+						Kind::TableHasRows,
+						format!(
+							"{} already holds rows in {rel}, a table the cluster does not manage; Lepis will not overwrite it",
+							pg.label
+						),
+					));
 				}
 			}
 			if let Some(f) = &p.fence_target_after {
@@ -229,7 +238,11 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 		}
 		delete_ordered(pg, stale).await?;
 	}
-	cx.save(h, json!({"tables_ready": true, "tables_ms": started.elapsed().as_millis() as u64})).await?;
+	cx.save(
+		h,
+		json!({"tables_ready": true, "tables_ms": started.elapsed().as_millis() as u64}),
+	)
+	.await?;
 
 	// The source as the targets reach it (a node label when it differs from the router's view).
 	let peer = h
@@ -245,14 +258,13 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 		.ok_or_else(|| OpError::new("no source node"))?;
 	for (&n, pg) in targets.iter_mut() {
 		let name = names(cx, n);
-		let exists = src
-			.value(
+		let exists =
+			src.value(
 				"select count(*) from pg_publication where pubname = $1",
 				&[&name],
 			)
 			.await?
-			.as_deref()
-			!= Some("0");
+			.as_deref() != Some("0");
 		if !exists {
 			let mut items = Vec::new();
 			for rel in &t.tables {
@@ -274,14 +286,13 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 			))
 			.await?;
 		}
-		let has_sub = pg
-			.value(
+		let has_sub =
+			pg.value(
 				"select count(*) from pg_subscription where subname = $1",
 				&[&name],
 			)
 			.await?
-			.as_deref()
-			!= Some("0");
+			.as_deref() != Some("0");
 		if !has_sub {
 			let info = super::pg::conninfo(&cx.app, &peer, source_node);
 			pg.simple(&format!(
@@ -294,7 +305,11 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 			.await?;
 		}
 	}
-	cx.save(h, json!({"phase": "prepared", "prepare_ms": started.elapsed().as_millis() as u64})).await
+	cx.save(
+		h,
+		json!({"phase": "prepared", "prepare_ms": started.elapsed().as_millis() as u64}),
+	)
+	.await
 }
 
 /// Waits for every table's initial copy, then for a marker row to round-trip fast enough.
@@ -395,7 +410,11 @@ async fn mark_round_trip(
 					cx.job, n.0
 				))
 				.await?;
-			if seen.first().and_then(|r| r.first().cloned().flatten()).as_deref() == Some("t") {
+			if seen
+				.first()
+				.and_then(|r| r.first().cloned().flatten())
+				.as_deref() == Some("t")
+			{
 				break;
 			}
 			if start.elapsed() > limit {
@@ -418,11 +437,7 @@ enum Attempt {
 	Retry(String),
 }
 
-async fn cutover(
-	cx: &mut StepCtx,
-	h: &mut Pg,
-	t: &TransferSpec,
-) -> Result<Option<Held>, OpError> {
+async fn cutover(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<Option<Held>, OpError> {
 	let mut attempt = cx.get("attempts").and_then(Value::as_u64).unwrap_or(0);
 	loop {
 		attempt += 1;
@@ -432,7 +447,12 @@ async fn cutover(
 		match try_cutover(cx, h, t, attempt).await? {
 			Attempt::Done(held) => return Ok(Some(held)),
 			Attempt::Retry(why) => {
-				tracing::info!(job = cx.job, step = cx.n, attempt, "cutover postponed: {why}");
+				tracing::info!(
+					job = cx.job,
+					step = cx.n,
+					attempt,
+					"cutover postponed: {why}"
+				);
 				cx.save(h, json!({"attempts": attempt, "postponed": why}))
 					.await?;
 				let wait = Duration::from_millis(250 * (1u64 << attempt.min(7)));
@@ -468,10 +488,7 @@ async fn try_cutover(
 
 	let t0 = Instant::now();
 	let mut aborted = 0u64;
-	let lock_sql = format!(
-		"lock table {} in access exclusive mode",
-		tables.join(", ")
-	);
+	let lock_sql = format!("lock table {} in access exclusive mode", tables.join(", "));
 	// The ceiling (L10) is checked at every point the attempt can still be given up: until the
 	// catalog changes, letting go of the lock undoes everything. The lock itself is waited for
 	// only as long as the pause allows; a transaction in flight that holds it past
@@ -646,7 +663,11 @@ async fn source_fences(
 
 /// Cancels (or, idle in a transaction, terminates) what holds locks the cutover is waiting for
 /// and has been running longer than `drain` (L10's drain_timeout).
-pub(super) async fn abort_blockers(side: &mut Pg, pid: i32, drain: Duration) -> Result<u64, OpError> {
+pub(super) async fn abort_blockers(
+	side: &mut Pg,
+	pid: i32,
+	drain: Duration,
+) -> Result<u64, OpError> {
 	let rows = side
 		.query(
 			"select case when state like 'idle in transaction%' then pg_terminate_backend(pid) \
@@ -810,17 +831,19 @@ async fn teardown(
 	for &n in &t.targets {
 		let name = names(cx, n);
 		let mut pg = connect_node(&cx.app, &c, n).await?;
-		let has_sub = pg
-			.value(
+		let has_sub =
+			pg.value(
 				"select count(*) from pg_subscription where subname = $1",
 				&[&name],
 			)
 			.await?
-			.as_deref()
-			!= Some("0");
+			.as_deref() != Some("0");
 		if has_sub
 			&& pg
-				.simple(&format!("drop subscription if exists {}", quote_ident(&name)))
+				.simple(&format!(
+					"drop subscription if exists {}",
+					quote_ident(&name)
+				))
 				.await
 				.is_err()
 		{
@@ -844,7 +867,11 @@ async fn teardown(
 					&[&name],
 				)
 				.await?;
-			match left.first().and_then(|r| r.first().cloned().flatten()).as_deref() {
+			match left
+				.first()
+				.and_then(|r| r.first().cloned().flatten())
+				.as_deref()
+			{
 				None => break,
 				Some("f") => {
 					src.query("select pg_drop_replication_slot($1)", &[&name])
