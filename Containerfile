@@ -20,6 +20,10 @@ RUN cargo build --locked --release -p snout-lepis \
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /snout-lepis /snout-lepis
+# Not distroless's own nonroot (65532): a Cloud pod's user namespace maps container uids 0-1023
+# only, and podman refuses to start a container whose user it cannot map. 1000, as the other
+# servers run. The certificate the host makes for the router is world-readable (host/lepis.ts).
+USER 1000:1000
 EXPOSE 5432
 # How SnoutData Studio's "Find databases" knows this container is part of the SnoutData stack:
 # by label, never by guessing from the image name.
