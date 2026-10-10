@@ -265,7 +265,7 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 			.unwrap_or_default();
 		return refuse(
 			NOT_ACROSS_NODES,
-			format!("{g} lives only on the home node and cannot be combined with a sharded table"),
+			format!("{g} lives only on the home node and cannot be combined with a distributed table"),
 			format!("Make {g} a reference table so every node has it, or query it separately."),
 		);
 	}
@@ -279,7 +279,7 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 				"{} (keyspace {other}) and {} (keyspace {keyspace}) are not colocated",
 				facts.tables[*i].name, facts.tables[sharded[0].0].name
 			),
-			"Join sharded tables only within one keyspace, on the shard key.",
+			"Join distributed tables only within one keyspace, on the distribution key.",
 		);
 	}
 	// The common case first: one sharded table pinned to one value is that value's node.
@@ -300,15 +300,15 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 	let not_on_key = || {
 		refuse(
 			NOT_ACROSS_NODES,
-			"a join of sharded tables that is not on the shard key would need rows from several nodes",
-			"Join colocated tables on their shard key, or make the smaller table a reference table.",
+			"a join of distributed tables that is not on the distribution key would need rows from several nodes",
+			"Join colocated tables on their distribution key, or make the smaller table a reference table.",
 		)
 	};
 
 	if facts.assigns_key {
 		return refuse(
 			NOT_ACROSS_NODES,
-			"an UPDATE may not change a row's shard key",
+			"an UPDATE may not change a row's distribution key",
 			"Delete the row and insert it with the new key.",
 		);
 	}
@@ -324,8 +324,8 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 				Ok(None) => {
 					return refuse(
 						"23502",
-						"a row's shard key is NULL",
-						"Every row of a sharded table needs a shard key.",
+						"a row's distribution key is NULL",
+						"Every row of a distributed table needs a distribution key.",
 					);
 				}
 				Err(r) => return r,
@@ -406,7 +406,7 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 				return refuse(
 					NOT_ACROSS_NODES,
 					"a write whose rows belong to several nodes is supported for INSERT … VALUES, COPY … FROM STDIN, UPDATE and DELETE",
-					"Pin the write to one shard key value, or write the rows with INSERT … VALUES.",
+					"Pin the write to one distribution key value, or write the rows with INSERT … VALUES.",
 				);
 			}
 			// A read: what its ORDER BY, aggregates and the rest need from a merge, and whether
@@ -456,7 +456,7 @@ fn owner(
 		refuse(
 			"22P02",
 			e,
-			"Pass the shard key in its type's standard form.",
+			"Pass the distribution key in its type's standard form.",
 		)
 	};
 	let Some(key) = catalog.keyspaces.get(keyspace).map(|k| k.key_type) else {
@@ -577,7 +577,7 @@ fn other_type(key: crate::hash::KeyType, what: &str) -> Route {
 	refuse(
 		NOT_ACROSS_NODES,
 		format!(
-			"the shard key is compared with a value of another type ({what}), so Lepis cannot tell which node it belongs to"
+			"the distribution key is compared with a value of another type ({what}), so Lepis cannot tell which node it belongs to"
 		),
 		format!(
 			"Compare the key with a {} value, or bind it in text format.",
@@ -750,7 +750,7 @@ pub mod copy {
 				other => {
 					return Err(no(
 						format!("COPY option {other} is not supported across nodes"),
-						"Leave the option out, or COPY the rows of each shard key value on their own.",
+						"Leave the option out, or COPY the rows of each distribution key value on their own.",
 					));
 				}
 			}
@@ -1023,7 +1023,7 @@ pub mod copy {
 			}
 			String::from_utf8(out)
 				.map(Key::Text)
-				.map_err(|_| "a shard key in the COPY data is not valid UTF-8".into())
+				.map_err(|_| "a distribution key in the COPY data is not valid UTF-8".into())
 		}
 
 		fn csv_key(&self, row: &[u8]) -> Result<Key, String> {
@@ -1077,7 +1077,7 @@ pub mod copy {
 					}
 					return String::from_utf8(value)
 						.map(Key::Text)
-						.map_err(|_| "a shard key in the COPY data is not valid UTF-8".into());
+						.map_err(|_| "a distribution key in the COPY data is not valid UTF-8".into());
 				}
 				if i >= row.len() {
 					return Err("a row has fewer columns than the COPY names".into());

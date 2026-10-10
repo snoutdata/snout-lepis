@@ -292,14 +292,14 @@ impl Analyzer<'_> {
 				"SQL-level PREPARE / EXECUTE hide the statement from Lepis, so it cannot tell which node it belongs to; use the protocol's prepared statements instead",
 			),
 			N::MergeStmt(_) => self.opaque(
-				"MERGE is not supported on a sharded database yet: Lepis cannot tell which node each of its rows belongs to",
+				"MERGE is not supported on a cluster yet: Lepis cannot tell which node each of its rows belongs to",
 			),
 			n if is_ddl(n) => {
 				self.ddl(n)?;
 				plain(Kind::Ddl)
 			}
 			n => self.opaque(&format!(
-				"{} is not supported on a sharded database yet, so Lepis cannot tell which node it belongs to",
+				"{} is not supported on a cluster yet, so Lepis cannot tell which node it belongs to",
 				node_name(n)
 			)),
 		}
@@ -326,7 +326,7 @@ impl Analyzer<'_> {
 					.find(|t| t.written && self.is_sharded(&t.name))
 				{
 					return Err(AnalyzeError::Unsupported(format!(
-						"a query that reads may not also write the sharded table {} yet; run the write as a statement of its own",
+						"a query that reads may not also write the distributed table {} yet; run the write as a statement of its own",
 						t.name
 					)));
 				}
@@ -459,7 +459,7 @@ impl Analyzer<'_> {
 		let key = self.key_of(target);
 		if key.is_some() && s.cols.is_empty() {
 			return Err(AnalyzeError::Unsupported(
-				"name the columns of an INSERT into a sharded table, so Lepis can find the shard key"
+				"name the columns of an INSERT into a distributed table, so Lepis can find the distribution key"
 					.into(),
 			));
 		}
@@ -485,7 +485,7 @@ impl Analyzer<'_> {
 				matches!(&c.node, Some(NodeEnum::ResTarget(r)) if &r.name == key && r.indirection.is_empty())
 			}) else {
 				return Err(AnalyzeError::Unsupported(format!(
-					"an INSERT into a sharded table must give its shard key column {key} a value, so Lepis can find each row's node"
+					"an INSERT into a distributed table must give its distribution key column {key} a value, so Lepis can find each row's node"
 				)));
 			};
 			let mut out = Vec::with_capacity(rows.len());
@@ -496,7 +496,7 @@ impl Analyzer<'_> {
 				};
 				out.push(value.ok_or_else(|| {
 					AnalyzeError::Unsupported(
-						"the shard key of an inserted row must be a literal or a parameter".into(),
+						"the distribution key of an inserted row must be a literal or a parameter".into(),
 					)
 				})?);
 			}
@@ -815,7 +815,7 @@ impl Analyzer<'_> {
 					.find(|t| self.is_sharded(&self.tables[*t].name));
 				if let Some(t) = sampled {
 					return Err(AnalyzeError::Unsupported(format!(
-						"TABLESAMPLE of the sharded table {} would sample each node's rows, not the table's",
+						"TABLESAMPLE of the distributed table {} would sample each node's rows, not the table's",
 						self.tables[t].name
 					)));
 				}
@@ -2889,7 +2889,7 @@ mod tests {
 
 	#[test]
 	fn an_insert_lepis_cannot_place_is_refused() {
-		let literal = "the shard key of an inserted row must be a literal or a parameter";
+		let literal = "the distribution key of an inserted row must be a literal or a parameter";
 		assert_eq!(
 			unsupported("insert into orders (tenant_id) values (default)"),
 			literal
@@ -2899,7 +2899,7 @@ mod tests {
 			literal
 		);
 		let columns =
-			"name the columns of an INSERT into a sharded table, so Lepis can find the shard key";
+			"name the columns of an INSERT into a distributed table, so Lepis can find the distribution key";
 		assert_eq!(unsupported("insert into orders values (1)"), columns);
 		assert_eq!(
 			unsupported("insert into orders select * from orders"),

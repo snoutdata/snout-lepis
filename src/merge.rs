@@ -1570,7 +1570,7 @@ impl Acc {
 								type_name(oid)
 							),
 							format!(
-								"Cast the argument to numeric ({what}(x::numeric)), or pin the query to one shard key value."
+								"Cast the argument to numeric ({what}(x::numeric)), or pin the query to one distribution key value."
 							),
 						));
 					}
@@ -1580,7 +1580,7 @@ impl Acc {
 								"Lepis does not combine a sum of {} across nodes yet",
 								type_name(other)
 							),
-							"Pin the query to one shard key value.",
+							"Pin the query to one distribution key value.",
 						));
 					}
 				}
@@ -1626,7 +1626,7 @@ impl Acc {
 										"Lepis does not combine a sum of distinct {} values across nodes",
 										type_name(other)
 									),
-									"Cast the argument to numeric, or pin the query to one shard key value.",
+									"Cast the argument to numeric, or pin the query to one distribution key value.",
 								));
 							}
 						}
@@ -1710,7 +1710,7 @@ impl Eval<'_> {
 		let unsupported = |what: &str| {
 			refusal(
 				format!("Lepis cannot compute {what} after combining the nodes' aggregates"),
-				"Select the aggregates themselves and compute the rest in the application, or pin the query to one shard key value.",
+				"Select the aggregates themselves and compute the rest in the application, or pin the query to one distribution key value.",
 			)
 		};
 		Ok(match e {

@@ -91,9 +91,9 @@ fn refuse(message: impl Into<String>, hint: impl Into<String>) -> DdlPlan {
 }
 
 /// The L15 sentence.
-pub const L15_SEQUENCES: &str = "Sequences are not global: on a sharded table use uuidv7() (Postgres 18) or a bigint from a sequence striped by node, never serial, identity or nextval of a plain sequence.";
+pub const L15_SEQUENCES: &str = "Sequences are not global: on a distributed table use uuidv7() (Postgres 18) or a bigint from a sequence striped by node, never serial, identity or nextval of a plain sequence.";
 /// The other half of L15.
-pub const L15_UNIQUE: &str = "A unique constraint or primary key on a sharded table must include its shard key, as on a partitioned table: only then can each node check it alone.";
+pub const L15_UNIQUE: &str = "A unique constraint or primary key on a distributed table must include its distribution key, as on a partitioned table: only then can each node check it alone.";
 
 /// Where and how one statement runs. `sql` is ONE statement; `tables` are the relations the
 /// parser adapter found in it (`Facts::tables`, resolved through the search path); `index_owners`
@@ -248,7 +248,7 @@ impl Planner<'_> {
 						{
 							return refuse(
 								format!(
-									"a foreign key from a new table to the sharded table {t} cannot be checked on one node"
+									"a foreign key from a new table to the distributed table {t} cannot be checked on one node"
 								),
 								"Create the table, distribute it in the same keyspace with the key in the foreign key, then add the foreign key.",
 							);
@@ -276,9 +276,9 @@ impl Planner<'_> {
 				{
 					return refuse(
 						format!(
-							"a view or table built from the sharded table {t} is not supported yet"
+							"a view or table built from the distributed table {t} is not supported yet"
 						),
-						"Query the sharded table directly; Lepis routes or scatters each query.",
+						"Query the distributed table directly; Lepis routes or scatters each query.",
 					);
 				}
 				if !sources.is_empty() && sources.iter().all(|t| self.distributed(t)) {
@@ -300,7 +300,7 @@ impl Planner<'_> {
 				{
 					return refuse(
 						format!(
-							"a unique index on the sharded table {t} must include its key {key}"
+							"a unique index on the distributed table {t} must include its key {key}"
 						),
 						L15_UNIQUE,
 					);
@@ -364,7 +364,7 @@ impl Planner<'_> {
 							if self.key_of(t) == Some(r.subname.as_str()) =>
 						{
 							return refuse(
-								format!("{}, the shard key of {t}, cannot be renamed", r.subname),
+								format!("{}, the distribution key of {t}, cannot be renamed", r.subname),
 								"The catalog names the key column; it stays as it is.",
 							);
 						}
@@ -482,7 +482,7 @@ impl Planner<'_> {
 				"Run it on the node directly.",
 			),
 			N::CreateSchemaStmt(s) if !s.schema_elts.is_empty() => refuse(
-				"CREATE SCHEMA with the objects inside it is not supported on a sharded database",
+				"CREATE SCHEMA with the objects inside it is not supported on a cluster",
 				"Create the schema, then each object in it.",
 			),
 			// Trigger, rule, policy, comment, grant, truncate, statistics, ownership: where the table is.
@@ -597,17 +597,17 @@ impl Planner<'_> {
 		match sub {
 			AlterTableType::AtDropColumn | AlterTableType::AtAlterColumnType if cmd.name == key => {
 				Some(refuse(
-					format!("{key}, the shard key of {t}, cannot be dropped or change type"),
+					format!("{key}, the distribution key of {t}, cannot be dropped or change type"),
 					"Every row's node is computed from it; create a new table and move the rows.",
 				))
 			}
 			AlterTableType::AtAddIdentity | AlterTableType::AtSetIdentity => Some(refuse(
-				format!("an identity column on the sharded table {t}"),
+				format!("an identity column on the distributed table {t}"),
 				L15_SEQUENCES,
 			)),
 			AlterTableType::AtColumnDefault => match opt(&cmd.def) {
 				Some(d) if calls_nextval(d) => Some(refuse(
-					format!("a nextval default on the sharded table {t}"),
+					format!("a nextval default on the distributed table {t}"),
 					L15_SEQUENCES,
 				)),
 				_ => None,
@@ -643,7 +643,7 @@ impl Planner<'_> {
 					if serial || bad_default {
 						Some(refuse(
 							format!(
-								"{} on the sharded table {t} draws from a sequence",
+								"{} on the distributed table {t} draws from a sequence",
 								d.colname
 							),
 							L15_SEQUENCES,
@@ -651,7 +651,7 @@ impl Planner<'_> {
 					} else if unique_without_key {
 						Some(refuse(
 							format!(
-								"a unique {} on the sharded table {t} without its key {key}",
+								"a unique {} on the distributed table {t} without its key {key}",
 								d.colname
 							),
 							L15_UNIQUE,
@@ -684,7 +684,7 @@ impl Planner<'_> {
 					} else {
 						Some(refuse(
 							format!(
-								"a unique constraint on the sharded table {t} without its key {key}"
+								"a unique constraint on the distributed table {t} without its key {key}"
 							),
 							L15_UNIQUE,
 						))
@@ -769,7 +769,7 @@ pub fn distribute_refusal(
 			return Some(Refusal {
 				code: NOT_ACROSS_NODES,
 				message: format!(
-					"{table} cannot be sharded: {} draws from a sequence, and sequences are not global",
+					"{table} cannot be distributed: {} draws from a sequence, and sequences are not global",
 					c.name
 				),
 				hint: L15_SEQUENCES.into(),
@@ -781,7 +781,7 @@ pub fn distribute_refusal(
 			return Some(Refusal {
 				code: NOT_ACROSS_NODES,
 				message: format!(
-					"{table} cannot be sharded by {key}: its unique key ({}) does not include it",
+					"{table} cannot be distributed by {key}: its unique key ({}) does not include it",
 					u.join(", ")
 				),
 				hint: L15_UNIQUE.into(),

@@ -291,7 +291,7 @@ pub async fn check_movable(
 		return Err(OpError::refused(
 			Kind::TableNotShardable,
 			format!(
-				"constraint {} on {rel} does not include the shard key {key}: a node can only check uniqueness over what it holds (L15)",
+				"constraint {} on {rel} does not include the distribution key {key}: a node can only check uniqueness over what it holds (L15)",
 				text(r, 0)
 			),
 		));

@@ -100,7 +100,7 @@ fn no(message: impl Into<String>, hint: impl Into<String>) -> Refusal {
 	}
 }
 
-const PIN: &str = "Pin the query to one shard key value, so one node answers it.";
+const PIN: &str = "Pin the query to one distribution key value, so one node answers it.";
 
 /// Whether `sql` (one statement) is an EXPLAIN Lepis answers itself: text format, of a SELECT.
 pub fn is_explain(sql: &str) -> bool {
@@ -206,7 +206,7 @@ pub fn split_insert(sql: &str, rows: &[Vec<usize>]) -> Result<Vec<String>, Refus
 	if ins.on_conflict_clause.is_some() && !ins.returning_list.is_empty() {
 		return Err(no(
 			"INSERT … ON CONFLICT … RETURNING with rows for several nodes is not supported",
-			"Insert the rows of each shard key value in a statement of their own, or leave out RETURNING.",
+			"Insert the rows of each distribution key value in a statement of their own, or leave out RETURNING.",
 		));
 	}
 	let Some(NodeEnum::SelectStmt(values)) =
@@ -237,7 +237,7 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 	let parsed = pg_query::parse(sql).map_err(|e| {
 		no(
 			format!("Lepis cannot read this statement: {e}"),
-			"Rewrite the statement without it, or pin it to one shard key value.",
+			"Rewrite the statement without it, or pin it to one distribution key value.",
 		)
 	})?;
 	let version = parsed.protobuf.version;
@@ -254,7 +254,7 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 				if !explain_format_is_text(e) {
 					return Err(no(
 						"EXPLAIN of a query across nodes is given in text format only",
-						"Use EXPLAIN without FORMAT, or pin the query to one shard key value.",
+						"Use EXPLAIN without FORMAT, or pin the query to one distribution key value.",
 					));
 				}
 				(s.as_ref(), Some(e.options.clone()))
@@ -843,19 +843,19 @@ impl<'a> Builder<'a> {
 		{
 			return Err(no(
 				"UNION, INTERSECT and EXCEPT across several nodes are not supported yet",
-				"Run each side as a query of its own, or pin the query to one shard key value.",
+				"Run each side as a query of its own, or pin the query to one distribution key value.",
 			));
 		}
 		if !s.locking_clause.is_empty() {
 			return Err(no(
 				"row locks (FOR UPDATE, FOR SHARE) across several nodes are not supported yet",
-				"Lock the rows of one shard key value at a time.",
+				"Lock the rows of one distribution key value at a time.",
 			));
 		}
 		if s.distinct_clause.iter().any(|d| d.node.is_some()) {
 			return Err(no(
 				"SELECT DISTINCT ON across several nodes is not supported yet",
-				"Use DISTINCT or GROUP BY, or pin the query to one shard key value.",
+				"Use DISTINCT or GROUP BY, or pin the query to one distribution key value.",
 			));
 		}
 		if s.group_distinct
@@ -865,7 +865,7 @@ impl<'a> Builder<'a> {
 		{
 			return Err(no(
 				"GROUPING SETS, ROLLUP and CUBE across several nodes are not supported yet",
-				"Run one GROUP BY per grouping, or pin the query to one shard key value.",
+				"Run one GROUP BY per grouping, or pin the query to one distribution key value.",
 			));
 		}
 		if !s.window_clause.is_empty()
@@ -877,13 +877,13 @@ impl<'a> Builder<'a> {
 		{
 			return Err(no(
 				"a window function across several nodes would see only each node's rows",
-				"Compute it over one shard key value (pin the query), or in the application over the rows Lepis returns.",
+				"Compute it over one distribution key value (pin the query), or in the application over the rows Lepis returns.",
 			));
 		}
 		if s.limit_option == LimitOption::WithTies as i32 {
 			return Err(no(
 				"FETCH … WITH TIES across several nodes is not supported yet",
-				"Use LIMIT, or pin the query to one shard key value.",
+				"Use LIMIT, or pin the query to one distribution key value.",
 			));
 		}
 		Ok(())
@@ -936,9 +936,9 @@ impl<'a> Builder<'a> {
 			if let Some(what) = what {
 				return Err(no(
 					format!(
-						"a subquery with {what} over a sharded table would be computed on each node's rows separately"
+						"a subquery with {what} over a distributed table would be computed on each node's rows separately"
 					),
-					"Group the subquery by the shard key, make the table it reads a reference table, or pin the query to one shard key value.",
+					"Group the subquery by the distribution key, make the table it reads a reference table, or pin the query to one distribution key value.",
 				));
 			}
 		}
@@ -1201,7 +1201,7 @@ impl<'a> Builder<'a> {
 			Ok(SortByDir::SortbyUsing) => {
 				return Err(no(
 					"ORDER BY … USING an operator across several nodes is not supported yet",
-					"Use ASC or DESC, or pin the query to one shard key value.",
+					"Use ASC or DESC, or pin the query to one distribution key value.",
 				));
 			}
 			_ => false,
@@ -1271,7 +1271,7 @@ impl<'a> Builder<'a> {
 		{
 			return Err(no(
 				"a * in the select list of an aggregate query across several nodes is not supported yet",
-				"Name the columns, or pin the query to one shard key value.",
+				"Name the columns, or pin the query to one distribution key value.",
 			));
 		}
 		let mut st = GroupState::default();
@@ -1447,7 +1447,7 @@ impl<'a> Builder<'a> {
 		let unsupported = || {
 			no(
 				"Lepis cannot compute this expression over aggregates across several nodes yet",
-				"Select the aggregates themselves and compute the rest in the application, or pin the query to one shard key value.",
+				"Select the aggregates themselves and compute the rest in the application, or pin the query to one distribution key value.",
 			)
 		};
 		let mut sub = |x: Option<&Node>, me: &mut Self| -> Result<Box<Expr>, Refusal> {
@@ -1545,7 +1545,7 @@ impl<'a> Builder<'a> {
 				format!(
 					"Lepis cannot read parameter ${number} to compute the aggregates across nodes"
 				),
-				"Bind it as a number, or pin the query to one shard key value.",
+				"Bind it as a number, or pin the query to one distribution key value.",
 			)
 		};
 		if self.ctx.described.is_none() {
@@ -1594,7 +1594,7 @@ impl<'a> Builder<'a> {
 		let cannot = |why: &str| {
 			no(
 				format!("{name}() {why}"),
-				"Pin the query to one shard key value, or compute it in the application from rows Lepis returns.",
+				"Pin the query to one distribution key value, or compute it in the application from rows Lepis returns.",
 			)
 		};
 		if schema.as_deref().is_some_and(|s| s != "pg_catalog") {

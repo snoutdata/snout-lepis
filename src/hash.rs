@@ -103,7 +103,7 @@ impl KeyType {
 			KeyType::Numeric => format!("hash_numeric_extended({column}, {seed})"),
 			KeyType::Uuid => format!("uuid_hash_extended({column}, {seed})"),
 			KeyType::Bytea if pg18 => format!("hashbyteaextended({column}, {seed})"),
-			KeyType::Bytea => return Err("a bytea shard key needs Postgres 18 on every node"),
+			KeyType::Bytea => return Err("a bytea distribution key needs Postgres 18 on every node"),
 			KeyType::Date if pg18 => format!("hashdateextended({column}, {seed})"),
 			KeyType::Date => format!("hashint4extended({column} - date '2000-01-01', {seed})"),
 			KeyType::Timestamp => format!("timestamp_hash_extended({column}, {seed})"),
@@ -271,7 +271,7 @@ impl fmt::Display for KeyError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
-			"cannot read {:?} as a {} shard key: {}",
+			"cannot read {:?} as a {} distribution key: {}",
 			self.value,
 			self.key_type.sql_name(),
 			self.reason

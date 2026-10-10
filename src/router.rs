@@ -844,7 +844,7 @@ impl Router {
 					return Ok(Plan::Refuse(route::Refusal {
 						code: route::NOT_ACROSS_NODES,
 						message: msg.clone(),
-						hint: "Rewrite the statement without it, or pin it to one shard key value."
+						hint: "Rewrite the statement without it, or pin it to one distribution key value."
 							.into(),
 					}));
 				}
@@ -1026,7 +1026,7 @@ impl Router {
 					message:
 						"these statements belong to different nodes and cannot run together yet"
 							.into(),
-					hint: "Send the statements for each shard key value in a batch of their own."
+					hint: "Send the statements for each distribution key value in a batch of their own."
 						.into(),
 				}));
 			}
@@ -1041,7 +1041,7 @@ impl Router {
 			return Ok(Plan::Refuse(route::Refusal {
 				code: route::NOT_ACROSS_NODES,
 				message: "savepoints and PREPARE TRANSACTION in a transaction across several nodes are not supported".into(),
-				hint: "Keep a transaction with savepoints to the shard key values of one node.".into(),
+				hint: "Keep a transaction with savepoints to the distribution key values of one node.".into(),
 			}));
 		}
 		if (multi || self.tx_status == b'E')
@@ -1112,7 +1112,7 @@ impl Router {
 			return Ok(Plan::Refuse(route::Refusal {
 				code: route::NOT_ACROSS_NODES,
 				message: "this transaction already uses another node".into(),
-				hint: "Keep a transaction to the shard key values of one node, or run the other statements outside it.".into(),
+				hint: "Keep a transaction to the distribution key values of one node, or run the other statements outside it.".into(),
 			}));
 		}
 
@@ -1868,7 +1868,7 @@ impl Router {
 				message:
 					"fetching a read across several nodes a few rows at a time is not supported yet"
 						.into(),
-				hint: "Execute it without a row limit, or pin it to one shard key value.".into(),
+				hint: "Execute it without a row limit, or pin it to one distribution key value.".into(),
 			});
 		}
 		None
@@ -2000,7 +2000,7 @@ impl Router {
 						break Err(route::Refusal {
 							code: route::NOT_ACROSS_NODES,
 							message: "Lepis could not learn the types of the values it would compare across nodes".into(),
-							hint: "Pin the query to one shard key value.".into(),
+							hint: "Pin the query to one distribution key value.".into(),
 						});
 					}
 					Ok(p) if p.needs_types => {
@@ -2203,7 +2203,7 @@ impl Router {
 					error = Some(refusal_message(
 						route::NOT_ACROSS_NODES,
 						"Lepis could not check which functions of this query are aggregates",
-						"Pin the query to one shard key value.",
+						"Pin the query to one distribution key value.",
 					));
 				}
 				b'Z' => seen += 1,
@@ -2402,7 +2402,7 @@ impl Router {
 				return Ok(Err(MergeError {
 					code: route::NOT_ACROSS_NODES,
 					message: format!("Lepis cannot order values of type {} across nodes", r.oid),
-					hint: Some("Pin the query to one shard key value.".into()),
+					hint: Some("Pin the query to one distribution key value.".into()),
 				}));
 			};
 			let collate = r
@@ -2466,7 +2466,7 @@ impl Router {
 						message: format!(
 							"the home node could not order the values Lepis merges: {text}"
 						),
-						hint: Some("Pin the query to one shard key value.".into()),
+						hint: Some("Pin the query to one distribution key value.".into()),
 					});
 					if !sync {
 						break;
@@ -2498,7 +2498,7 @@ impl Router {
 		};
 		let mut lines = vec![match planned {
 			None => format!(
-				"Lepis: one node, {} (the shard key picks it); the statement runs there unchanged",
+				"Lepis: one node, {} (the distribution key picks it); the statement runs there unchanged",
 				nodes.first().map(name).unwrap_or_default()
 			),
 			Some(p) => format!(
@@ -3071,7 +3071,7 @@ impl Router {
 			return Some(route::Refusal {
 				code: route::NOT_ACROSS_NODES,
 				message: "a transaction with savepoints cannot take in another node".into(),
-				hint: "Use savepoints only in a transaction that stays on one node, or keep the transaction to one shard key value.".into(),
+				hint: "Use savepoints only in a transaction that stays on one node, or keep the transaction to one distribution key value.".into(),
 			});
 		}
 		None
@@ -3126,13 +3126,13 @@ impl Router {
 					"the transaction could not be opened on another node: {}",
 					get(b'M')
 				),
-				hint: "Keep the transaction to the shard key values of one node.".into(),
+				hint: "Keep the transaction to the distribution key values of one node.".into(),
 			})
 		} else if isolation.as_deref() == Some("serializable") {
 			Some(route::Refusal {
 				code: route::NOT_ACROSS_NODES,
 				message: "a SERIALIZABLE transaction cannot span several nodes: each node would check only its own part".into(),
-				hint: "Use REPEATABLE READ or READ COMMITTED for a transaction across nodes, or keep it to the shard key values of one node.".into(),
+				hint: "Use REPEATABLE READ or READ COMMITTED for a transaction across nodes, or keep it to the distribution key values of one node.".into(),
 			})
 		} else {
 			None
@@ -3444,7 +3444,7 @@ impl Router {
 					let e = refusal_message(
 						route::NOT_ACROSS_NODES,
 						"an INSERT across nodes returned a different number of rows than it inserted, so RETURNING cannot be put in order",
-						"Insert the rows of each shard key value in a statement of their own.",
+						"Insert the rows of each distribution key value in a statement of their own.",
 					);
 					let o = fail(self, e);
 					self.answer(&batch, simple, Some((&d, &fields)), o);
@@ -4841,7 +4841,7 @@ impl Router {
 			fail(
 				self,
 				route::NOT_ACROSS_NODES,
-				"Lepis can split a COPY only into a sharded table",
+				"Lepis can split a COPY only into a distributed table",
 				"COPY into the table on its node.",
 			);
 			return Ok(());
@@ -4881,9 +4881,9 @@ impl Router {
 				self,
 				route::NOT_ACROSS_NODES,
 				&format!(
-					"a COPY into {table} across nodes must include its shard key column {key_column}"
+					"a COPY into {table} across nodes must include its distribution key column {key_column}"
 				),
-				"Add the shard key to the COPY's column list.",
+				"Add the distribution key to the COPY's column list.",
 			);
 			return Ok(());
 		};
@@ -5092,7 +5092,7 @@ impl Router {
 				Piece::Row { key, bytes } => {
 					let owner = match &key {
 						Key::Null => {
-							Err("a row's shard key is NULL, so it has no node".to_string())
+							Err("a row's distribution key is NULL, so it has no node".to_string())
 						}
 						Key::Text(v) => self
 							.catalog
@@ -5119,7 +5119,7 @@ impl Router {
 							cs.error = Some(refusal_message(
 								route::NOT_ACROSS_NODES,
 								&format!("COPY across nodes: {e}"),
-								"Give every row its shard key.",
+								"Give every row its distribution key.",
 							));
 							return;
 						}
