@@ -39,6 +39,18 @@ fn active(c: &Catalog) -> Vec<NodeId> {
 		.collect()
 }
 
+/// Where a rebalance may put ranges: the active nodes and the joining ones. A node attached from
+/// the home's backup (Cloud) stays Joining, a standby, until a range moves onto it, so counting
+/// only Active nodes made a rebalance right after an attach plan nothing at all, while a hand
+/// move onto the same node worked. Draining and removed nodes are never destinations.
+fn destinations(c: &Catalog) -> Vec<NodeId> {
+	c.nodes
+		.values()
+		.filter(|n| matches!(n.state, NodeState::Active | NodeState::Joining))
+		.map(|n| n.id)
+		.collect()
+}
+
 fn ks<'a>(c: &'a Catalog, name: &str) -> Result<&'a Keyspace, OpError> {
 	c.keyspaces.get(name).ok_or_else(|| {
 		OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}"))
@@ -543,7 +555,7 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			steps
 		}
 		Op::Rebalance { keyspace } => {
-			let members = active(c);
+			let members = destinations(c);
 			let mut names: Vec<&String> = c.keyspaces.keys().collect();
 			names.sort();
 			let mut steps = Vec::new();
@@ -1079,6 +1091,23 @@ mod tests {
 		let mut cat2 = c.clone();
 		cat2.keyspaces.insert("k".into(), check);
 		cat2.validate().unwrap();
+	}
+
+	#[test]
+	fn rebalance_counts_a_joining_node() {
+		let mut c = cat(2, 2);
+		// Node 2 was just attached from the home's backup: a standby, owning nothing yet.
+		c.nodes.get_mut(&NodeId(2)).unwrap().state = NodeState::Joining;
+		let mut k = c.keyspaces["k"].clone();
+		for r in k.ranges.iter_mut() {
+			r.node = NodeId(1);
+		}
+		let members = destinations(&c);
+		assert!(members.contains(&NodeId(2)), "{members:?}");
+		let (_, out) = rebalance(&k, &members);
+		assert!(out.iter().any(|r| r.node == NodeId(2)), "nothing moved to the joining node");
+		c.nodes.get_mut(&NodeId(2)).unwrap().state = NodeState::Draining;
+		assert!(!destinations(&c).contains(&NodeId(2)));
 	}
 
 	#[test]
