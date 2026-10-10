@@ -147,6 +147,15 @@ pub enum Change {
 		node: NodeId,
 		state: NodeState,
 	},
+	/// A relation the catalog no longer names (`dissolve`; a dropped table leaves by the
+	/// catalog's event trigger instead, catalog.sql).
+	DropRelation {
+		name: RelationName,
+	},
+	/// A keyspace no relation uses, with its ranges and pins (`keyspace.drop`, `dissolve`).
+	DropKeyspace {
+		name: String,
+	},
 	/// Several changes applied together (one cutover moving several ranges).
 	Many(Vec<Change>),
 }
@@ -304,6 +313,31 @@ impl Change {
 					})?
 					.state = *state;
 			}
+			Change::DropRelation { name } => {
+				c.relations.remove(name);
+			}
+			Change::DropKeyspace { name } => {
+				let mut users: Vec<String> = c
+					.relations
+					.iter()
+					.filter(
+						|(_, k)| matches!(k, RelationKind::Sharded { keyspace, .. } if keyspace == name),
+					)
+					.map(|(r, _)| r.to_string())
+					.collect();
+				if !users.is_empty() {
+					users.sort();
+					return Err(OpError::refused(
+						Kind::KeyspaceInUse,
+						format!(
+							"keyspace {name} still distributes {}; bring {} home first (table.global)",
+							users.join(", "),
+							if users.len() == 1 { "it" } else { "them" }
+						),
+					));
+				}
+				c.keyspaces.remove(name);
+			}
 			Change::Many(all) => {
 				for ch in all {
 					ch.apply(c)?;
@@ -356,6 +390,8 @@ impl Change {
 			Change::NodeState { node, state } => {
 				json!({"node_state": {"node": node.0, "state": state_name(*state)}})
 			}
+			Change::DropRelation { name } => json!({"drop_relation": {"table": name.to_string()}}),
+			Change::DropKeyspace { name } => json!({"drop_keyspace": {"name": name}}),
 			Change::Many(all) => {
 				json!({"many": all.iter().map(Change::to_json).collect::<Vec<_>>()})
 			}
@@ -430,6 +466,12 @@ impl Change {
 			"node_state" => Change::NodeState {
 				node: NodeId(i(a, "node")? as i32),
 				state: parse_state(&s(a, "state")?)?,
+			},
+			"drop_relation" => Change::DropRelation {
+				name: relation_name(&s(a, "table")?)?,
+			},
+			"drop_keyspace" => Change::DropKeyspace {
+				name: s(a, "name")?,
 			},
 			"many" => Change::Many(
 				a.as_array()
@@ -588,6 +630,32 @@ pub async fn write_catalog(
 				id.0
 			));
 		}
+	}
+	// What the catalog stops naming goes first: a relation before the keyspace it used.
+	let mut gone: Vec<&RelationName> = before
+		.relations
+		.keys()
+		.filter(|r| !after.relations.contains_key(*r))
+		.collect();
+	gone.sort();
+	for r in gone {
+		sql.push_str(&format!(
+			"delete from lepis.relation where schema_name = {} and table_name = {};\n",
+			quote_literal(&r.schema),
+			quote_literal(&r.table)
+		));
+	}
+	let mut dropped: Vec<&String> = before
+		.keyspaces
+		.keys()
+		.filter(|k| !after.keyspaces.contains_key(*k))
+		.collect();
+	dropped.sort();
+	for name in dropped {
+		let n = quote_literal(name);
+		sql.push_str(&format!(
+			"delete from lepis.pin where keyspace = {n};\ndelete from lepis.range where keyspace = {n};\ndelete from lepis.keyspace where name = {n};\n"
+		));
 	}
 	let mut names: Vec<&String> = after.keyspaces.keys().collect();
 	names.sort();
@@ -756,6 +824,32 @@ mod tests {
 			assert!(same(&once, &twice), "{ch:?}");
 			once.validate().unwrap();
 		}
+	}
+
+	#[test]
+	fn a_keyspace_is_dropped_only_once_nothing_uses_it() {
+		let mut c = cat(2, 2);
+		let t = relation_name("app.t").unwrap();
+		c.relations.insert(
+			t.clone(),
+			RelationKind::Sharded {
+				keyspace: "k".into(),
+				key_column: "id".into(),
+			},
+		);
+		let drop = Change::DropKeyspace { name: "k".into() };
+		let e = drop.apply(&mut c.clone()).unwrap_err();
+		assert_eq!(e.kind, Some(Kind::KeyspaceInUse));
+		assert!(e.message.contains("app.t"), "{e}");
+		let all = Change::Many(vec![Change::DropRelation { name: t }, drop.clone()]);
+		assert_eq!(Change::from_json(&all.to_json()).unwrap(), all);
+		let mut once = c.clone();
+		all.apply(&mut once).unwrap();
+		assert!(once.keyspaces.is_empty() && once.relations.is_empty());
+		let mut twice = once.clone();
+		all.apply(&mut twice).unwrap();
+		assert!(same(&once, &twice));
+		once.validate().unwrap();
 	}
 
 	#[test]

@@ -81,3 +81,40 @@ end $$;
 drop trigger if exists epoch_moved on lepis.cluster;
 create trigger epoch_moved after update of epoch on lepis.cluster
 	for each statement execute function lepis.notify_epoch();
+
+-- A table dropped on the home node leaves the catalog in the same transaction, so a relation
+-- the catalog names always exists (a dropped table used to stay listed, and a new table of the
+-- same name would have been routed as the old one). The epoch moves without the NOTIFY: the drop
+-- of a distributed table is a two-phase transaction, and PREPARE refuses one that notified, so
+-- routers see it at their next heartbeat, which reads the epoch back (live.rs, within 5 s). Only
+-- a superuser may make an event trigger; a catalog set up by a login with REPLICATION alone goes
+-- without it.
+create or replace function lepis.forget_dropped() returns event_trigger
+	language plpgsql security definer set search_path = pg_catalog, pg_temp as $$
+declare
+	gone int;
+	was text;
+begin
+	if to_regclass('lepis.relation') is null then
+		return;
+	end if;
+	delete from lepis.relation r
+	using pg_event_trigger_dropped_objects() d
+	where d.object_type = 'table' and d.schema_name = r.schema_name and d.object_name = r.table_name;
+	get diagnostics gone = row_count;
+	if gone > 0 then
+		was := current_setting('session_replication_role');
+		perform set_config('session_replication_role', 'replica', true);
+		update lepis.cluster set epoch = epoch + 1 where id = 1;
+		perform set_config('session_replication_role', was, true);
+	end if;
+end $$;
+do $$
+begin
+	if (select rolsuper from pg_roles where rolname = current_user)
+		and not exists (select from pg_event_trigger where evtname = 'lepis_forget_dropped') then
+		create event trigger lepis_forget_dropped on sql_drop
+			when tag in ('DROP TABLE', 'DROP SCHEMA', 'DROP OWNED')
+			execute function lepis.forget_dropped();
+	end if;
+end $$;

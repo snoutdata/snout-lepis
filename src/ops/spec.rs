@@ -174,10 +174,18 @@ pub enum Op {
 	RestorePoint {
 		name: Option<String>,
 	},
+	/// A keyspace no table uses any more, forgotten with its ranges and pins.
+	KeyspaceDrop {
+		name: String,
+	},
+	/// The cluster back to one plain database: allowed once the home is the only node left. Its
+	/// data is checked, the fences come off, and the catalog forgets every keyspace and relation;
+	/// the job log stays. What runs the router then stops it (the Cloud: `cloud_project_unshard`).
+	Dissolve,
 }
 
 /// Every operation's name, for the API's own description of itself.
-pub const OPS: [&str; 17] = [
+pub const OPS: [&str; 19] = [
 	"node.add",
 	"node.drain",
 	"node.remove",
@@ -195,6 +203,8 @@ pub const OPS: [&str; 17] = [
 	"cleanup",
 	"node.attach",
 	"restore_point",
+	"keyspace.drop",
+	"dissolve",
 ];
 
 fn node_ref(v: &Value, k: &str) -> Result<NodeRef, OpError> {
@@ -303,6 +313,10 @@ impl Op {
 			"restore_point" => Op::RestorePoint {
 				name: opt_str(v, "name"),
 			},
+			"keyspace.drop" => Op::KeyspaceDrop {
+				name: s(v, "name")?,
+			},
+			"dissolve" => Op::Dissolve,
 			other => {
 				return Err(OpError::refused(
 					Kind::UnknownOperation,
@@ -331,6 +345,8 @@ impl Op {
 			Op::Cleanup { .. } => "cleanup",
 			Op::NodeAttach { .. } => "node.attach",
 			Op::RestorePoint { .. } => "restore_point",
+			Op::KeyspaceDrop { .. } => "keyspace.drop",
+			Op::Dissolve => "dissolve",
 		}
 	}
 }
@@ -388,6 +404,8 @@ pub enum Step {
 	RestorePoint {
 		name: String,
 	},
+	/// Fences off and the catalog's shape forgotten, on a cluster of the home alone (`Op::Dissolve`).
+	Dissolve,
 }
 
 fn tables_json(t: &[RelationName]) -> Value {
@@ -409,6 +427,7 @@ impl Step {
 			Step::Cleanup { .. } => "cleanup",
 			Step::NodeAttach { .. } => "node.attach",
 			Step::RestorePoint { .. } => "restore_point",
+			Step::Dissolve => "dissolve",
 		}
 	}
 
@@ -438,6 +457,7 @@ impl Step {
 				json!({"id": id.0, "spec": spec.to_json(), "standby_of": standby_of.0})
 			}
 			Step::RestorePoint { name } => json!({"name": name}),
+			Step::Dissolve => json!({}),
 		}
 	}
 
@@ -505,6 +525,7 @@ impl Step {
 			"restore_point" => Step::RestorePoint {
 				name: s(a, "name")?,
 			},
+			"dissolve" => Step::Dissolve,
 			other => return Err(OpError::new(format!("unknown step {other}"))),
 		})
 	}
@@ -529,6 +550,7 @@ mod tests {
 				},
 			}),
 			Step::Cleanup { node: None },
+			Step::Dissolve,
 			Step::Verify {
 				keyspace: Some("k".into()),
 			},
@@ -559,6 +581,14 @@ mod tests {
 				at: None,
 				to: Some(NodeRef::Name("n3".into())),
 			}
+		);
+		assert_eq!(
+			Op::from_json(&json!({"op": "dissolve"})).unwrap(),
+			Op::Dissolve
+		);
+		assert_eq!(
+			Op::from_json(&json!({"op": "keyspace.drop", "name": "k"})).unwrap(),
+			Op::KeyspaceDrop { name: "k".into() }
 		);
 		let e = Op::from_json(&json!({"op": "range.teleport"})).unwrap_err();
 		assert!(e.message.contains("range.move"), "{e}");

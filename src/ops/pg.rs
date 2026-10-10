@@ -280,10 +280,13 @@ pub enum Kind {
 	RangeMoved,
 	VerifyFailed,
 	Cancelled,
+	KeyspaceInUse,
+	NotSingleNode,
+	InDoubt,
 }
 
 impl Kind {
-	pub const ALL: [Kind; 35] = [
+	pub const ALL: [Kind; 38] = [
 		Kind::NoSuchJob,
 		Kind::NoSuchKeyspace,
 		Kind::NoSuchNode,
@@ -319,6 +322,9 @@ impl Kind {
 		Kind::RangeMoved,
 		Kind::VerifyFailed,
 		Kind::Cancelled,
+		Kind::KeyspaceInUse,
+		Kind::NotSingleNode,
+		Kind::InDoubt,
 	];
 
 	pub fn name(self) -> &'static str {
@@ -358,6 +364,9 @@ impl Kind {
 			Kind::RangeMoved => "range_moved",
 			Kind::VerifyFailed => "verify_failed",
 			Kind::Cancelled => "cancelled",
+			Kind::KeyspaceInUse => "keyspace_in_use",
+			Kind::NotSingleNode => "not_single_node",
+			Kind::InDoubt => "in_doubt",
 		}
 	}
 

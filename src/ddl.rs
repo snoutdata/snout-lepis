@@ -364,7 +364,10 @@ impl Planner<'_> {
 							if self.key_of(t) == Some(r.subname.as_str()) =>
 						{
 							return refuse(
-								format!("{}, the distribution key of {t}, cannot be renamed", r.subname),
+								format!(
+									"{}, the distribution key of {t}, cannot be renamed",
+									r.subname
+								),
 								"The catalog names the key column; it stays as it is.",
 							);
 						}

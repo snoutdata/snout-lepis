@@ -591,7 +591,43 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			super::restore_point::check_name(&name)?;
 			vec![Step::RestorePoint { name }]
 		}
+		Op::KeyspaceDrop { name } => {
+			ks(c, name)?;
+			let change = Change::DropKeyspace { name: name.clone() };
+			// Refused now, naming the tables, rather than when the job reaches it.
+			change.apply(&mut c.clone())?;
+			vec![Step::Catalog(change)]
+		}
+		Op::Dissolve => {
+			only_home(c, home)?;
+			// Checked before anything changes: every distributed table fenced, every row where the
+			// catalog says. Then the fences come off and the catalog forgets its shape.
+			vec![Step::Verify { keyspace: None }, Step::Dissolve]
+		}
 	})
+}
+
+/// `dissolve`'s condition: the home is the cluster's only node, so every row is already on it.
+pub fn only_home(c: &Catalog, home: NodeId) -> Result<(), OpError> {
+	let mut others: Vec<&str> = c
+		.nodes
+		.values()
+		.filter(|n| n.id != home && n.state != NodeState::Removed)
+		.map(|n| n.name.as_str())
+		.collect();
+	if others.is_empty() {
+		return Ok(());
+	}
+	others.sort();
+	Err(OpError::refused(
+		Kind::NotSingleNode,
+		format!(
+			"the cluster still has {} besides the home node ({}); drain and remove {} first, so every row is on the home node",
+			if others.len() == 1 { "a node" } else { "nodes" },
+			others.join(", "),
+			if others.len() == 1 { "it" } else { "them" }
+		),
+	))
 }
 
 async fn node_add(
@@ -1105,7 +1141,10 @@ mod tests {
 		let members = destinations(&c);
 		assert!(members.contains(&NodeId(2)), "{members:?}");
 		let (_, out) = rebalance(&k, &members);
-		assert!(out.iter().any(|r| r.node == NodeId(2)), "nothing moved to the joining node");
+		assert!(
+			out.iter().any(|r| r.node == NodeId(2)),
+			"nothing moved to the joining node"
+		);
 		c.nodes.get_mut(&NodeId(2)).unwrap().state = NodeState::Draining;
 		assert!(!destinations(&c).contains(&NodeId(2)));
 	}
@@ -1147,5 +1186,23 @@ mod tests {
 			.filter(|s| matches!(s, Step::Transfer(_)))
 			.count();
 		assert!((1..=2).contains(&moved), "{steps:?}");
+	}
+
+	#[test]
+	fn dissolve_waits_for_the_home_to_be_alone() {
+		let mut c = cat(3, 3);
+		let e = only_home(&c, NodeId(1)).unwrap_err();
+		assert_eq!(e.kind, Some(Kind::NotSingleNode));
+		assert!(e.message.contains("(n2, n3)"), "{e}");
+		c.nodes.get_mut(&NodeId(2)).unwrap().state = NodeState::Removed;
+		c.nodes.get_mut(&NodeId(3)).unwrap().state = NodeState::Joining;
+		assert!(
+			only_home(&c, NodeId(1))
+				.unwrap_err()
+				.message
+				.contains("a node besides the home node (n3)")
+		);
+		c.nodes.get_mut(&NodeId(3)).unwrap().state = NodeState::Removed;
+		only_home(&c, NodeId(1)).unwrap();
 	}
 }

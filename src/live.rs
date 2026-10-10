@@ -1,6 +1,8 @@
 //! The catalog, kept current (L6): read from the home node at start, then again whenever the
-//! epoch moves. A router learns of a move by `LISTEN lepis_epoch` and, in case a notification is
-//! lost with a broken connection, by reading the epoch every `POLL`.
+//! epoch moves. A router learns of a move by `LISTEN lepis_epoch`; by its heartbeat, which reads
+//! the epoch back, within `HEARTBEAT` when a move was made without a notification (a dropped table
+//! leaving the catalog inside a two-phase transaction, catalog.sql); and, in case the connection
+//! itself broke, by reading the whole catalog every `POLL`.
 //!
 //! Each router also keeps a heartbeat row in `lepis.router` with the epoch it has loaded: its ack.
 //! A cutover (L10, `ops::transfer`) waits for every live router to ack the new epoch before the
@@ -196,21 +198,31 @@ async fn wait(b: &mut Conn) -> Result<bool, String> {
 	}
 }
 
-/// Writes this router's heartbeat with the epoch it routes by. Returns whether a notification
-/// arrived meanwhile, so the caller reads the catalog again instead of waiting. A cluster with no
-/// catalog has nothing to ack.
+/// Writes this router's heartbeat with the epoch it routes by. Returns whether the catalog moved
+/// meanwhile, by a notification or by the epoch the heartbeat reads back being another, so the
+/// caller reads the catalog again instead of waiting. A cluster with no catalog has nothing to ack.
 async fn heartbeat(b: &mut Conn, id: &str, epoch: i64) -> bool {
 	if epoch == 0 {
 		return false;
 	}
 	let sql = format!(
 		"insert into lepis.router (id, epoch, seen_at) values ({}, {epoch}, now()) \
-		on conflict (id) do update set epoch = excluded.epoch, seen_at = now()",
+		on conflict (id) do update set epoch = excluded.epoch, seen_at = now() \
+		returning (select epoch from lepis.cluster where id = 1)",
 		catalog::quote_literal(id)
 	);
 	let mut notified = false;
-	if let Err(e) = exchange(b, &sql, &mut notified).await {
-		tracing::debug!("router heartbeat: {e}");
+	match exchange(b, &sql, &mut notified).await {
+		Ok(rows) => {
+			let now = rows
+				.first()
+				.and_then(|r| r.first().cloned().flatten())
+				.and_then(|v| v.parse::<i64>().ok());
+			notified || now.is_some_and(|e| e != epoch)
+		}
+		Err(e) => {
+			tracing::debug!("router heartbeat: {e}");
+			notified
+		}
 	}
-	notified
 }

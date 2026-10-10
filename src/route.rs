@@ -265,7 +265,9 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 			.unwrap_or_default();
 		return refuse(
 			NOT_ACROSS_NODES,
-			format!("{g} lives only on the home node and cannot be combined with a distributed table"),
+			format!(
+				"{g} lives only on the home node and cannot be combined with a distributed table"
+			),
 			format!("Make {g} a reference table so every node has it, or query it separately."),
 		);
 	}
@@ -1075,9 +1077,9 @@ pub mod copy {
 					if !was_quoted && value == self.o.null {
 						return Ok(Key::Null);
 					}
-					return String::from_utf8(value)
-						.map(Key::Text)
-						.map_err(|_| "a distribution key in the COPY data is not valid UTF-8".into());
+					return String::from_utf8(value).map(Key::Text).map_err(|_| {
+						"a distribution key in the COPY data is not valid UTF-8".into()
+					});
 				}
 				if i >= row.len() {
 					return Err("a row has fewer columns than the COPY names".into());

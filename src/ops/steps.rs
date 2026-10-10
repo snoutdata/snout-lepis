@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use super::Kind;
 use super::spec::{NodeSpec, Step, sslmode_name};
 use super::{
-	OpError, Pg, Settings, Target, change_catalog, load_catalog, qualified, schema, state_name,
-	transfer,
+	Change, OpError, Pg, Settings, Target, change_catalog, load_catalog, qualified, schema,
+	state_name, transfer,
 };
 use crate::catalog::{
 	self, Catalog, NodeId, NodeState, RelationKind, RelationName, owns_check, quote_ident,
@@ -232,7 +232,91 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, step: &Step) -> Result<(), OpErro
 			standby_of,
 		} => super::attach::run(cx, h, *id, spec, *standby_of).await,
 		Step::RestorePoint { name } => super::restore_point::run(cx, h, name).await,
+		Step::Dissolve => dissolve(cx, h).await,
 	}
+}
+
+/// `dissolve`'s one step, on a cluster whose home is its only node (the plan refused otherwise;
+/// asked again here, since a job may run long after it was planned). Nothing is left in doubt
+/// first: a prepared two-phase transaction needs a router to finish it, and the router is what
+/// goes next. Then each distributed table loses its fence, and the catalog forgets every keyspace
+/// and relation in one write. Rows are untouched: on one node they were all there already.
+/// Striped sequences keep their stride, so the values they hand out stay unique (with gaps).
+async fn dissolve(cx: &mut StepCtx, h: &mut Pg) -> Result<(), OpError> {
+	let c = load_catalog(h).await?;
+	let home = c
+		.home()
+		.map(|n| n.id)
+		.ok_or_else(|| OpError::refused(Kind::CatalogInvalid, "the catalog has no home node"))?;
+	if let Some(n) = c
+		.nodes
+		.values()
+		.find(|n| n.id != home && n.state != NodeState::Removed)
+	{
+		return Err(OpError::refused(
+			Kind::NotSingleNode,
+			format!(
+				"{} joined the cluster after this was planned; drain and remove it first",
+				n.name
+			),
+		));
+	}
+	let waiting = h
+		.simple(
+			"select (select count(*) from pg_prepared_xacts 				where gid like 'lepis:' || (select uid from lepis.cluster where id = 1) || ':%') 			+ (select count(*) from lepis.prepared where decision = 'commit')",
+		)
+		.await?
+		.first()
+		.and_then(|r| r.first().cloned().flatten())
+		.and_then(|v| v.parse::<i64>().ok())
+		.unwrap_or(0);
+	if waiting > 0 {
+		return Err(OpError::refused(
+			Kind::InDoubt,
+			format!(
+				"{waiting} two-phase transaction(s) are not finished yet; resume this job in a minute, once the router has finished them"
+			),
+		));
+	}
+	let mut sharded: Vec<&RelationName> = c
+		.relations
+		.iter()
+		.filter(|(_, k)| matches!(k, RelationKind::Sharded { .. }))
+		.map(|(r, _)| r)
+		.collect();
+	sharded.sort();
+	let mut pg = connect_node(&cx.app, &c, home).await?;
+	let mut unfenced = Vec::new();
+	for rel in sharded {
+		if schema::exists(&mut pg, rel).await? {
+			alter_briefly(
+				&mut pg,
+				&format!(
+					"alter table {} drop constraint if exists lepis_owns",
+					qualified(rel)
+				),
+			)
+			.await?;
+			unfenced.push(rel.to_string());
+		}
+	}
+	let mut forgot: Vec<Change> = Vec::new();
+	let mut tables: Vec<String> = c.relations.keys().map(|r| r.to_string()).collect();
+	tables.sort();
+	for r in c.relations.keys() {
+		forgot.push(Change::DropRelation { name: r.clone() });
+	}
+	let mut keyspaces: Vec<String> = c.keyspaces.keys().cloned().collect();
+	keyspaces.sort();
+	for k in &keyspaces {
+		forgot.push(Change::DropKeyspace { name: k.clone() });
+	}
+	let epoch = change_catalog(h, &Change::Many(forgot), "").await?;
+	cx.save(
+		h,
+		json!({"epoch": epoch, "unfenced": unfenced, "forgot": {"tables": tables, "keyspaces": keyspaces}}),
+	)
+	.await
 }
 
 /// L1's requirements for a node, each refused with the setting to change.

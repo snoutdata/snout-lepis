@@ -1868,7 +1868,8 @@ impl Router {
 				message:
 					"fetching a read across several nodes a few rows at a time is not supported yet"
 						.into(),
-				hint: "Execute it without a row limit, or pin it to one distribution key value.".into(),
+				hint: "Execute it without a row limit, or pin it to one distribution key value."
+					.into(),
 			});
 		}
 		None

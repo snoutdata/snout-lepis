@@ -496,7 +496,8 @@ impl Analyzer<'_> {
 				};
 				out.push(value.ok_or_else(|| {
 					AnalyzeError::Unsupported(
-						"the distribution key of an inserted row must be a literal or a parameter".into(),
+						"the distribution key of an inserted row must be a literal or a parameter"
+							.into(),
 					)
 				})?);
 			}
@@ -2898,8 +2899,7 @@ mod tests {
 			unsupported("insert into orders (tenant_id) values (1), (1 + 1)"),
 			literal
 		);
-		let columns =
-			"name the columns of an INSERT into a distributed table, so Lepis can find the distribution key";
+		let columns = "name the columns of an INSERT into a distributed table, so Lepis can find the distribution key";
 		assert_eq!(unsupported("insert into orders values (1)"), columns);
 		assert_eq!(
 			unsupported("insert into orders select * from orders"),
