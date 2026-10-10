@@ -24,6 +24,10 @@ COPY --from=build /snout-lepis /snout-lepis
 # only, and podman refuses to start a container whose user it cannot map. 1000, as the other
 # servers run. The certificate the host makes for the router is world-readable (host/lepis.ts).
 USER 1000:1000
+# The base's working directory is /home/nonroot, owned by 65532 with no access for anyone else,
+# so uid 1000 cannot start in it ("chdir to /home/nonroot: Permission denied"). The router
+# writes no files; it starts in /.
+WORKDIR /
 EXPOSE 5432
 # How SnoutData Studio's "Find databases" knows this container is part of the SnoutData stack:
 # by label, never by guessing from the image name.
