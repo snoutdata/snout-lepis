@@ -708,6 +708,19 @@ impl Router {
 		if self.pinned.is_some() || self.tx_status != b'I' {
 			self.moved_in_tx = true;
 		}
+		// A node whose address moved (`node.failover`) is another server now: a backend this
+		// session holds for it belongs to the old one. Outside a transaction it is let go and the
+		// next statement dials the new address; inside one, the transaction fails as it would have.
+		if self.tx_status == b'I' && self.pinned.is_none() {
+			let old = &self.catalog;
+			self.conns
+				.retain(|id, _| match (old.nodes.get(id), fresh.nodes.get(id)) {
+					(Some(a), Some(b)) => {
+						a.host == b.host && a.port == b.port && a.dbname == b.dbname
+					}
+					_ => true,
+				});
+		}
 		self.home_id = fresh.home().map(|n| n.id).unwrap_or(self.home_id);
 		self.catalog = fresh;
 	}

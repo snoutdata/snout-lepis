@@ -584,6 +584,15 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				standby_of,
 			}]
 		}
+		Op::NodeFailover { node, spec, fenced } => {
+			let node = node.resolve(c)?;
+			super::failover::precheck(app, c, node, spec).await?;
+			vec![Step::NodeFailover {
+				node,
+				spec: spec.clone(),
+				fenced: *fenced,
+			}]
+		}
 		Op::RestorePoint { name } => {
 			let name = name
 				.clone()

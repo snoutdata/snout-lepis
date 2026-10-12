@@ -14,6 +14,12 @@
 #   connect  pgbench -S -C            a new connection per transaction: the login path (two SCRAM
 #                                     exchanges through Lepis, auth_query + one through PgBouncer)
 #
+# LEPIS_BENCH_RATE=N runs every target at the same offered load, N transactions a second in all
+# (pgbench -R), instead of as fast as each goes. At full speed a target that goes slower also loads
+# Postgres less, so its tail is not comparable with the others'; at one fixed rate below every
+# target's ceiling it is. Added for the 64-client p99, where PgBouncer's p99 read below plain
+# Postgres's own while it ran at half the throughput.
+#
 # Lepis in Phase 0 is a session pass-through, so PgBouncer runs in session mode for a like-for-like
 # reading. With LEPIS_BENCH_ROUTED=1 the bench database gets a one-node catalog, so Lepis runs its
 # router (Phase 1 on), and Lepis is measured twice: pool_mode session and pool_mode transaction. Everything it starts is named lepis-bench-<pid>-* and removed after, by name.
@@ -84,7 +90,7 @@ bench() {
 	local host="$1" args="$2" db="${3:-bench}"
 	"$engine" exec "$client" sh -c 'rm -f /tmp/pgl.*'
 	"$engine" exec -e PGPASSWORD=bench-pw "$client" \
-		pgbench -h "$host" -p 5432 -U bench -n -T "$seconds" -c "$clients" -j 4 -l --sampling-rate=0.1 --log-prefix=/tmp/pgl $args "$db" 2>&1
+		pgbench -h "$host" -p 5432 -U bench -n -T "$seconds" -c "$clients" -j 4 -l --sampling-rate=0.1 --log-prefix=/tmp/pgl ${LEPIS_BENCH_RATE:+-R "$LEPIS_BENCH_RATE"} $args "$db" 2>&1
 }
 # p50 and p99 in ms, from the 10% per-transaction sample bench() logged (field 3 is microseconds).
 percentiles() {
@@ -98,7 +104,7 @@ raw="$(mktemp)"
 	echo "# Lepis Phase 0: pgbench, $label"
 	echo
 	echo "\`bash bench/pgbench.sh $seconds $clients $label\`, $(date -u +%FT%TZ)."
-	echo "Host: $(uname -srm), $(nproc 2>/dev/null || echo '?') CPUs. postgres:18, scale 20, $clients clients, $seconds s each."
+	echo "Host: $(uname -srm), $(nproc 2>/dev/null || echo '?') CPUs. postgres:18, scale 20, $clients clients, $seconds s each${LEPIS_BENCH_RATE:+, at a fixed $LEPIS_BENCH_RATE transactions/s in all (pgbench -R)}."
 	if [ -n "$routed" ]; then
 		echo "Lepis: the router (a one-node catalog), pool_mode session and transaction. PgBouncer $pgbouncer_image in session mode."
 	else

@@ -218,6 +218,8 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		create schema physx;
 		create table physx.ledger (acct bigint not null, id bigint not null, note text, primary key (acct, id));
 		create table physx.plans (id int primary key, name text not null);
+		create table physx.notes (acct bigint not null, id bigint not null, body text, primary key (acct, id));
+		insert into physx.notes select (g % 500) + 1, g, 'n' from generate_series(1, 2000) g;
 		insert into physx.plans values (1, 'free'), (2, 'pro');
 		grant usage on schema physx to phys_app;
 		grant select, insert, update, delete on all tables in schema physx to phys_app;
@@ -345,6 +347,25 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		.unwrap();
 	assert_eq!(n2["state"], "joining", "{st}");
 
+	// While it is a joining standby, a table distributed into the keyspace, a verify and a cleanup
+	// pass it by: it is read-only, and has the fence and the rows by replay. Each of these failed
+	// the job with 25006 until 0.1.6 (found live on 2026-10-11, the dashboard's "spread a table").
+	let j = admin
+		.op(
+			json!({"op": "table.distribute", "table": "physx.notes", "column": "acct", "keyspace": "acct"}),
+		)
+		.await;
+	let fences = j["steps"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|s| s["kind"] == "fences")
+		.unwrap();
+	assert_eq!(fences["detail"]["standbys_passed"], json!([2]), "{j:#}");
+	admin.op(json!({"op": "verify", "keyspace": "acct"})).await;
+	admin.op(json!({"op": "cleanup"})).await;
+	assert_eq!(one(&home, "select count(*) from physx.notes").await, "2000");
+
 	// The upper range moves to the standby, which is promoted to take it.
 	let r = ranges(&st, "acct");
 	let upper = *r.iter().max_by_key(|x| x.0).unwrap();
@@ -465,6 +486,129 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		.await
 		.unwrap_err();
 	assert_eq!(e.as_db_error().unwrap().code().code(), "23514", "{e}");
+
+	// Its replica takes its place (L16-L17): a cascading standby made of the standby before the
+	// split, which followed it onto its new timeline when it was promoted. The node answers, so
+	// Lepis fences it itself (read-only, sessions ended, the replica caught up), promotes the
+	// replica and points node 2's row at it. Rows written to node 2 just before are on it.
+	let _node2 = match env("LEPIS_PHYS_REPLICA") {
+		None => {
+			eprintln!("LEPIS_PHYS_REPLICA not set; the failover is skipped");
+			sb
+		}
+		Some(replica) => {
+			let rep = admin_of(&replica).await;
+			assert_eq!(one(&rep, "select pg_is_in_recovery()").await, "t");
+			let (rh, rp) = replica.rsplit_once(':').unwrap();
+			let failover = json!({"op": "node.failover", "node": 2, "name": "n2r", "host": rh,
+				"port": rp.parse::<u16>().unwrap(), "dbname": "postgres", "sslmode": "disable"});
+			let (code, e) = admin
+				.call(
+					"POST",
+					"/v1/plan",
+					Some(
+						&json!({"op": "node.failover", "node": 1, "name": "n2r", "host": rh,
+					"port": rp.parse::<u16>().unwrap(), "dbname": "postgres", "sslmode": "disable"}),
+					),
+				)
+				.await;
+			assert_eq!(
+				(code, e["error"]["kind"].as_str()),
+				(409, Some("home_node")),
+				"{e}"
+			);
+			let (code, e) = admin
+				.call(
+					"POST",
+					"/v1/plan",
+					Some(
+						&json!({"op": "node.failover", "node": 2, "name": "n9", "host": phost,
+					"port": pport.parse::<u16>().unwrap(), "dbname": "postgres", "sslmode": "disable"}),
+					),
+				)
+				.await;
+			assert_eq!(code, 409, "the home is not node 2's replica: {e}");
+			let app_conn = connect(&lepis, "phys_app", "app-pw")
+				.await
+				.expect("phys_app through lepis");
+			for id in 0..20 {
+				app_conn
+					.simple_query(&format!(
+						"insert into physx.ledger (acct, id, note) values ({moved}, {}, 'before failover')",
+						-1000 - id
+					))
+					.await
+					.expect("insert before the failover");
+			}
+			let before: BTreeSet<(i64, i64)> = rows(&sb).await.into_iter().collect();
+			let j = admin.op(failover).await;
+			let d = &j["steps"][0]["detail"];
+			assert_eq!(d["phase"], "cut", "{j:#}");
+			assert_eq!(d["fence"]["how"], "made read-only by lepis", "{j:#}");
+			eprintln!("failover: {d}");
+			assert_eq!(
+				one(&rep, "select pg_is_in_recovery()").await,
+				"f",
+				"the replica was not promoted"
+			);
+			assert_eq!(
+				one(&rep, "select current_setting('synchronous_standby_names')").await,
+				""
+			);
+			let st = admin.status().await;
+			let n2 = st["nodes"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|n| n["id"] == 2)
+				.unwrap();
+			assert_eq!(
+				(n2["name"].as_str(), n2["state"].as_str()),
+				(Some("n2r"), Some("active")),
+				"{st}"
+			);
+			assert!(ranges(&st, "acct").contains(&(upper.0, upper.1, 2)), "{st}");
+			// Every row node 2 had is on its replica, and nothing else.
+			let after: BTreeSet<(i64, i64)> = rows(&rep).await.into_iter().collect();
+			assert_eq!(after, before, "the replica's rows differ from the node's");
+			assert!(
+				before
+					.iter()
+					.filter(|(a, i)| *a == moved && *i <= -1000)
+					.count() == 20
+			);
+			// The router's sessions dial the new address: a write to a moved key lands on the
+			// replica, through the same client connection as before.
+			app_conn
+				.simple_query(&format!(
+					"insert into physx.ledger (acct, id, note) values ({moved}, -2000, 'after failover')"
+				))
+				.await
+				.expect("insert after the failover");
+			assert_eq!(
+				one(
+					&rep,
+					&format!(
+						"select count(*) from physx.ledger where acct = {moved} and id = -2000"
+					)
+				)
+				.await,
+				"1"
+			);
+			// The old node is read-only: nothing can write there any more (the fence ended the
+			// sessions it had, this test's among them, so a new one asks).
+			let old = admin_of(&standby).await;
+			let e = old
+				.simple_query(&format!(
+					"insert into physx.ledger values ({moved}, -3000, 'old node')"
+				))
+				.await
+				.unwrap_err();
+			assert_eq!(e.as_db_error().unwrap().code().code(), "25006", "{e}");
+			admin.op(json!({"op": "verify", "keyspace": "acct"})).await;
+			rep
+		}
+	};
 
 	// The promoted node is an ordinary node now: the range comes back by the logical path.
 	let lower = *ranges(&st, "acct").iter().min_by_key(|x| x.0).unwrap();

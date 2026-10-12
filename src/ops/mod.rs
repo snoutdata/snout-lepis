@@ -23,6 +23,7 @@
 pub mod advisor;
 pub mod attach;
 pub mod engine;
+pub mod failover;
 pub mod pg;
 pub mod physical;
 pub mod plan;

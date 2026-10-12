@@ -111,6 +111,22 @@ pub async fn version(pg: &mut Pg) -> Result<u32, OpError> {
 		.ok_or_else(|| OpError::new("no server_version_num"))
 }
 
+/// Whether a node is a physical standby still replaying its source (`pg_is_in_recovery()`): a node
+/// attached as `joining` from the home's backup (Cloud) until a range moves onto it and promotes it.
+/// It cannot be written, and needs no writing: every fence, table and delete on its source reaches
+/// it by replay. So the steps that write to every node pass it by, rather than failing the job on
+/// `25006 read-only transaction` (found live on 2026-10-11: a table distributed while a new node was
+/// joining failed at its fences).
+pub async fn in_recovery(pg: &mut Pg) -> Result<bool, OpError> {
+	Ok(pg
+		.simple("select pg_is_in_recovery()")
+		.await?
+		.first()
+		.and_then(|r| r.first().cloned().flatten())
+		.as_deref()
+		== Some("t"))
+}
+
 /// Runs a fence (or any short ALTER on a busy table) with a lock timeout, retrying, so it never
 /// queues writers behind it for long.
 pub async fn alter_briefly(pg: &mut Pg, sql: &str) -> Result<(), OpError> {
@@ -231,6 +247,9 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, step: &Step) -> Result<(), OpErro
 			spec,
 			standby_of,
 		} => super::attach::run(cx, h, *id, spec, *standby_of).await,
+		Step::NodeFailover { node, spec, fenced } => {
+			super::failover::run(cx, h, *node, spec, *fenced).await
+		}
 		Step::RestorePoint { name } => super::restore_point::run(cx, h, name).await,
 		Step::Dissolve => dissolve(cx, h).await,
 	}
@@ -450,6 +469,10 @@ async fn table_create(
 ) -> Result<(), OpError> {
 	let c = load_catalog(h).await?;
 	let mut dst = connect_node(&cx.app, &c, node).await?;
+	// A standby has the table, and its source's fence, by replay.
+	if in_recovery(&mut dst).await? {
+		return Ok(());
+	}
 	if !schema::exists(&mut dst, table).await? {
 		let mut made = false;
 		let mut sources: Vec<NodeId> = c.home().map(|n| n.id).into_iter().collect();
@@ -486,8 +509,13 @@ async fn fences(cx: &mut StepCtx, h: &mut Pg, keyspace: &str) -> Result<(), OpEr
 	let c = load_catalog(h).await?;
 	let tables = tables_of(&c, keyspace);
 	let mut done = 0;
+	let mut standbys = Vec::new();
 	for n in c.nodes.values().filter(|n| n.state != NodeState::Removed) {
 		let mut pg = connect_node(&cx.app, &c, n.id).await?;
+		if in_recovery(&mut pg).await? {
+			standbys.push(n.id.0);
+			continue;
+		}
 		let v = version(&mut pg).await?;
 		for t in &tables {
 			if schema::exists(&mut pg, t).await?
@@ -498,7 +526,8 @@ async fn fences(cx: &mut StepCtx, h: &mut Pg, keyspace: &str) -> Result<(), OpEr
 			}
 		}
 	}
-	cx.save(h, json!({"fences": done})).await
+	cx.save(h, json!({"fences": done, "standbys_passed": standbys}))
+		.await
 }
 
 /// The sharded relations of a keyspace, in name order.
@@ -619,6 +648,10 @@ async fn cleanup(cx: &mut StepCtx, h: &mut Pg, node: Option<NodeId>) -> Result<(
 		.filter(|n| n.state != NodeState::Removed && node.is_none_or(|x| x == n.id))
 	{
 		let mut pg = connect_node(&cx.app, &c, n.id).await?;
+		// A standby owns nothing and holds its source's rows by replay: nothing to delete there.
+		if in_recovery(&mut pg).await? {
+			continue;
+		}
 		let v = version(&mut pg).await?;
 		let mut sharded: Vec<&RelationName> = c
 			.relations

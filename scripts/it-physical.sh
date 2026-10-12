@@ -18,12 +18,13 @@ run="lepis-phys-$$"
 net="$run-net"
 primary="$run-p"
 standby="$run-s"
+replica="$run-r"
 
 cleanup() {
 	if [ -n "${LEPIS_PHYS_LOGS:-}" ]; then
 		"$engine" logs "$standby" 2>&1 | tail -n "$LEPIS_PHYS_LOGS" >&2 || true
 	fi
-	"$engine" rm -fv "$primary" "$standby" >/dev/null 2>&1 || true
+	"$engine" rm -fv "$primary" "$standby" "$replica" >/dev/null 2>&1 || true
 	"$engine" network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -71,5 +72,27 @@ until [ "$("$engine" exec "$standby" psql -U postgres -h 127.0.0.1 -Atc 'select 
 done
 echo "== $standby is streaming from $primary (postgres:$major)" >&2
 
-STACK_DEV_ARGS="--network $net -e LEPIS_PHYS_PRIMARY=$primary:5432 -e LEPIS_PHYS_STANDBY=$standby:5432" \
+# The standby's REPLICA (L16): a cascading standby of the standby, which follows it onto its new
+# timeline when the split promotes it, so it is a replica of node 2 by the time the test fails
+# node 2 over to it. The standby needs the same replication line its primary has.
+"$engine" exec "$standby" bash -c 'echo "host replication postgres all scram-sha-256" >> /var/lib/postgresql/standby/pg_hba.conf'
+"$engine" exec "$standby" psql -U postgres -h 127.0.0.1 -Atc 'select pg_reload_conf()' >/dev/null
+rdata=/var/lib/postgresql/replica
+"$engine" run -d --name "$replica" --network "$net" -e PGPASSWORD=x --entrypoint bash \
+	"docker.io/library/postgres:$major" -c "
+	set -e
+	mkdir -p $rdata && chown postgres:postgres $rdata && chmod 700 $rdata
+	gosu postgres pg_basebackup -h $standby -U postgres -D $rdata -R -X stream -c fast
+	exec gosu postgres postgres -D $rdata ${settings[*]}" >/dev/null
+until [ "$("$engine" exec "$replica" psql -U postgres -h 127.0.0.1 -Atc 'select pg_is_in_recovery()' 2>/dev/null || true)" = "t" ]; do
+	if ! "$engine" ps -q -f "name=$replica" | grep -q .; then
+		"$engine" logs "$replica" >&2 || true
+		echo "the replica did not start" >&2
+		exit 1
+	fi
+	sleep 1
+done
+echo "== $replica is streaming from $standby" >&2
+
+STACK_DEV_ARGS="--network $net -e LEPIS_PHYS_PRIMARY=$primary:5432 -e LEPIS_PHYS_STANDBY=$standby:5432 -e LEPIS_PHYS_REPLICA=$replica:5432" \
 	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test physical -- --nocapture

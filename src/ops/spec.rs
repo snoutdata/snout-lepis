@@ -170,6 +170,12 @@ pub enum Op {
 		spec: NodeSpec,
 		standby_of: NodeRef,
 	},
+	/// A node's replica takes its place (L16-L17, `failover.rs`). `fenced`: the caller stopped it.
+	NodeFailover {
+		node: NodeRef,
+		spec: NodeSpec,
+		fenced: bool,
+	},
 	/// One named marker in every node's WAL with no two-phase decision in between (`restore_point.rs`).
 	RestorePoint {
 		name: Option<String>,
@@ -185,7 +191,7 @@ pub enum Op {
 }
 
 /// Every operation's name, for the API's own description of itself.
-pub const OPS: [&str; 19] = [
+pub const OPS: [&str; 20] = [
 	"node.add",
 	"node.drain",
 	"node.remove",
@@ -202,6 +208,7 @@ pub const OPS: [&str; 19] = [
 	"verify",
 	"cleanup",
 	"node.attach",
+	"node.failover",
 	"restore_point",
 	"keyspace.drop",
 	"dissolve",
@@ -310,6 +317,11 @@ impl Op {
 				spec: NodeSpec::from_json(v)?,
 				standby_of: node_ref(v, "standby_of")?,
 			},
+			"node.failover" => Op::NodeFailover {
+				node: node_ref(v, "node")?,
+				spec: NodeSpec::from_json(v)?,
+				fenced: v.get("fenced").and_then(Value::as_bool).unwrap_or(false),
+			},
 			"restore_point" => Op::RestorePoint {
 				name: opt_str(v, "name"),
 			},
@@ -344,6 +356,7 @@ impl Op {
 			Op::Verify { .. } => "verify",
 			Op::Cleanup { .. } => "cleanup",
 			Op::NodeAttach { .. } => "node.attach",
+			Op::NodeFailover { .. } => "node.failover",
 			Op::RestorePoint { .. } => "restore_point",
 			Op::KeyspaceDrop { .. } => "keyspace.drop",
 			Op::Dissolve => "dissolve",
@@ -401,6 +414,12 @@ pub enum Step {
 		spec: NodeSpec,
 		standby_of: NodeId,
 	},
+	/// A node's catalog row moved to its promoted replica (`failover.rs`).
+	NodeFailover {
+		node: NodeId,
+		spec: NodeSpec,
+		fenced: bool,
+	},
 	RestorePoint {
 		name: String,
 	},
@@ -426,6 +445,7 @@ impl Step {
 			Step::Verify { .. } => "verify",
 			Step::Cleanup { .. } => "cleanup",
 			Step::NodeAttach { .. } => "node.attach",
+			Step::NodeFailover { .. } => "node.failover",
 			Step::RestorePoint { .. } => "restore_point",
 			Step::Dissolve => "dissolve",
 		}
@@ -455,6 +475,9 @@ impl Step {
 				standby_of,
 			} => {
 				json!({"id": id.0, "spec": spec.to_json(), "standby_of": standby_of.0})
+			}
+			Step::NodeFailover { node, spec, fenced } => {
+				json!({"node": node.0, "spec": spec.to_json(), "fenced": fenced})
 			}
 			Step::RestorePoint { name } => json!({"name": name}),
 			Step::Dissolve => json!({}),
@@ -521,6 +544,11 @@ impl Step {
 				id: node("id")?,
 				spec: NodeSpec::from_json(a.get("spec").unwrap_or(&Value::Null))?,
 				standby_of: node("standby_of")?,
+			},
+			"node.failover" => Step::NodeFailover {
+				node: node("node")?,
+				spec: NodeSpec::from_json(a.get("spec").unwrap_or(&Value::Null))?,
+				fenced: a.get("fenced").and_then(Value::as_bool).unwrap_or(false),
 			},
 			"restore_point" => Step::RestorePoint {
 				name: s(a, "name")?,

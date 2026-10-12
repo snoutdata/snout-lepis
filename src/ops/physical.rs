@@ -498,6 +498,11 @@ async fn try_cutover(
 			"the standby did not finish promoting within 60 s".into(),
 		));
 	}
+	// It came with its source's settings, which may make it wait for its source's replica: this
+	// session's own writes never wait (the reset reaches the walsenders a moment later), and the
+	// wait is cleared for every other session (`failover::clear_sync_wait`).
+	dst.simple("set synchronous_commit = local").await?;
+	super::failover::clear_sync_wait(&mut dst).await?;
 	let promote_done = t0.elapsed();
 	// Jobs run on the home node (Phase 7); a copy of them here would run twice.
 	dst.simple(
@@ -606,6 +611,7 @@ async fn resume_promoting(
 	{
 		return cx.save(h, json!({"phase": "synced"})).await;
 	}
+	super::failover::clear_sync_wait(&mut dst).await?;
 	cx.save(h, json!({"phase": "fallback"})).await
 }
 
