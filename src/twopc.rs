@@ -72,6 +72,21 @@ pub const LEADER_LOCK: i64 = 0x6c65_7069_7332_7063;
 /// The leader syncs pg_cron copies every this many passes (cron.rs).
 const CRON_EVERY: u64 = 6;
 
+/// And reconciles every node's roles with home's every this many passes, whether or not home's
+/// changed: a node that drifted on its own is put back within a minute.
+const ROLES_EVERY: u64 = 12;
+
+/// One value for home's roles as a node must carry them (`roles.rs`): attributes and verifiers,
+/// memberships, role settings. Read on every pass; a change is reconciled on that pass. A role
+/// changed on home OUTSIDE the router never reaches `roles::replicate`: the host's ALTER ROLE for
+/// the owner's password (on every agent start and every reset) gave home a new verifier and left
+/// the nodes with the old one, so every session that touched a node failed its login until
+/// something reconciled (the node-failure drill, 2026-10-15).
+const ROLES_FINGERPRINT_SQL: &str = "select md5(\
+	coalesce((select string_agg(a::text, '|' order by a.oid) from pg_authid a where a.oid >= 16384), '') || '#' || \
+	coalesce((select string_agg(m.roleid::text || ',' || m.member::text || ',' || m.admin_option::text, '|' order by m.roleid, m.member) from pg_auth_members m), '') || '#' || \
+	coalesce((select string_agg(s::text, '|' order by s.setrole, s.setdatabase) from pg_db_role_setting s), ''))";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
 	Commit,
@@ -864,18 +879,35 @@ async fn lead(app: &Arc<App>, settings: &Settings) -> Result<(), String> {
 	}
 	tracing::info!("in-doubt recovery: this router leads");
 	let mut active: Option<BTreeSet<NodeId>> = None;
+	let mut roles_seen: Option<String> = None;
 	let mut passes: u64 = 0;
 	loop {
 		if let Some(catalog) = app.catalog() {
 			// A node that has just become writable (a promoted standby, a finished join) is
-			// brought in line with home's roles, as is every node when this router starts leading.
+			// brought in line with home's roles, as is every node when this router starts leading,
+			// and every node whenever home's roles changed by any path (ROLES_FINGERPRINT_SQL).
 			let now = writable_nodes(&catalog)
 				.into_iter()
 				.collect::<BTreeSet<_>>();
 			let grew = active.as_ref().is_none_or(|a| !now.is_subset(a));
-			if grew {
+			let fingerprint = log
+				.query(ROLES_FINGERPRINT_SQL, &[])
+				.await
+				.ok()
+				.and_then(|rows| rows.into_iter().next())
+				.and_then(|r| r.into_iter().next().flatten());
+			let changed = fingerprint.is_some() && fingerprint != roles_seen;
+			if grew || changed || passes.is_multiple_of(ROLES_EVERY) {
 				match crate::roles::reconcile(app, &catalog).await {
-					Ok(r) if r.iter().all(|(_, x)| x.is_ok()) => active = Some(now),
+					Ok(r) if r.iter().all(|(_, x)| x.is_ok()) => {
+						if changed && roles_seen.is_some() {
+							tracing::info!(
+								"role reconcile: home's roles changed, every node brought in line"
+							);
+						}
+						active = Some(now);
+						roles_seen = fingerprint;
+					}
 					Ok(r) => tracing::warn!("role reconcile: {r:?}"),
 					Err(e) => tracing::warn!("role reconcile: {e}"),
 				}

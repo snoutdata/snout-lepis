@@ -107,6 +107,8 @@ pub struct Router {
 	secret: ClientSecret,
 	startup: Vec<(String, String)>,
 	client_r: Reader,
+	/// The client's own connection failed or closed: nothing more can be said to it.
+	client_gone: bool,
 	out: Vec<u8>,
 	conns: HashMap<NodeId, Conn>,
 	/// The node the open transaction is on.
@@ -215,6 +217,7 @@ impl Router {
 			secret,
 			startup,
 			client_r: FrameReader::new(client),
+			client_gone: false,
 			out: Vec::new(),
 			conns,
 			pinned: None,
@@ -267,7 +270,26 @@ impl Router {
 	}
 
 	/// Runs until the client leaves.
+	/// Serves the client until it leaves. A session that ends for any reason but the client's own
+	/// (a node's connection broke or could not be opened) tells the client so before it closes, as
+	/// a FATAL `08006` naming the node and what was lost, the way Postgres says FATAL before it
+	/// drops a session, instead of closing the socket without a word (which a driver reports as
+	/// "connection terminated unexpectedly"; found by the node-failure drill, 2026-10-15).
 	pub async fn run(mut self) -> Result<(), WireError> {
+		let result = self.relay().await;
+		if let Err(e) = &result
+			&& !self.client_gone
+		{
+			let fatal = node_lost_message(e);
+			let _ = self.flush_client().await;
+			let client = self.client_r.get_mut();
+			let _ = client.write_all(&fatal.encode()).await;
+			let _ = client.flush().await;
+		}
+		result
+	}
+
+	async fn relay(&mut self) -> Result<(), WireError> {
 		self.refresh_settings().await;
 		loop {
 			// One write per answer, not per message: the client is sent what is waiting when
@@ -291,20 +313,27 @@ impl Router {
 			let parked_until = self.parked_until;
 			let Router {
 				client_r, conns, ..
-			} = &mut self;
+			} = self;
 			let node_reader = listen_node
 				.and_then(|n| conns.get_mut(&n))
 				.map(|c| &mut c.reader);
 			let event = match (node_reader, parked_until) {
 				(Some(r), _) => tokio::select! {
-					m = client_r.next() => Event::Client(m?),
+					m = client_r.next() => Event::client(m),
 					m = r.next() => Event::Node(listen_node.expect("set"), m?),
 				},
 				(None, Some(until)) => tokio::select! {
-					m = client_r.next() => Event::Client(m?),
+					m = client_r.next() => Event::client(m),
 					() = tokio::time::sleep_until(until) => Event::Idle,
 				},
-				(None, None) => Event::Client(client_r.next().await?),
+				(None, None) => Event::client(client_r.next().await),
+			};
+			let event = match event {
+				Event::ClientGone(e) => {
+					self.client_gone = true;
+					return Err(e);
+				}
+				event => event,
 			};
 			match event {
 				Event::Client(m) => {
@@ -312,7 +341,11 @@ impl Router {
 						return Ok(());
 					}
 					// The rest of what the client has already sent (a batch arrives in one read).
-					while let Some(m) = self.client_r.take()? {
+					while let Some(m) = self
+						.client_r
+						.take()
+						.inspect_err(|_| self.client_gone = true)?
+					{
 						if !self.on_client(m).await? {
 							return Ok(());
 						}
@@ -335,6 +368,7 @@ impl Router {
 					self.dispatch().await?;
 				}
 				Event::Idle => self.publish(),
+				Event::ClientGone(e) => return Err(e),
 			}
 		}
 	}
@@ -388,6 +422,8 @@ impl Router {
 			b'F' => self.queued.push_back(vec![m]),
 			b'd' | b'c' | b'f' => {} // COPY messages with no COPY running: ignored, as Postgres does
 			other => {
+				// The client's own fault: not reported to it as a node lost.
+				self.client_gone = true;
 				return Err(WireError::Protocol(format!(
 					"unexpected message '{}'",
 					char::from(other)
@@ -5476,9 +5512,34 @@ struct Fanout {
 
 enum Event {
 	Client(Message),
+	/// Reading from the client failed: it is gone, and nothing more is said to it.
+	ClientGone(WireError),
 	Node(NodeId, Message),
 	/// The client stayed idle past `PARK`: its node sessions go to the pool.
 	Idle,
+}
+
+impl Event {
+	fn client(m: Result<Message, WireError>) -> Event {
+		match m {
+			Ok(m) => Event::Client(m),
+			Err(e) => Event::ClientGone(e),
+		}
+	}
+}
+
+/// What a client is told when its session ends because a node's connection broke or could not be
+/// opened: FATAL 08006 (connection_failure, which drivers and poolers treat as "reconnect and
+/// retry"), the cause, and what it means for the work in flight.
+fn node_lost_message(e: &WireError) -> Message {
+	ErrorFields::fatal(
+		"08006",
+		format!("the cluster lost this session's connection to one of its nodes: {e}"),
+	)
+	.with_hint(
+		"Connect again and retry. A transaction open on this connection did not commit, unless its COMMIT had already been sent: that one may have committed.",
+	)
+	.message()
 }
 
 enum Plan {
@@ -5629,6 +5690,24 @@ fn portal_ref(m: &Message) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_lost_node_is_a_fatal_08006_that_says_what_happened() {
+		let m = node_lost_message(&WireError::Protocol("node 2: early eof".into()));
+		let fields = wire::parse_error_fields(&m.body);
+		let get = |k: u8| {
+			fields
+				.iter()
+				.find(|(x, _)| *x == k)
+				.map(|(_, v)| v.clone())
+				.unwrap_or_default()
+		};
+		assert_eq!(m.tag, b'E');
+		assert_eq!(get(b'S'), "FATAL");
+		assert_eq!(get(b'C'), "08006");
+		assert!(get(b'M').contains("node 2: early eof"));
+		assert!(get(b'H').contains("may have committed"));
+	}
 
 	/// The router's own cost per transaction, without a network: a client and a node made of
 	/// in-memory pipes, the node answering a Bind/Execute/Sync at once, as pgbench -S -M prepared
