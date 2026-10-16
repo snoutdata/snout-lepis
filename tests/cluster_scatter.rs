@@ -132,7 +132,7 @@ async fn parameters_reach_every_node_and_the_merge() {
 			true,
 		),
 		(
-			"select status, count(*) from oracle.orders where total_cents < $1 group by status having count(*) > $2 order by 2 desc",
+			"select status, count(*) from oracle.orders where total_cents < $1 group by status having count(*) > $2 order by 2 desc, 1",
 			vec![Box::new(30_000i64), Box::new(100i64)],
 			true,
 		),

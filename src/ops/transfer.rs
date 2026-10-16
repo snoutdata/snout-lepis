@@ -322,17 +322,21 @@ async fn sync(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpEr
 	}
 	let started = Instant::now();
 	let mut last_save = Instant::now() - Duration::from_secs(60);
+	// Since when a table has been left unsynced with no worker copying it (`COPY_STALL`).
+	let mut stalled_since: Option<Instant> = None;
 	loop {
 		if cx.cancelling(h).await? {
 			return rollback(cx, h, t).await;
 		}
 		let mut pending = Vec::new();
 		let mut lag = serde_json::Map::new();
+		let mut stalled = false;
 		for (n, pg) in targets.iter_mut() {
 			let name = names(cx, *n);
 			let r = pg
 				.query(
-					"select count(*) filter (where r.srsubstate <> 'r'), count(*) \
+					"select count(*) filter (where r.srsubstate <> 'r'), count(*), \
+					(select count(*) from pg_stat_subscription w where w.subname = $1 and w.relid is not null) \
 					from pg_subscription s left join pg_subscription_rel r on r.srsubid = s.oid \
 					where s.subname = $1",
 					&[&name],
@@ -341,8 +345,12 @@ async fn sync(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpEr
 			let row = r.first().cloned().unwrap_or_default();
 			let not_ready = row.first().cloned().flatten().unwrap_or_default();
 			let total = row.get(1).cloned().flatten().unwrap_or_default();
+			let copying = row.get(2).cloned().flatten().unwrap_or_default();
 			if not_ready != "0" || total == "0" {
 				pending.push(n.0);
+			}
+			if not_ready != "0" && copying == "0" {
+				stalled = true;
 			}
 			let bytes = src
 				.value(
@@ -360,6 +368,24 @@ async fn sync(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpEr
 			)
 			.await?;
 			last_save = Instant::now();
+		}
+		// A table whose initial copy lost its source part way (the source killed mid-copy) can be
+		// left `f`, copied and never caught up, with no worker to finish it: Postgres does not start
+		// another. Waiting on it waited forever (a drain whose node was killed two seconds in, the
+		// node-failure drill, 2026-10-15). Past COPY_STALL the move starts again from nothing.
+		stalled_since = if stalled {
+			stalled_since.or(Some(Instant::now()))
+		} else {
+			None
+		};
+		if stalled_since.is_some_and(|at| at.elapsed() > COPY_STALL) {
+			return restart(
+				cx,
+				h,
+				t,
+				"a table's initial copy stopped with nothing left copying it",
+			)
+			.await;
 		}
 		if pending.is_empty() {
 			let rtt = mark_round_trip(cx, &mut src, &mut targets, Duration::from_secs(10)).await?;
@@ -925,9 +951,41 @@ async fn cleanup_source(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Resul
 		.await
 }
 
+/// How long a table may sit unsynced with no worker copying it before the move starts over.
+const COPY_STALL: Duration = Duration::from_secs(60);
+
+/// How many times a move starts over on its own before it fails for a person to look at.
+const RESTARTS: u64 = 3;
+
+/// Before the cutover only: undo what `prepare` made, as a cancel does, and go back to `new`, so
+/// the next pass prepares the move again from nothing. Counted, and refused past `RESTARTS`.
+async fn restart(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec, why: &str) -> Result<(), OpError> {
+	let done = cx.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+	if done >= RESTARTS {
+		return Err(OpError::new(format!(
+			"{why}, and the move has started over {done} times already"
+		)));
+	}
+	tracing::warn!(job = cx.job, step = cx.n, "the move starts over: {why}");
+	undo(cx, h, t).await?;
+	cx.save(
+		h,
+		json!({"phase": "new", "restarts": done + 1, "restarted_because": why}),
+	)
+	.await
+}
+
 /// Cancel before the cutover: everything made is dropped, the targets' copies deleted and their
 /// fences put back.
 async fn rollback(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpError> {
+	undo(cx, h, t).await?;
+	cx.save(h, json!({"phase": "rolled_back"})).await?;
+	Err(cancelled())
+}
+
+/// What `rollback` and `restart` share: subscriptions, slots and publications dropped, the
+/// targets' copies of the slice deleted and their fences put back.
+async fn undo(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpError> {
 	teardown(cx, h, t, "rolling_back").await?;
 	let c = load_catalog(h).await?;
 	for &n in &t.targets {
@@ -945,6 +1003,5 @@ async fn rollback(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), 
 		}
 		delete_ordered(&mut pg, items).await?;
 	}
-	cx.save(h, json!({"phase": "rolled_back"})).await?;
-	Err(cancelled())
+	Ok(())
 }

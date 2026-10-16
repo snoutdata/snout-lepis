@@ -4167,15 +4167,16 @@ impl Router {
 			Some(b) => (b.param_formats.clone(), b.values.clone()),
 			None => (Vec::new(), Vec::new()),
 		};
-		let open = [
-			parse_message(&p.worker_sql, &d.params),
-			bind_portal(PORTAL, &pformats, &values, &p.formats),
-			Body::new().byte(b'P').cstr(PORTAL).message(b'D'),
-			Body::new().cstr(PORTAL).i32(WINDOW).message(b'E'),
-			Message::new(b'H', vec![]),
-		];
 		self.spread_cancel(nodes);
 		for n in nodes {
+			// Each node reads only the rows it owns (scatter::Planned::worker_sql_for).
+			let open = [
+				parse_message(&p.worker_sql_for(&self.catalog, *n), &d.params),
+				bind_portal(PORTAL, &pformats, &values, &p.formats),
+				Body::new().byte(b'P').cstr(PORTAL).message(b'D'),
+				Body::new().cstr(PORTAL).i32(WINDOW).message(b'E'),
+				Message::new(b'H', vec![]),
+			];
 			self.send(*n, &open).await?;
 			self.conns
 				.get_mut(n)

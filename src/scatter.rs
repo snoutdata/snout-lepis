@@ -90,6 +90,75 @@ pub struct Planned {
 	pub needs_types: bool,
 	/// The worker's SELECT (without the EXPLAIN around it), for EXPLAIN's routing line.
 	pub worker_select: String,
+	/// The worker as a tree, and the sharded tables in its top-level FROM (the name a column is
+	/// qualified with there, the key column, the keyspace), for `worker_sql_for`.
+	pub worker_tree: Option<(SelectStmt, i32)>,
+	pub owned: Vec<(String, String, String)>,
+}
+
+impl Planned {
+	/// The worker as `node` runs it: reading only the rows of each sharded table that `node` owns
+	/// under `c`. A node holds rows it does not own while a range moves (the target's copy before
+	/// the cutover, the source's until cleanup) and a node joined by restore holds its source's
+	/// until it deletes them; a scatter read counted those twice (22,400 of 20,000 rows through
+	/// the router, the node-failure drill, 2026-10-15, a drain whose source was killed mid-copy).
+	/// The filter is the fence's own expression (L5, L7). Only the top-level FROM is filtered: a
+	/// subquery in FROM reads what its node holds. Falls back to the plain worker should the tree
+	/// not come back as SQL.
+	pub fn worker_sql_for(&self, c: &Catalog, on: crate::catalog::NodeId) -> String {
+		let Some((tree, version)) = &self.worker_tree else {
+			return self.worker_sql.clone();
+		};
+		if self.owned.is_empty() {
+			return self.worker_sql.clone();
+		}
+		let server = c
+			.nodes
+			.get(&on)
+			.and_then(|n| n.server_version_num)
+			.unwrap_or(170000);
+		let mut terms = Vec::new();
+		for (refname, key, keyspace) in &self.owned {
+			let Some(ks) = c.keyspaces.get(keyspace) else {
+				return self.worker_sql.clone();
+			};
+			let column = format!(
+				"{}.{}",
+				crate::catalog::quote_ident(refname),
+				crate::catalog::quote_ident(key)
+			);
+			match crate::catalog::owns_check(&column, ks, on, server) {
+				Ok(t) => terms.push(format!("({t})")),
+				Err(_) => return self.worker_sql.clone(),
+			}
+		}
+		let Ok(parsed) = pg_query::parse(&format!("select 1 where {}", terms.join(" and "))) else {
+			return self.worker_sql.clone();
+		};
+		let filter = parsed.protobuf.stmts.first().and_then(|r| {
+			match r.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+				Some(NodeEnum::SelectStmt(sel)) => sel.where_clause.clone(),
+				_ => None,
+			}
+		});
+		let Some(filter) = filter else {
+			return self.worker_sql.clone();
+		};
+		let mut w = tree.clone();
+		w.where_clause = Some(match w.where_clause.take() {
+			None => filter,
+			Some(existing) => Box::new(node(NodeEnum::BoolExpr(Box::new(
+				pg_query::protobuf::BoolExpr {
+					xpr: None,
+					boolop: BoolExprType::AndExpr as i32,
+					args: vec![*existing, *filter],
+					location: -1,
+				},
+			)))),
+		});
+		deparse_stmt(NodeEnum::SelectStmt(Box::new(w)), *version)
+			.unwrap_or_else(|_| self.worker_sql.clone())
+	}
 }
 
 fn no(message: impl Into<String>, hint: impl Into<String>) -> Refusal {
@@ -276,7 +345,9 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 	merge.collation_of = b.collation_of.clone();
 	let changed = b.changed;
 	let formats = b.formats.clone();
+	let owned = b.owned_in_from();
 	let worker = b.into_worker();
+	let worker_tree = worker.clone();
 	let worker_select = deparse_stmt(NodeEnum::SelectStmt(Box::new(worker.clone())), version)?;
 	let worker_sql = match explain {
 		None if !changed => sql.trim().trim_end_matches(';').to_string(),
@@ -291,11 +362,14 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 			version,
 		)?,
 	};
+	let is_explain = explain_is(raw);
 	Ok(Planned {
+		worker_tree: (!is_explain).then(|| (worker_tree, version)),
+		owned,
 		worker_sql,
 		formats,
 		merge,
-		explain: explain_is(raw),
+		explain: is_explain,
 		summary,
 		needs_types,
 		worker_select,
@@ -968,6 +1042,49 @@ impl<'a> Builder<'a> {
 			schema: self.ctx.search_path.first().cloned().unwrap_or_default(),
 			table: table.into(),
 		}
+	}
+
+	/// The sharded tables of the top-level FROM (through joins, not into subqueries): the name a
+	/// column is qualified with there, the key column, the keyspace.
+	fn owned_in_from(&self) -> Vec<(String, String, String)> {
+		fn from<'n>(n: &'n Node, out: &mut Vec<&'n pg_query::protobuf::RangeVar>) {
+			match &n.node {
+				Some(NodeEnum::RangeVar(rv)) => out.push(rv),
+				Some(NodeEnum::JoinExpr(j)) => {
+					for s in [&j.larg, &j.rarg].into_iter().flatten() {
+						from(s, out);
+					}
+				}
+				_ => {}
+			}
+		}
+		let mut rvs = Vec::new();
+		for f in &self.top.from_clause {
+			from(f, &mut rvs);
+		}
+		rvs.into_iter()
+			.filter_map(|rv| {
+				match self
+					.ctx
+					.catalog
+					.relations
+					.get(&self.resolve(&rv.schemaname, &rv.relname))
+				{
+					Some(RelationKind::Sharded {
+						keyspace,
+						key_column,
+					}) => Some((
+						rv.alias
+							.as_ref()
+							.map(|a| a.aliasname.clone())
+							.unwrap_or_else(|| rv.relname.clone()),
+						key_column.clone(),
+						keyspace.clone(),
+					)),
+					_ => None,
+				}
+			})
+			.collect()
 	}
 
 	fn sharded_key(&self, schema: &str, table: &str) -> Option<String> {
@@ -1749,6 +1866,38 @@ mod tests {
 	use crate::catalog::{Keyspace, Node as CatalogNode, NodeId, NodeState, Strategy};
 	use crate::config::SslMode;
 	use crate::hash::KeyType;
+
+	#[test]
+	fn each_node_reads_only_the_rows_it_owns() {
+		let c = cat();
+		let p = planned(
+			"select count(*) from orders o join countries using (code) where o.total > 5",
+			&["count"],
+			&[20],
+		)
+		.unwrap();
+		assert_eq!(
+			p.owned,
+			vec![(
+				"o".to_string(),
+				"tenant_id".to_string(),
+				"tenant".to_string()
+			)]
+		);
+		let n2 = p.worker_sql_for(&c, NodeId(2));
+		assert!(n2.contains("hashint8extended(o.tenant_id, 1)"), "{n2}");
+		assert!(n2.contains("o.total > 5"), "{n2}");
+		assert_ne!(
+			n2,
+			p.worker_sql_for(&c, NodeId(3)),
+			"each node gets its own ranges"
+		);
+		// No sharded table in FROM (a reference table alone): the worker as it is.
+		let r = planned("select code from countries order by code", &["code"], &[25]);
+		if let Ok(r) = r {
+			assert_eq!(r.worker_sql_for(&c, NodeId(2)), r.worker_sql);
+		}
+	}
 
 	fn cat() -> Catalog {
 		let ids: Vec<NodeId> = (1..=3).map(NodeId).collect();
