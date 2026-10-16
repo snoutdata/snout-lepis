@@ -435,6 +435,7 @@ impl Router {
 	}
 
 	async fn on_node(&mut self, n: NodeId, m: Message) -> Result<(), WireError> {
+		let m = fence_refusal_as_retry(m);
 		let Some(front) = self.inflight.front_mut() else {
 			// Asynchronous messages while idle: notifications, notices, parameter changes.
 			if matches!(m.tag, b'A' | b'N' | b'S') {
@@ -5528,6 +5529,35 @@ impl Event {
 	}
 }
 
+/// A write a node refused with its fence (`lepis_owns`, L7, a CHECK violation 23514) is a write
+/// sent to the node that USED to own its row: the range moved while the transaction ran. That is
+/// the cutover's in-flight case, which L10 answers with 40001 so a client retries, and it must
+/// read as one: a 23514 is a data error every driver and ORM gives up on (found by the node-failure
+/// drill during a live move, 2026-10-15). Anything else passes as it is.
+fn fence_refusal_as_retry(m: Message) -> Message {
+	if m.tag != b'E' {
+		return m;
+	}
+	let fields = wire::parse_error_fields(&m.body);
+	let get = |k: u8| {
+		fields
+			.iter()
+			.find(|(x, _)| *x == k)
+			.map(|(_, v)| v.as_str())
+	};
+	if get(b'C') != Some("23514") || get(b'n') != Some("lepis_owns") {
+		return m;
+	}
+	let mut e = ErrorFields::error(
+		"40001",
+		"the row's range moved to another node while this transaction ran; retry the transaction",
+	);
+	if let Some(original) = get(b'M') {
+		e = e.with_detail(format!("the node that used to own it said: {original}"));
+	}
+	e.message()
+}
+
 /// What a client is told when its session ends because a node's connection broke or could not be
 /// opened: FATAL 08006 (connection_failure, which drivers and poolers treat as "reconnect and
 /// retry"), the cause, and what it means for the work in flight.
@@ -5690,6 +5720,46 @@ fn portal_ref(m: &Message) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_write_refused_by_the_old_owners_fence_is_a_retry() {
+		let fence = wire::Body::new()
+			.byte(b'S')
+			.cstr("ERROR")
+			.byte(b'C')
+			.cstr("23514")
+			.byte(b'M')
+			.cstr("new row for relation \"ledger\" violates check constraint \"lepis_owns\"")
+			.byte(b'n')
+			.cstr("lepis_owns")
+			.byte(0)
+			.message(b'E');
+		let m = fence_refusal_as_retry(fence);
+		let f = wire::parse_error_fields(&m.body);
+		let get = |k: u8| {
+			f.iter()
+				.find(|(x, _)| *x == k)
+				.map(|(_, v)| v.clone())
+				.unwrap_or_default()
+		};
+		assert_eq!(get(b'C'), "40001");
+		assert!(get(b'D').contains("lepis_owns"));
+		// Another CHECK is the user's own, and stays as it is.
+		let other = wire::Body::new()
+			.byte(b'C')
+			.cstr("23514")
+			.byte(b'n')
+			.cstr("price_positive")
+			.byte(0)
+			.message(b'E');
+		assert_eq!(
+			wire::parse_error_fields(&fence_refusal_as_retry(other).body)
+				.iter()
+				.find(|(k, _)| *k == b'C')
+				.map(|(_, v)| v.as_str()),
+			Some("23514")
+		);
+	}
 
 	#[test]
 	fn a_lost_node_is_a_fatal_08006_that_says_what_happened() {

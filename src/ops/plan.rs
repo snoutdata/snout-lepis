@@ -51,6 +51,36 @@ fn destinations(c: &Catalog) -> Vec<NodeId> {
 		.collect()
 }
 
+/// Who owned the hash `at` in `ranges` (the layout before a plan).
+fn owner_before(ranges: &[Range], at: i64) -> Option<NodeId> {
+	ranges
+		.iter()
+		.find(|r| r.lo <= at && at <= r.hi)
+		.map(|r| r.node)
+}
+
+/// Each joining node attached as a physical standby, and the node it is a standby of (its
+/// `standby_of` label, which the catalog does not carry), for `rebalance_from`.
+async fn joining_sources(app: &Arc<App>, c: &Catalog) -> Result<BTreeMap<NodeId, NodeId>, OpError> {
+	let joining: Vec<NodeId> = c
+		.nodes
+		.values()
+		.filter(|n| n.state == NodeState::Joining)
+		.map(|n| n.id)
+		.collect();
+	let mut out = BTreeMap::new();
+	if joining.is_empty() {
+		return Ok(out);
+	}
+	let mut h = Pg::connect(app, &Target::home(app)).await?;
+	for n in joining {
+		if let Some(of) = super::physical::standby_of(&mut h, n).await? {
+			out.insert(n, of);
+		}
+	}
+	Ok(out)
+}
+
 fn ks<'a>(c: &'a Catalog, name: &str) -> Result<&'a Keyspace, OpError> {
 	c.keyspaces.get(name).ok_or_else(|| {
 		OpError::refused(Kind::NoSuchKeyspace, format!("there is no keyspace {name}"))
@@ -61,11 +91,30 @@ fn ks<'a>(c: &'a Catalog, name: &str) -> Result<&'a Keyspace, OpError> {
 /// when none fits. Ranges on nodes that are not members (being drained) all move. Returns the
 /// splits, in order, as (lo, at), and the final layout.
 pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Range>) {
+	rebalance_from(ks, members, &BTreeMap::new())
+}
+
+/// `rebalance`, with `only_from`: a joining node attached as a physical standby (L8, the Cloud's
+/// node add) can take ranges only from the node it is a standby of, until a move from that node
+/// promotes it (`physical::select` refuses anything else). A plan that gave it a range from any
+/// other node failed at that transfer every time it ran: adding a node to a cluster of three, the
+/// rebalance moved node 3's share onto the new standby of node 1 (the node-failure drill,
+/// 2026-10-15). Such a node is given its share from its source alone, and never gives one away in
+/// the same plan; a later rebalance evens out the rest once it is active.
+pub fn rebalance_from(
+	ks: &Keyspace,
+	members: &[NodeId],
+	only_from: &BTreeMap<NodeId, NodeId>,
+) -> (Vec<(i64, i64)>, Vec<Range>) {
 	let mut ranges = ks.ranges.clone();
 	let mut splits = Vec::new();
 	if members.is_empty() {
 		return (splits, ranges);
 	}
+	// Whether `b` may take a range from `a` in this plan.
+	let may = |b: NodeId, a: NodeId| {
+		only_from.get(&b).is_none_or(|of| *of == a) && !only_from.contains_key(&a)
+	};
 	let total: u128 = ranges.iter().map(width).sum();
 	let fair = total / members.len() as u128;
 	let tolerance = (fair / 20).max(1);
@@ -78,11 +127,14 @@ pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Ran
 				None => outsider = Some(r.node),
 			}
 		}
-		let (&b, &lb) = load
-			.iter()
-			.min_by_key(|(n, l)| (**l, **n))
-			.expect("members");
 		if let Some(a) = outsider {
+			let Some((&b, _)) = load
+				.iter()
+				.filter(|(n, _)| may(**n, a))
+				.min_by_key(|(n, l)| (**l, **n))
+			else {
+				break;
+			};
 			let i = ranges
 				.iter()
 				.position(|r| r.node == a)
@@ -90,34 +142,54 @@ pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Ran
 			ranges[i].node = b;
 			continue;
 		}
-		let (&a, &la) = load
-			.iter()
-			.max_by_key(|(n, l)| (**l, std::cmp::Reverse(**n)))
-			.expect("members");
-		let diff = la - lb;
-		if diff <= tolerance {
-			break;
+		// The least-loaded node that can take a range, and the most-loaded node it may take one
+		// from, the pair with something worth moving between them and a range that may move.
+		let mut by_load: Vec<(NodeId, u128)> = load.iter().map(|(n, l)| (*n, *l)).collect();
+		by_load.sort_by_key(|(n, l)| (*l, *n));
+		// A range may go to a joining standby only if its source held it before this plan.
+		let movable = |r: &Range, a: NodeId, b: NodeId| {
+			r.node == a
+				&& (!only_from.contains_key(&b) || owner_before(&ks.ranges, r.lo) == Some(a))
+		};
+		let mut chosen = None;
+		for &(b, lb) in &by_load {
+			let Some((a, la)) = load
+				.iter()
+				.filter(|(n, _)| **n != b && may(b, **n))
+				.max_by_key(|(n, l)| (**l, std::cmp::Reverse(**n)))
+				.map(|(n, l)| (*n, *l))
+			else {
+				continue;
+			};
+			if la <= lb || la - lb <= tolerance {
+				continue;
+			}
+			let diff = la - lb;
+			let want = diff / 2;
+			// The range on `a` whose width is nearest `want` without reaching `diff`.
+			let pick = ranges
+				.iter()
+				.enumerate()
+				.filter(|(_, r)| movable(r, a, b) && width(r) < diff)
+				.min_by_key(|(_, r)| width(r).abs_diff(want))
+				.map(|(i, _)| i);
+			let split = ranges
+				.iter()
+				.enumerate()
+				.filter(|(_, r)| movable(r, a, b) && width(r) > want)
+				.min_by_key(|(_, r)| width(r))
+				.map(|(i, _)| i);
+			if pick.is_some() || split.is_some() {
+				chosen = Some((b, want, pick, split));
+				break;
+			}
 		}
-		let want = diff / 2;
-		// The range on `a` whose width is nearest `want` without reaching `diff`.
-		let pick = ranges
-			.iter()
-			.enumerate()
-			.filter(|(_, r)| r.node == a && width(r) < diff)
-			.min_by_key(|(_, r)| width(r).abs_diff(want))
-			.map(|(i, _)| i);
-		match pick {
-			Some(i) => ranges[i].node = b,
-			None => {
-				let Some(i) = ranges
-					.iter()
-					.enumerate()
-					.filter(|(_, r)| r.node == a && width(r) > want)
-					.min_by_key(|(_, r)| width(r))
-					.map(|(i, _)| i)
-				else {
-					break;
-				};
+		let Some((b, want, pick, split)) = chosen else {
+			break;
+		};
+		match (pick, split) {
+			(Some(i), _) => ranges[i].node = b,
+			(None, Some(i)) => {
 				let r = ranges[i];
 				let at = (r.lo as i128 + want as i128) as i64;
 				splits.push((r.lo, at));
@@ -132,6 +204,7 @@ pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Ran
 					},
 				);
 			}
+			(None, None) => break,
 		}
 	}
 	(splits, ranges)
@@ -556,6 +629,7 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 		}
 		Op::Rebalance { keyspace } => {
 			let members = destinations(c);
+			let only_from = joining_sources(app, c).await?;
 			let mut names: Vec<&String> = c.keyspaces.keys().collect();
 			names.sort();
 			let mut steps = Vec::new();
@@ -563,7 +637,7 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				if keyspace.as_ref().is_some_and(|k| k != name) {
 					continue;
 				}
-				let (splits, ranges) = rebalance(&c.keyspaces[name], &members);
+				let (splits, ranges) = rebalance_from(&c.keyspaces[name], &members, &only_from);
 				steps.extend(moves_to(c, name, &splits, &ranges)?);
 			}
 			steps
@@ -1156,6 +1230,45 @@ mod tests {
 		);
 		c.nodes.get_mut(&NodeId(2)).unwrap().state = NodeState::Draining;
 		assert!(!destinations(&c).contains(&NodeId(2)));
+	}
+
+	#[test]
+	fn a_joining_standby_takes_its_share_from_its_source_alone() {
+		// Three active nodes own the space evenly; node 4 joins as a standby of node 1.
+		let c = cat(3, 6);
+		let k = c.keyspaces["k"].clone();
+		let members = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+		let only_from: BTreeMap<NodeId, NodeId> = [(NodeId(4), NodeId(1))].into_iter().collect();
+		let (_, out) = rebalance_from(&k, &members, &only_from);
+		let before: BTreeMap<(i64, i64), NodeId> =
+			k.ranges.iter().map(|r| ((r.lo, r.hi), r.node)).collect();
+		let moved_to_4: Vec<&Range> = out.iter().filter(|r| r.node == NodeId(4)).collect();
+		assert!(!moved_to_4.is_empty(), "node 4 was given nothing");
+		for r in &moved_to_4 {
+			// Every range node 4 takes was node 1's, possibly split from one.
+			let owner = k
+				.ranges
+				.iter()
+				.find(|o| o.lo <= r.lo && r.hi <= o.hi)
+				.map(|o| o.node);
+			assert_eq!(owner, Some(NodeId(1)), "{r:?} came from {owner:?}");
+		}
+		// And nothing left node 4 in the same plan, nor did 2 and 3 give anything to it.
+		assert!(before.values().all(|n| *n != NodeId(4)));
+		let mut cat2 = c.clone();
+		let mut k2 = k.clone();
+		k2.ranges = out;
+		cat2.keyspaces.insert("k".into(), k2);
+		cat2.nodes.insert(
+			NodeId(4),
+			crate::catalog::Node {
+				id: NodeId(4),
+				name: "n4".into(),
+				state: NodeState::Joining,
+				..c.nodes[&NodeId(2)].clone()
+			},
+		);
+		cat2.validate().unwrap();
 	}
 
 	#[test]

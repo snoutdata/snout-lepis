@@ -4,7 +4,7 @@
 //! A table is distributed from the home node, then a range is split (half moving), a range moves,
 //! two ranges merge, a tenant is pinned to its own node, a node is drained and removed, the
 //! cluster scales back out (node add, then a rebalance), and a move is cancelled; then verify. Eight writers insert and update
-//! through the router the whole time, retrying what the cutovers refuse (`23514` from a fence,
+//! through the router the whole time, retrying what the cutovers refuse (`40001` from a fence, which the node says as `23514`,
 //! the `57014` of a drain abort, a broken session). The write latency each one saw, retries
 //! included, is the pause the application felt; the jobs record the pause they measured.
 //!
