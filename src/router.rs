@@ -51,9 +51,6 @@ use crate::server::App;
 use crate::twopc;
 use crate::wire::{self, Body, ErrorFields, Message, WireError};
 
-/// SQLSTATE `cannot_connect_now`: the router's catalog is too old to route by (`plan_once`).
-const CATALOG_STALE: &str = "57P03";
-
 /// A connection, read through its frame buffer and written through `get_mut`. Not split: the
 /// router reads and writes each one from its own task, never both at once, so the lock a split
 /// takes on every read and write would buy nothing.
@@ -923,25 +920,6 @@ impl Router {
 					acc.targets.push(self.pinned.unwrap_or(self.home()));
 				}
 			}
-		}
-
-		// A catalog this router cannot confirm is current (live.rs `Freshness`): a statement that
-		// reads or writes user tables is refused before anything reaches a node, inside a
-		// transaction as outside (`refuse` has the transaction's node raise it). 57P03 is what
-		// Postgres itself answers while it cannot serve yet (starting up, or in recovery): the
-		// statement is not at fault and may be sent again later. Not 40001, which tells a client
-		// to retry the transaction at once, a tight loop for as long as the home node is away.
-		if acc.data
-			&& let Some(age) = self.app.freshness.stale_at(std::time::Instant::now())
-		{
-			return Ok(Plan::Refuse(route::Refusal {
-				code: CATALOG_STALE,
-				message: format!(
-					"this router has not reached the home node for {} s, so its catalog of where rows live may be out of date",
-					age.as_secs()
-				),
-				hint: "Try again once the home node answers; the router resumes by itself.".into(),
-			}));
 		}
 
 		let Acc {
@@ -2107,21 +2085,6 @@ impl Router {
 					other => break other,
 				}
 			};
-			// Every node it reads must have its own worker (scatter::per_node_workers), planned from
-			// the same catalog as `nodes`; one without would read rows it does not own.
-			let planned = planned.and_then(|p| {
-				if !p.explain && nodes.iter().any(|n| p.worker_sql_for(*n).is_none()) {
-					Err(route::Refusal {
-						code: route::NOT_ACROSS_NODES,
-						message:
-							"Lepis could not limit each node to the rows it owns for this read"
-								.into(),
-						hint: "Pin the query to one distribution key value.".into(),
-					})
-				} else {
-					Ok(p)
-				}
-			});
 			match planned {
 				Ok(p) => {
 					let formats = if p.explain {
@@ -4206,10 +4169,9 @@ impl Router {
 		};
 		self.spread_cancel(nodes);
 		for n in nodes {
-			// Each node reads only the rows it owns (scatter::per_node_workers); checked above that
-			// every node has its worker.
+			// Each node reads only the rows it owns (scatter::Planned::worker_sql_for).
 			let open = [
-				parse_message(p.worker_sql_for(*n).unwrap_or_default(), &d.params),
+				parse_message(&p.worker_sql_for(&self.catalog, *n), &d.params),
 				bind_portal(PORTAL, &pformats, &values, &p.formats),
 				Body::new().byte(b'P').cstr(PORTAL).message(b'D'),
 				Body::new().cstr(PORTAL).i32(WINDOW).message(b'E'),

@@ -26,8 +26,6 @@ pub struct App {
 	pub clients: Arc<Semaphore>,
 	/// The current catalog snapshot; None when the cluster has no `lepis` schema (live.rs).
 	catalog: RwLock<Option<Arc<Catalog>>>,
-	/// When the home node last answered, and whether the catalog may still be routed by.
-	pub freshness: live::Freshness,
 }
 
 impl App {
@@ -41,7 +39,6 @@ impl App {
 			_ => (None, None),
 		};
 		let node_tls = tls::client_config(&config.home)?;
-		let freshness = live::Freshness::new(config.catalog_max_age, std::time::Instant::now());
 		Ok(Arc::new(App {
 			verifiers: VerifierSource::new(config.clone(), node_tls.clone()),
 			clients: Arc::new(Semaphore::new(config.max_clients)),
@@ -51,7 +48,6 @@ impl App {
 			node_tls,
 			cancels: cancel::Registry::default(),
 			catalog: RwLock::new(None),
-			freshness,
 		}))
 	}
 

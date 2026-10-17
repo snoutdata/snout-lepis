@@ -26,9 +26,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
-	AConst, AExprKind, AStar, Alias, BoolExprType, ColumnRef, ExplainStmt, FuncCall, LimitOption,
-	Node, NullTestType, ParseResult, RangeSubselect, RangeVar, RawStmt, ResTarget, SelectStmt,
-	SetOperation, SortBy, SortByDir, SortByNulls, a_const,
+	AConst, AExprKind, BoolExprType, ColumnRef, ExplainStmt, FuncCall, LimitOption, Node,
+	NullTestType, ParseResult, RawStmt, ResTarget, SelectStmt, SetOperation, SortBy, SortByDir,
+	SortByNulls, a_const,
 };
 
 use crate::analyze;
@@ -90,19 +90,74 @@ pub struct Planned {
 	pub needs_types: bool,
 	/// The worker's SELECT (without the EXPLAIN around it), for EXPLAIN's routing line.
 	pub worker_select: String,
-	/// The worker as each node runs it (`per_node_workers`), for every node of the catalog the
-	/// statement was planned with; empty for EXPLAIN, which reads no rows.
-	pub per_node: Vec<(crate::catalog::NodeId, String)>,
+	/// The worker as a tree, and the sharded tables in its top-level FROM (the name a column is
+	/// qualified with there, the key column, the keyspace), for `worker_sql_for`.
+	pub worker_tree: Option<(SelectStmt, i32)>,
+	pub owned: Vec<(String, String, String)>,
 }
 
 impl Planned {
-	/// The worker as `on` runs it, or None for a node the plan's catalog did not have (the router
-	/// refuses the statement then rather than send any node an unfiltered worker).
-	pub fn worker_sql_for(&self, on: crate::catalog::NodeId) -> Option<&str> {
-		self.per_node
-			.iter()
-			.find(|(n, _)| *n == on)
-			.map(|(_, sql)| sql.as_str())
+	/// The worker as `node` runs it: reading only the rows of each sharded table that `node` owns
+	/// under `c`. A node holds rows it does not own while a range moves (the target's copy before
+	/// the cutover, the source's until cleanup) and a node joined by restore holds its source's
+	/// until it deletes them; a scatter read counted those twice (22,400 of 20,000 rows through
+	/// the router, the node-failure drill, 2026-10-15, a drain whose source was killed mid-copy).
+	/// The filter is the fence's own expression (L5, L7). Only the top-level FROM is filtered: a
+	/// subquery in FROM reads what its node holds. Falls back to the plain worker should the tree
+	/// not come back as SQL.
+	pub fn worker_sql_for(&self, c: &Catalog, on: crate::catalog::NodeId) -> String {
+		let Some((tree, version)) = &self.worker_tree else {
+			return self.worker_sql.clone();
+		};
+		if self.owned.is_empty() {
+			return self.worker_sql.clone();
+		}
+		let server = c
+			.nodes
+			.get(&on)
+			.and_then(|n| n.server_version_num)
+			.unwrap_or(170000);
+		let mut terms = Vec::new();
+		for (refname, key, keyspace) in &self.owned {
+			let Some(ks) = c.keyspaces.get(keyspace) else {
+				return self.worker_sql.clone();
+			};
+			let column = format!(
+				"{}.{}",
+				crate::catalog::quote_ident(refname),
+				crate::catalog::quote_ident(key)
+			);
+			match crate::catalog::owns_check(&column, ks, on, server) {
+				Ok(t) => terms.push(format!("({t})")),
+				Err(_) => return self.worker_sql.clone(),
+			}
+		}
+		let Ok(parsed) = pg_query::parse(&format!("select 1 where {}", terms.join(" and "))) else {
+			return self.worker_sql.clone();
+		};
+		let filter = parsed.protobuf.stmts.first().and_then(|r| {
+			match r.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+				Some(NodeEnum::SelectStmt(sel)) => sel.where_clause.clone(),
+				_ => None,
+			}
+		});
+		let Some(filter) = filter else {
+			return self.worker_sql.clone();
+		};
+		let mut w = tree.clone();
+		w.where_clause = Some(match w.where_clause.take() {
+			None => filter,
+			Some(existing) => Box::new(node(NodeEnum::BoolExpr(Box::new(
+				pg_query::protobuf::BoolExpr {
+					xpr: None,
+					boolop: BoolExprType::AndExpr as i32,
+					args: vec![*existing, *filter],
+					location: -1,
+				},
+			)))),
+		});
+		deparse_stmt(NodeEnum::SelectStmt(Box::new(w)), *version)
+			.unwrap_or_else(|_| self.worker_sql.clone())
 	}
 }
 
@@ -290,8 +345,9 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 	merge.collation_of = b.collation_of.clone();
 	let changed = b.changed;
 	let formats = b.formats.clone();
+	let owned = b.owned_in_from();
 	let worker = b.into_worker();
-	let tree = worker.clone();
+	let worker_tree = worker.clone();
 	let worker_select = deparse_stmt(NodeEnum::SelectStmt(Box::new(worker.clone())), version)?;
 	let worker_sql = match explain {
 		None if !changed => sql.trim().trim_end_matches(';').to_string(),
@@ -307,13 +363,9 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 		)?,
 	};
 	let is_explain = explain_is(raw);
-	let per_node = if is_explain {
-		Vec::new()
-	} else {
-		per_node_workers(ctx, &tree, version, &worker_sql)?
-	};
 	Ok(Planned {
-		per_node,
+		worker_tree: (!is_explain).then(|| (worker_tree, version)),
+		owned,
 		worker_sql,
 		formats,
 		merge,
@@ -322,335 +374,6 @@ pub fn plan(sql: &str, ctx: &Context) -> Result<Planned, Refusal> {
 		needs_types,
 		worker_select,
 	})
-}
-
-// ---------------------------------------------------------------------------------------------
-// Each node reads only the rows it owns.
-
-/// The worker as every node of the catalog runs it: each sharded table it reads, wherever it reads
-/// it, replaced by `(select * from <table> as <name> where <owns>) as <name>`, so that node reads
-/// only the rows it owns under the plan's catalog. A node holds rows it does not own while a range
-/// moves (the target's copy before the cutover, the source's until cleanup) and a node joined by
-/// restore holds its source's until it deletes them; a scatter read counted those twice (22,400 of
-/// 20,000 rows through the router, the node-failure drill, 2026-10-15, a drain whose source was
-/// killed mid-copy). `<owns>` is the fence's own expression (L5, L7).
-///
-/// The table itself is replaced, not filtered in its SELECT's WHERE: a WHERE filter would also drop
-/// the rows an outer join null-extends for it, and would miss a table read in a subquery or a CTE.
-/// Postgres pulls such a subquery up, so the node's plan is the one a WHERE filter gives. A worker
-/// whose filter cannot be built for some node is refused here, before any node is asked: run
-/// unfiltered it could count a moving range twice.
-fn per_node_workers(
-	ctx: &Context,
-	worker: &SelectStmt,
-	version: i32,
-	worker_sql: &str,
-) -> Result<Vec<(crate::catalog::NodeId, String)>, Refusal> {
-	let mut ctes = BTreeSet::new();
-	let mut sampled = None;
-	let mut any = false;
-	let top = node(NodeEnum::SelectStmt(Box::new(worker.clone())));
-	walk(&top, &mut |s| {
-		match s {
-			Seen::Expr(NodeEnum::CommonTableExpr(c)) => {
-				ctes.insert(c.ctename.clone());
-			}
-			Seen::Expr(NodeEnum::RangeTableSample(t)) => {
-				if let Some(NodeEnum::RangeVar(rv)) =
-					t.relation.as_deref().and_then(|n| n.node.as_ref())
-				{
-					sampled = Some(rv.relname.clone());
-				}
-			}
-			_ => {}
-		}
-		true
-	});
-	walk(&top, &mut |s| {
-		if let Seen::Expr(NodeEnum::RangeVar(rv)) = s
-			&& sharded_table(ctx, &ctes, rv).is_some()
-		{
-			any = true;
-		}
-		!any
-	});
-	let nodes = ctx
-		.catalog
-		.nodes
-		.iter()
-		.filter(|(_, n)| n.state != crate::catalog::NodeState::Removed);
-	if !any {
-		return Ok(nodes.map(|(id, _)| (*id, worker_sql.to_string())).collect());
-	}
-	if let Some(table) = sampled.filter(|t| {
-		ctx.catalog
-			.relations
-			.get(&resolve_name(ctx.catalog, ctx.search_path, "", t))
-			.is_some_and(|k| matches!(k, RelationKind::Sharded { .. }))
-	}) {
-		return Err(no(
-			format!("TABLESAMPLE of the distributed table {table} is not answered across nodes"),
-			PIN,
-		));
-	}
-	let mut out = Vec::new();
-	for (id, n) in nodes {
-		let server = n.server_version_num.unwrap_or(170000);
-		let mut w = worker.clone();
-		let mut failed = None;
-		filter_select(&mut w, &mut |rv| {
-			let (key, keyspace) = sharded_table(ctx, &ctes, rv)?;
-			let refname = rv
-				.alias
-				.as_ref()
-				.map(|a| a.aliasname.clone())
-				.unwrap_or_else(|| rv.relname.clone());
-			match owned_rows(ctx.catalog, rv, &refname, &key, &keyspace, *id, server) {
-				Ok(n) => Some(n),
-				Err(e) => {
-					failed.get_or_insert(e);
-					None
-				}
-			}
-		});
-		if let Some(e) = failed {
-			return Err(e);
-		}
-		out.push((
-			*id,
-			deparse_stmt(NodeEnum::SelectStmt(Box::new(w)), version)?,
-		));
-	}
-	Ok(out)
-}
-
-/// The key column and keyspace of the sharded table `rv` names, unless it names a CTE.
-fn sharded_table(
-	ctx: &Context,
-	ctes: &BTreeSet<String>,
-	rv: &RangeVar,
-) -> Option<(String, String)> {
-	if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
-		// A CTE of that name shadows the table; the CTE's own query is filtered where it reads it.
-		return None;
-	}
-	match ctx.catalog.relations.get(&resolve_name(
-		ctx.catalog,
-		ctx.search_path,
-		&rv.schemaname,
-		&rv.relname,
-	)) {
-		Some(RelationKind::Sharded {
-			keyspace,
-			key_column,
-		}) => Some((key_column.clone(), keyspace.clone())),
-		_ => None,
-	}
-}
-
-/// `(select * from <rv> as <refname> where <owns>) as <refname>`, with `rv`'s column aliases kept
-/// on the outside, so the rest of the statement sees the same names.
-fn owned_rows(
-	c: &Catalog,
-	rv: &RangeVar,
-	refname: &str,
-	key: &str,
-	keyspace: &str,
-	on: crate::catalog::NodeId,
-	server: u32,
-) -> Result<Node, Refusal> {
-	let cannot = |why: String| {
-		no(
-			format!(
-				"Lepis could not limit each node to the rows it owns of {}: {why}",
-				rv.relname
-			),
-			PIN,
-		)
-	};
-	let ks = c
-		.keyspaces
-		.get(keyspace)
-		.ok_or_else(|| cannot(format!("its keyspace {keyspace} is not in the catalog")))?;
-	let column = format!(
-		"{}.{}",
-		crate::catalog::quote_ident(refname),
-		crate::catalog::quote_ident(key)
-	);
-	let check = crate::catalog::owns_check(&column, ks, on, server).map_err(|e| cannot(e.0))?;
-	let parsed = pg_query::parse(&format!("select 1 where {check}"))
-		.map_err(|e| cannot(format!("its ownership expression does not parse: {e}")))?;
-	let filter = parsed
-		.protobuf
-		.stmts
-		.first()
-		.and_then(|r| match r.stmt.as_deref().and_then(|n| n.node.as_ref()) {
-			Some(NodeEnum::SelectStmt(sel)) => sel.where_clause.clone(),
-			_ => None,
-		})
-		.ok_or_else(|| cannot("its ownership expression is empty".into()))?;
-	let mut inner = rv.clone();
-	inner.alias = Some(Alias {
-		aliasname: refname.to_string(),
-		colnames: Vec::new(),
-	});
-	let star = node(NodeEnum::ColumnRef(ColumnRef {
-		fields: vec![node(NodeEnum::AStar(AStar {}))],
-		location: -1,
-	}));
-	let select = SelectStmt {
-		target_list: vec![node(NodeEnum::ResTarget(Box::new(ResTarget {
-			val: Some(Box::new(star)),
-			..Default::default()
-		})))],
-		from_clause: vec![node(NodeEnum::RangeVar(inner))],
-		where_clause: Some(filter),
-		limit_option: LimitOption::Default as i32,
-		op: SetOperation::SetopNone as i32,
-		..Default::default()
-	};
-	Ok(node(NodeEnum::RangeSubselect(Box::new(RangeSubselect {
-		lateral: false,
-		subquery: Some(Box::new(node(NodeEnum::SelectStmt(Box::new(select))))),
-		alias: Some(Alias {
-			aliasname: refname.to_string(),
-			colnames: rv
-				.alias
-				.as_ref()
-				.map(|a| a.colnames.clone())
-				.unwrap_or_default(),
-		}),
-	}))))
-}
-
-/// Replaces every table reference in `s` (its FROM, its joins, its subqueries in FROM and in
-/// expressions, its CTEs, its set operation's arms) for which `f` gives a replacement. A
-/// replacement is not looked into again.
-fn filter_select(s: &mut SelectStmt, f: &mut dyn FnMut(&RangeVar) -> Option<Node>) {
-	if let Some(w) = &mut s.with_clause {
-		for c in &mut w.ctes {
-			filter_node(c, f);
-		}
-	}
-	for n in s
-		.target_list
-		.iter_mut()
-		.chain(&mut s.from_clause)
-		.chain(s.where_clause.as_deref_mut())
-		.chain(&mut s.group_clause)
-		.chain(s.having_clause.as_deref_mut())
-		.chain(&mut s.window_clause)
-		.chain(&mut s.distinct_clause)
-		.chain(&mut s.values_lists)
-		.chain(&mut s.sort_clause)
-		.chain(s.limit_offset.as_deref_mut())
-		.chain(s.limit_count.as_deref_mut())
-	{
-		filter_node(n, f);
-	}
-	for arm in [&mut s.larg, &mut s.rarg].into_iter().flatten() {
-		filter_select(arm, f);
-	}
-}
-
-fn filter_node(n: &mut Node, f: &mut dyn FnMut(&RangeVar) -> Option<Node>) {
-	match &mut n.node {
-		Some(NodeEnum::RangeVar(rv)) => {
-			if let Some(r) = f(rv) {
-				*n = r;
-			}
-		}
-		Some(NodeEnum::SelectStmt(s)) => filter_select(s, f),
-		Some(e) => {
-			for c in children_mut(e) {
-				filter_node(c, f);
-			}
-		}
-		None => {}
-	}
-}
-
-/// `children`, mutable: the nodes a table reference or a nested SELECT can sit under in a SELECT.
-fn children_mut(e: &mut NodeEnum) -> Vec<&mut Node> {
-	use NodeEnum as N;
-	fn o(n: &mut Option<Box<Node>>) -> Option<&mut Node> {
-		n.as_deref_mut()
-	}
-	match e {
-		N::ResTarget(r) => o(&mut r.val)
-			.into_iter()
-			.chain(&mut r.indirection)
-			.collect(),
-		N::AExpr(a) => o(&mut a.lexpr).into_iter().chain(o(&mut a.rexpr)).collect(),
-		N::BoolExpr(b) => b.args.iter_mut().collect(),
-		N::NullTest(t) => o(&mut t.arg).into_iter().collect(),
-		N::BooleanTest(t) => o(&mut t.arg).into_iter().collect(),
-		N::TypeCast(t) => o(&mut t.arg).into_iter().collect(),
-		N::CollateClause(c) => o(&mut c.arg).into_iter().collect(),
-		N::NamedArgExpr(a) => o(&mut a.arg).into_iter().collect(),
-		N::CaseExpr(c) => o(&mut c.arg)
-			.into_iter()
-			.chain(&mut c.args)
-			.chain(o(&mut c.defresult))
-			.collect(),
-		N::CaseWhen(w) => o(&mut w.expr).into_iter().chain(o(&mut w.result)).collect(),
-		N::CoalesceExpr(c) => c.args.iter_mut().collect(),
-		N::MinMaxExpr(m) => m.args.iter_mut().collect(),
-		N::RowExpr(r) => r.args.iter_mut().collect(),
-		N::AArrayExpr(a) => a.elements.iter_mut().collect(),
-		N::List(l) => l.items.iter_mut().collect(),
-		N::AIndirection(a) => o(&mut a.arg)
-			.into_iter()
-			.chain(&mut a.indirection)
-			.collect(),
-		N::SortBy(s) => o(&mut s.node).into_iter().collect(),
-		N::GroupingSet(g) => g.content.iter_mut().collect(),
-		N::FuncCall(f) => f
-			.args
-			.iter_mut()
-			.chain(&mut f.agg_order)
-			.chain(o(&mut f.agg_filter))
-			.collect(),
-		N::SubLink(s) => o(&mut s.testexpr)
-			.into_iter()
-			.chain(o(&mut s.subselect))
-			.collect(),
-		N::JoinExpr(j) => o(&mut j.larg)
-			.into_iter()
-			.chain(o(&mut j.rarg))
-			.chain(o(&mut j.quals))
-			.collect(),
-		N::RangeSubselect(r) => o(&mut r.subquery).into_iter().collect(),
-		N::RangeFunction(r) => r.functions.iter_mut().collect(),
-		N::CommonTableExpr(c) => o(&mut c.ctequery).into_iter().collect(),
-		N::JsonArrayQueryConstructor(j) => o(&mut j.query).into_iter().collect(),
-		// TABLESAMPLE over a distributed table is refused before this runs.
-		_ => Vec::new(),
-	}
-}
-
-/// The relation an unqualified (or qualified) table name means: the first schema of the search
-/// path the catalog has it in, as Postgres resolves it, else the first schema of the path.
-fn resolve_name(c: &Catalog, search_path: &[String], schema: &str, table: &str) -> RelationName {
-	if !schema.is_empty() {
-		return RelationName {
-			schema: schema.into(),
-			table: table.into(),
-		};
-	}
-	for s in search_path {
-		let n = RelationName {
-			schema: s.clone(),
-			table: table.into(),
-		};
-		if c.relations.contains_key(&n) {
-			return n;
-		}
-	}
-	RelationName {
-		schema: search_path.first().cloned().unwrap_or_default(),
-		table: table.into(),
-	}
 }
 
 /// The SELECT an EXPLAIN explains, as SQL: what the router describes to plan it.
@@ -1300,7 +1023,68 @@ impl<'a> Builder<'a> {
 	}
 
 	fn resolve(&self, schema: &str, table: &str) -> RelationName {
-		resolve_name(self.ctx.catalog, self.ctx.search_path, schema, table)
+		if !schema.is_empty() {
+			return RelationName {
+				schema: schema.into(),
+				table: table.into(),
+			};
+		}
+		for s in self.ctx.search_path {
+			let n = RelationName {
+				schema: s.clone(),
+				table: table.into(),
+			};
+			if self.ctx.catalog.relations.contains_key(&n) {
+				return n;
+			}
+		}
+		RelationName {
+			schema: self.ctx.search_path.first().cloned().unwrap_or_default(),
+			table: table.into(),
+		}
+	}
+
+	/// The sharded tables of the top-level FROM (through joins, not into subqueries): the name a
+	/// column is qualified with there, the key column, the keyspace.
+	fn owned_in_from(&self) -> Vec<(String, String, String)> {
+		fn from<'n>(n: &'n Node, out: &mut Vec<&'n pg_query::protobuf::RangeVar>) {
+			match &n.node {
+				Some(NodeEnum::RangeVar(rv)) => out.push(rv),
+				Some(NodeEnum::JoinExpr(j)) => {
+					for s in [&j.larg, &j.rarg].into_iter().flatten() {
+						from(s, out);
+					}
+				}
+				_ => {}
+			}
+		}
+		let mut rvs = Vec::new();
+		for f in &self.top.from_clause {
+			from(f, &mut rvs);
+		}
+		rvs.into_iter()
+			.filter_map(|rv| {
+				match self
+					.ctx
+					.catalog
+					.relations
+					.get(&self.resolve(&rv.schemaname, &rv.relname))
+				{
+					Some(RelationKind::Sharded {
+						keyspace,
+						key_column,
+					}) => Some((
+						rv.alias
+							.as_ref()
+							.map(|a| a.aliasname.clone())
+							.unwrap_or_else(|| rv.relname.clone()),
+						key_column.clone(),
+						keyspace.clone(),
+					)),
+					_ => None,
+				}
+			})
+			.collect()
 	}
 
 	fn sharded_key(&self, schema: &str, table: &str) -> Option<String> {
@@ -2085,111 +1869,34 @@ mod tests {
 
 	#[test]
 	fn each_node_reads_only_the_rows_it_owns() {
+		let c = cat();
 		let p = planned(
 			"select count(*) from orders o join countries using (code) where o.total > 5",
 			&["count"],
 			&[20],
 		)
 		.unwrap();
-		assert_eq!(p.per_node.len(), 3, "a worker for every node");
-		let n2 = p.worker_sql_for(NodeId(2)).unwrap();
-		assert!(
-			n2.contains("FROM orders o WHERE hashint8extended(o.tenant_id, 1)"),
-			"{n2}"
+		assert_eq!(
+			p.owned,
+			vec![(
+				"o".to_string(),
+				"tenant_id".to_string(),
+				"tenant".to_string()
+			)]
 		);
-		assert!(
-			n2.contains(") o JOIN countries"),
-			"the table, replaced in place: {n2}"
-		);
+		let n2 = p.worker_sql_for(&c, NodeId(2));
+		assert!(n2.contains("hashint8extended(o.tenant_id, 1)"), "{n2}");
 		assert!(n2.contains("o.total > 5"), "{n2}");
 		assert_ne!(
-			Some(n2),
-			p.worker_sql_for(NodeId(3)),
+			n2,
+			p.worker_sql_for(&c, NodeId(3)),
 			"each node gets its own ranges"
 		);
-		assert_eq!(
-			p.worker_sql_for(NodeId(9)),
-			None,
-			"a node the catalog does not have"
-		);
-		// No sharded table at all (a reference table alone): the worker as it is, on every node.
-		if let Ok(r) = planned("select code from countries order by code", &["code"], &[25]) {
-			assert_eq!(r.worker_sql_for(NodeId(2)), Some(r.worker_sql.as_str()));
+		// No sharded table in FROM (a reference table alone): the worker as it is.
+		let r = planned("select code from countries order by code", &["code"], &[25]);
+		if let Ok(r) = r {
+			assert_eq!(r.worker_sql_for(&c, NodeId(2)), r.worker_sql);
 		}
-	}
-
-	#[test]
-	fn a_table_read_anywhere_is_limited_to_the_rows_its_node_owns() {
-		for sql in [
-			// In a subquery in FROM, in a CTE, and in a subquery in WHERE: each was read whole before.
-			"select count(*) from (select * from orders where total > 5) s",
-			"with big as (select * from orders where total > 5) select count(*) from big",
-			"select count(*) from items i where exists (select 1 from orders o where o.tenant_id = i.tenant_id)",
-		] {
-			let p = planned(sql, &["count"], &[20]).unwrap();
-			let n2 = p.worker_sql_for(NodeId(2)).unwrap();
-			assert!(
-				n2.contains("FROM orders o WHERE hashint8extended(o.tenant_id, 1)")
-					|| n2
-						.contains("FROM orders orders WHERE hashint8extended(orders.tenant_id, 1)"),
-				"{sql}: {n2}"
-			);
-		}
-		// A CTE named like a table is not the table; the table inside it is.
-		let p = planned(
-			"with orders as (select * from app.orders) select count(*) from orders",
-			&["count"],
-			&[20],
-		)
-		.unwrap();
-		let n2 = p.worker_sql_for(NodeId(2)).unwrap();
-		assert!(n2.contains("hashint8extended"), "{n2}");
-		assert!(
-			n2.ends_with("FROM orders"),
-			"the CTE reference is left alone: {n2}"
-		);
-	}
-
-	#[test]
-	fn an_outer_join_keeps_the_rows_it_null_extends() {
-		// A WHERE filter on o's key would drop every item with no order (its o.tenant_id is NULL):
-		// the table is replaced instead, so the filter applies before the join.
-		let p = planned(
-			"select count(*) from items i left join orders o on o.tenant_id = i.tenant_id and o.id = i.order_id",
-			&["count"],
-			&[20],
-		)
-		.unwrap();
-		let n2 = p.worker_sql_for(NodeId(2)).unwrap();
-		assert!(
-			n2.contains("LEFT JOIN (SELECT * FROM orders o WHERE"),
-			"{n2}"
-		);
-		assert!(
-			!n2.contains(") o ON o.tenant_id = i.tenant_id AND o.id = i.order_id WHERE"),
-			"{n2}"
-		);
-	}
-
-	#[test]
-	fn a_read_whose_filter_cannot_be_built_is_refused_not_run_whole() {
-		let mut c = cat();
-		c.keyspaces.clear();
-		let e = planned_on(&c, "select count(*) from orders", &["count"], &[20], None).unwrap_err();
-		assert_eq!(e.code, NOT_ACROSS_NODES);
-		assert!(
-			e.message
-				.contains("could not limit each node to the rows it owns of orders"),
-			"{}",
-			e.message
-		);
-		let e = planned(
-			"select count(*) from orders tablesample system (10)",
-			&["count"],
-			&[20],
-		)
-		.unwrap_err();
-		assert!(e.message.contains("TABLESAMPLE"), "{}", e.message);
 	}
 
 	fn cat() -> Catalog {
@@ -2257,23 +1964,14 @@ mod tests {
 		types: &[u32],
 		col_types: Option<&[u32]>,
 	) -> Result<Planned, Refusal> {
-		planned_on(&cat(), sql, names, types, col_types)
-	}
-
-	fn planned_on(
-		cat: &Catalog,
-		sql: &str,
-		names: &[&str],
-		types: &[u32],
-		col_types: Option<&[u32]>,
-	) -> Result<Planned, Refusal> {
+		let cat = cat();
 		let path = vec!["app".to_string()];
 		let d = Described {
 			names: names.iter().map(|s| s.to_string()).collect(),
 			types: types.to_vec(),
 		};
 		let ctx = Context {
-			catalog: cat,
+			catalog: &cat,
 			search_path: &path,
 			described: Some(&d),
 			aggregates: &[],

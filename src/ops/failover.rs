@@ -57,9 +57,7 @@ pub async fn precheck(
 	if n.home {
 		return Err(OpError::refused(
 			Kind::HomeNode,
-			// L19: the catalog, the commit log and the router come back with the home's data, so a
-			// home is failed over beneath this job (its replica's data promoted in its place), never by it.
-			"the home node holds the catalog and runs beside the router, so it is failed over by putting its replica's data in its place, not by node.failover",
+			"the home node holds the catalog and runs beside the router; its failover is not built",
 		));
 	}
 	if !matches!(n.state, NodeState::Active | NodeState::Draining) {
