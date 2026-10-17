@@ -209,7 +209,10 @@ docker compose down -v       # removes this example's volumes too: the next `up`
   must hold the **same** verifier for the role, and row-level security keeps working, because
   each node session runs as the client's own role.
 - **Consistency.** A statement and a transaction on one node are full Postgres. A read across
-  nodes sees each node at its own moment, not one snapshot of all of them.
+  nodes sees each node at its own moment, not one snapshot of all of them, and each node is asked
+  only for the rows it owns, so a range in the middle of a move is never counted twice. A router
+  that has not heard from the home node for `LEPIS_CATALOG_MAX_AGE_MS` stops routing until it
+  has, so it never answers from a catalog a move has left behind.
 
 ## Running it
 
@@ -245,6 +248,7 @@ routers can run with the same five lines.
 | `LEPIS_ADMIN_ADDR` | none: no admin API | | `host:port` for the admin API (HTTP and JSON, what `snoutdata shards` calls). Off loopback it needs `LEPIS_TLS_CERT`, and is then HTTPS with that certificate; plain HTTP is refused anywhere but loopback |
 | `LEPIS_ADMIN_TOKEN` | required with `LEPIS_ADMIN_ADDR` | yes | the bearer token every admin call but `/v1/health` must send; at least 16 characters |
 | `LEPIS_MAX_CLIENTS` | `1000` | | connections over this are closed at once, not queued |
+| `LEPIS_CATALOG_MAX_AGE_MS` | `10000` | | how long the router routes by its catalog after it last heard from the home node. Past it, a statement that reads or writes a table is refused with SQLSTATE `57P03` until the home answers again, since a router that cannot reach the home cannot learn that a range moved. Must be under 15000, the heartbeat age past which a move stops waiting for a router; `0` turns the limit off |
 | `LEPIS_LOG` | `info` | | a `tracing` filter: `warn`, `debug`, `lepis=debug,info`, … |
 
 A missing required variable stops the router with a sentence naming it; there is no default

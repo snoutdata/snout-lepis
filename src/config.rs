@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// How Lepis reaches a node, in libpq's `sslmode` words for the three that mean something.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,9 @@ pub struct Config {
 	/// Returns one row with one column, the role's `rolpassword`, for `$1` = the role name.
 	pub verifier_query: String,
 	pub max_clients: usize,
+	/// How long the router routes by its catalog after it last heard from the home node; zero
+	/// for no limit (live.rs `Freshness`).
+	pub catalog_max_age: Duration,
 }
 
 pub const DEFAULT_VERIFIER_QUERY: &str = "select rolpassword from pg_catalog.pg_authid \
@@ -138,6 +142,23 @@ impl Config {
 				.parse()
 				.map_err(|_| ConfigError(format!("LEPIS_MAX_CLIENTS: {v}")))?,
 		};
+		let catalog_max_age = match get("LEPIS_CATALOG_MAX_AGE_MS") {
+			None => crate::live::DEFAULT_CATALOG_MAX_AGE,
+			Some(v) => {
+				let ms: u64 = v
+					.parse()
+					.map_err(|_| ConfigError(format!("LEPIS_CATALOG_MAX_AGE_MS: {v}")))?;
+				let age = Duration::from_millis(ms);
+				// A router a cutover does not wait for must already have stopped routing.
+				if age >= crate::live::ROUTER_FRESH {
+					return Err(ConfigError(format!(
+						"LEPIS_CATALOG_MAX_AGE_MS: {v} must be under {}, the age at which a cutover stops waiting for a router's heartbeat (0 turns the limit off)",
+						crate::live::ROUTER_FRESH.as_millis()
+					)));
+				}
+				age
+			}
+		};
 		Ok(Config {
 			host: get("LEPIS_HOST").unwrap_or_else(|| "0.0.0.0".into()),
 			port: port("LEPIS_PORT", 5432)?,
@@ -157,6 +178,7 @@ impl Config {
 			verifier_query: get("LEPIS_VERIFIER_QUERY")
 				.unwrap_or_else(|| DEFAULT_VERIFIER_QUERY.into()),
 			max_clients,
+			catalog_max_age,
 		})
 	}
 }
@@ -184,7 +206,29 @@ mod tests {
 		assert_eq!(c.home.port, 6543);
 		assert_eq!(c.home.sslmode, SslMode::VerifyFull);
 		assert_eq!(c.port, 5432);
+		assert_eq!(c.catalog_max_age, crate::live::DEFAULT_CATALOG_MAX_AGE);
 		assert!(!format!("{:?}", c.service).contains("pw"));
+	}
+
+	#[test]
+	fn the_catalog_age_stays_under_the_cutovers_wait() {
+		let base = [
+			("LEPIS_HOME", "h"),
+			("LEPIS_SERVICE_USER", "u"),
+			("LEPIS_SERVICE_PASSWORD", "p"),
+		];
+		let with = |v: &str| {
+			let mut e = env(&base);
+			e.insert("LEPIS_CATALOG_MAX_AGE_MS".into(), v.into());
+			Config::from_map(&e)
+		};
+		assert_eq!(with("0").unwrap().catalog_max_age, Duration::ZERO);
+		assert_eq!(
+			with("14999").unwrap().catalog_max_age,
+			Duration::from_millis(14_999)
+		);
+		assert!(with("15000").unwrap_err().0.contains("must be under 15000"));
+		assert!(with("ten").is_err());
 	}
 
 	#[test]
