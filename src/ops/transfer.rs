@@ -47,8 +47,9 @@ const MARK_SQL: &str = "create schema if not exists lepis_move; \
 	create table if not exists lepis_move.mark (job_id bigint not null, target int not null, \
 	token text not null, at timestamptz not null default now(), primary key (job_id, target, token))";
 
-/// How long the routers' heartbeat may be old and still count as a live router.
-const ROUTER_FRESH_SECS: u32 = 15;
+/// How long the routers' heartbeat may be old and still count as a live router. A router older
+/// than this has already stopped routing by itself (live.rs `DEFAULT_CATALOG_MAX_AGE`).
+const ROUTER_FRESH_SECS: u64 = crate::live::ROUTER_FRESH.as_secs();
 
 /// What a table needs for one target, computed once at prepare and kept in the detail.
 #[derive(Clone, Debug, Default)]

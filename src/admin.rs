@@ -460,8 +460,9 @@ pub async fn status(h: &mut Pg) -> Result<Value, OpError> {
 	let routers = h
 		.simple(&format!(
 			"select coalesce(json_agg(r order by id), '[]')::text from (select id, epoch, epoch >= {} as current, \
-			seen_at, now() - seen_at < interval '15 seconds' as live, fenced_epoch from lepis.router) r",
-			c.epoch
+			seen_at, now() - seen_at < interval '{} seconds' as live, fenced_epoch from lepis.router) r",
+			c.epoch,
+			crate::live::ROUTER_FRESH.as_secs()
 		))
 		.await?;
 	let routers: Value = routers
