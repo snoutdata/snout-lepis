@@ -25,6 +25,7 @@ the session from node to node. Ranges split, merge and move between nodes while 
 keeps writing, driven by `snoutdata shards` through the router's admin API. A statement Lepis
 cannot yet answer correctly is refused with a sentence saying so, never run wrongly.
 
+- [Tested and measured](#tested-and-measured): how far it scales, what it costs, and how it was broken on purpose
 - [Quick start](#quick-start): three Postgres nodes and a router, with sample data, in one command
 - [How it works](#how-it-works): nodes, keyspaces, ranges, the three kinds of table, fences
 - [Running it](#running-it): the binary and every variable
@@ -32,6 +33,86 @@ cannot yet answer correctly is refused with a sentence saying so, never run wron
 - [Operations](#operations): distributing tables, roles, catalog changes, logs, upgrades
 - [Threat model](#threat-model)
 - [Working on it](#working-on-it)
+
+## Tested and measured
+
+Every number here is measured, on real Postgres, with the raw output kept under `bench/results/`.
+
+### How far it scales
+
+Eight data nodes, each on its own EC2 `c7g.xlarge` (4 vCPUs, Postgres 18.6), one or two routers on
+`c7g.2xlarge` (8 vCPUs), and a pgbench client on its own `c7g.4xlarge`, in one zone of us-west-2. The
+same data at every size: 10 million accounts sharded by account and 4,000 TPC-B branches by branch,
+one equal range per node. 30 seconds per run, prepared statements, the peak over 32 to 512 clients.
+Every transaction stays on one node. "No router" is pgbench straight at each node, on keys that node
+owns: what the nodes can do with nothing in front of them.
+
+Peak transactions a second (2026-10-18):
+
+| Nodes | Reads, router | Reads, no router | Writes, router | Writes, no router | TPC-B, router | TPC-B, no router |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 68,296 | 73,191 | 12,169 | 11,608 | 7,611 | 7,644 |
+| 2 | 129,753 | 123,468 | 25,734 | 26,028 | 14,124 | 14,619 |
+| 4 | 223,356 | 249,216 | 45,923 | 51,411 | 25,134 | 28,483 |
+| 8 | 341,126 | 504,827 | 76,799 | 103,722 | 44,238 | 58,558 |
+| 8, two routers | 409,449 | | 85,626 | | 45,952 | |
+
+A read is one row by key; a write updates an account's balance and inserts a history row; TPC-B is
+pgbench's mix within one branch. Median latency through one router at 8 nodes: 1.4 ms for a read, 5.8
+ms for a write (0.5 and 4.9 with no router).
+
+- **1 to 4 nodes: the nodes are the limit.** They run at 94 to 100% of their CPU; the router is
+  within 7% of no router at 1 and 2 nodes, and at 88 to 90% at 4.
+- **8 nodes: one router is the limit.** On 8 vCPUs it runs at 88 to 97%, about 340,000 single-node
+  statements a second, and delivers 68 to 76% of the nodes' own throughput. Routers hold no state
+  beyond connections, so you add routers: a second one reaches 78 to 83%.
+- **Not yet explained:** a node spends 17% more CPU per transaction behind the router than with clients
+  straight at it (75 against 64 µs per read).
+- **A defect the run found, open:** with prepared statements, a session's first transaction commits in
+  two phases although it touches one node, and the session then holds a connection to the home node's
+  commit log. Past about 300 clients a home with 600 connections refuses them. The 8-node router peaks
+  for writes and TPC-B above were taken with the home at 1,200 connections; at 600 they are 62,551 and
+  39,322.
+- **Not measured yet:** transactions across nodes, skewed keys, and a run at one fixed rate.
+
+`lepis/bench/scaleout.sh` is the run.
+
+### What routing costs on one node
+
+The router in front of a one-node catalog, on one 8-vCPU host shared with Postgres and pgbench: at 64
+clients it delivers 72% of direct throughput on single-row reads (81k against 113k tps), with a lower
+median than a session-mode connection pooler; at 16 clients in transaction mode it keeps 97% of
+direct on TPC-B. That price is paid once; the table above is what it buys. `lepis/bench/pgbench.sh` is the run.
+
+### Correctness
+
+- **The shard hash** matches Postgres's own functions on 101 million values (10 million or more per key
+  type) on Postgres 18, and on 8.1 million on 13 and 11 million on 17: 0 differences.
+- **An oracle** runs the same data and queries on one plain Postgres and on a three-node cluster: 3,000
+  generated queries, 0 wrong answers; of 500 more, 390 equal, 110 refused, 0 wrong. A query Lepis cannot
+  answer correctly is refused, never run wrongly.
+- **Two-phase commit** with its coordinator killed at each of 9 points recovers at every one; 240 bank
+  transfers under those kills created or lost no money.
+- **Online moves:** 8 writers and 19 cutovers per run, about a million writes each on Postgres 18 and
+  17, 0 rows lost, duplicated or wrong. A split under 90 seconds of pgbench writes: 110,840 orders, 0
+  failed.
+
+### Broken on purpose, in SnoutData Cloud
+
+Lepis runs SnoutData Cloud's clusters, where it was driven on the live fleet through the public
+endpoint while clients wrote known keys, read fixed answers and moved money between nodes, and every
+acknowledged write was counted afterwards.
+
+- **21 ways of breaking a node:** pods killed, Postgres crashing, the router killed, nodes dying before
+  and after a two-phase PREPARE, frozen, cut off, out of disk, two at once, killed in the middle of a
+  move, a join and a drain. In every scenario that healed by itself, nothing acknowledged was lost or
+  applied twice and no two-node transaction was left half applied; a node's replica takes its place
+  with nobody involved. The home node broken: back on its replica's data in 130 s, nothing lost.
+- **A damaged page on disk:** found by its checksum, the node replaced by its replica, every row
+  matching a digest taken before the damage.
+- **A lost disk:** every commit, a cluster's nodes included, is also held in a second zone before it
+  is acknowledged. A database's disk destroyed under load (a plain database; a cluster's nodes have
+  not had this drill yet) came back in 89 s with none of 4,231 acknowledged writes lost.
 
 ## Quick start
 
