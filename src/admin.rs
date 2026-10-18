@@ -1,4 +1,4 @@
-//! The admin API (L13): the one interface every management surface calls. `snoutdata shards
+//! The admin API (L13): the one interface every management surface calls. `snoutdata cluster
 //! --admin <url>` talks to it for a standalone router; the Cloud's Snout Function, the dashboard
 //! and Studio reach the same operations through it. Nothing here decides anything: it plans,
 //! writes jobs and reads their state, and the job engine (`ops::engine`) does the work.

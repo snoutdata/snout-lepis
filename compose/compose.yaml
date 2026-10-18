@@ -13,7 +13,7 @@
 # `wal_level = logical` (moving a range) and `max_prepared_transactions` (writes across nodes),
 # and SCRAM for every login (Lepis never holds a password; it logs into each node with the key a
 # client's SCRAM proof reveals). Only the router is published, on this machine alone: Postgres
-# on 6432 and its admin API (what `snoutdata shards` drives) on 7432, both over TLS with a
+# on 6432 and its admin API (what `snoutdata cluster` drives) on 7432, both over TLS with a
 # self-signed certificate `setup` writes to ./certs.
 
 name: lepis-example

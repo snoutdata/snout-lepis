@@ -37,7 +37,7 @@ done
 
 echo "== the router's certificate"
 # Self-signed, for this machine: the router serves Postgres clients and its admin API over TLS
-# with it, and `snoutdata shards` trusts it through NODE_EXTRA_CA_CERTS. Made once.
+# with it, and `snoutdata cluster` trusts it through NODE_EXTRA_CA_CERTS. Made once.
 if [ ! -s /certs/lepis.crt ] || [ ! -s /certs/lepis.key ]; then
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 825 		-subj /CN=lepis -addext subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:lepis 		-keyout /certs/lepis.key -out /certs/lepis.crt 2>/dev/null
 	# The router runs as an unprivileged user and must read its key.

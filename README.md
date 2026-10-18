@@ -22,7 +22,7 @@ scales that read as one pattern, the way the nodes read as one database.
 nodes are merged (ORDER BY, LIMIT, aggregates, GROUP BY, DISTINCT), and writes across nodes commit
 on all of them or none through two-phase commit. Session settings and prepared statements follow
 the session from node to node. Ranges split, merge and move between nodes while the application
-keeps writing, driven by `snoutdata shards` through the router's admin API. A statement Lepis
+keeps writing, driven by `snoutdata cluster` through the router's admin API. A statement Lepis
 cannot yet answer correctly is refused with a sentence saying so, never run wrongly.
 
 - [Tested and measured](#tested-and-measured): how far it scales, what it costs, and how it was broken on purpose
@@ -176,8 +176,8 @@ select * from plans;
 -- Every node at once: asked of each node, and the answers merged.
 select count(*) from orders;
 
--- One statement whose rows belong to several nodes: refused, with SQLSTATE 0A000 and a hint
--- naming the fix, until writes across nodes commit on all of them or none.
+-- One statement whose rows belong to several nodes: each row goes to its node, and the write
+-- commits on all of them or none (two-phase commit).
 insert into orders (tenant_id, order_id, placed_at, total_cents, status)
 	values (1, 5000, now(), 1, 'placed'), (2, 5000, now(), 1, 'placed');
 ```
@@ -202,13 +202,13 @@ docker compose exec home psql -U postgres -d app -c "select * from lepis.range o
 ### Split while a load runs
 
 The router's admin API is published on `127.0.0.1:7432` (HTTPS, with the same certificate), and
-`snoutdata shards` drives it. In a second terminal, in `compose/`:
+`snoutdata cluster` drives it. In a second terminal, in `compose/`:
 
 ```sh
 export LEPIS_ADMIN_URL=https://localhost:7432
 export LEPIS_ADMIN_TOKEN="$(sed -n 's/^LEPIS_ADMIN_TOKEN=//p' .env)"
 export NODE_EXTRA_CA_CERTS="$PWD/certs/lepis.crt"     # trust the example's own certificate
-npx snoutdata shards status
+npx snoutdata cluster status
 ```
 
 `status` lists every range as `keyspace:lo` with the node that owns it. Start a write load: one
@@ -222,8 +222,8 @@ While it runs, from the other terminal, read the plan, then split the first `ten
 move its upper half to `node3`:
 
 ```sh
-npx snoutdata shards range split tenant:-9223372036854775808 --to node3 --plan
-npx snoutdata shards range split tenant:-9223372036854775808 --to node3
+npx snoutdata cluster range split tenant:-9223372036854775808 --to node3 --plan
+npx snoutdata cluster range split tenant:-9223372036854775808 --to node3
 ```
 
 The plan says what moves (rows, size, estimated copy time) and the write pause to expect. The
@@ -238,14 +238,14 @@ When the load ends, every order pgbench committed is on exactly one node, the on
 for n in home node2 node3; do
   docker compose exec $n psql -U postgres -d app -Atc "select '$n', count(*) from orders where status = 'load'"
 done
-npx snoutdata shards verify
-npx snoutdata shards jobs
+npx snoutdata cluster verify
+npx snoutdata cluster jobs
 ```
 
 The three counts add up to pgbench's "number of transactions actually processed", with none
 failed; `verify` checks that every node holds only the rows its ranges say. On a laptop the load's
 rate swings with the disk (every commit waits for an fsync on three Postgres at once), which is
-the machine, not the move. `snoutdata shards --help` lists the other operations (move, merge,
+the machine, not the move. `snoutdata cluster --help` lists the other operations (move, merge,
 rebalance, adding and draining nodes, distributing a table), and each takes `--plan`.
 
 ### Stopping and starting over
@@ -326,7 +326,7 @@ routers can run with the same five lines.
 | `LEPIS_VERIFIER_QUERY` | reads `pg_authid` | | one row, one column, the role's `rolpassword` for `$1` |
 | `LEPIS_HOST`, `LEPIS_PORT` | `0.0.0.0`, `5432` | | where clients connect |
 | `LEPIS_TLS_CERT`, `LEPIS_TLS_KEY` | none | the key | PEM files. With them, clients may use TLS, by SSLRequest or directly (`sslnegotiation=direct`), and SCRAM-SHA-256-PLUS with channel binding is offered. Both or neither |
-| `LEPIS_ADMIN_ADDR` | none: no admin API | | `host:port` for the admin API (HTTP and JSON, what `snoutdata shards` calls). Off loopback it needs `LEPIS_TLS_CERT`, and is then HTTPS with that certificate; plain HTTP is refused anywhere but loopback |
+| `LEPIS_ADMIN_ADDR` | none: no admin API | | `host:port` for the admin API (HTTP and JSON, what `snoutdata cluster` calls). Off loopback it needs `LEPIS_TLS_CERT`, and is then HTTPS with that certificate; plain HTTP is refused anywhere but loopback |
 | `LEPIS_ADMIN_TOKEN` | required with `LEPIS_ADMIN_ADDR` | yes | the bearer token every admin call but `/v1/health` must send; at least 16 characters |
 | `LEPIS_MAX_CLIENTS` | `1000` | | connections over this are closed at once, not queued |
 | `LEPIS_CATALOG_MAX_AGE_MS` | `10000` | | how long the router routes by its catalog after it last heard from the home node. Past it, a statement that reads or writes a table is refused with SQLSTATE `57P03` until the home answers again, since a router that cannot reach the home cannot learn that a range moved. Must be under 15000, the heartbeat age past which a move stops waiting for a router; `0` turns the limit off |
@@ -385,11 +385,11 @@ Replication connections are refused: connect to a node directly for those.
 ### Distributing tables
 
 Every operation on a running cluster is a call to the router's admin API, made with
-`snoutdata shards` (`--admin <url>` or `LEPIS_ADMIN_URL`, and `LEPIS_ADMIN_TOKEN`): `keyspace
+`snoutdata cluster` (`--admin <url>` or `LEPIS_ADMIN_URL`, and `LEPIS_ADMIN_TOKEN`): `keyspace
 create`, `table distribute <schema.table> --column C --keyspace K`, `table reference`, `range
 split|merge|move`, `tenant pin`, `nodes add|drain|remove`, `rebalance`, `scale`, `verify` and
 `cleanup`. Each has a dry run (`--plan`: what moves, how much, the copy time and the write pause
-to expect) and runs as a job in the catalog that survives a router restart (`shards jobs`, `jobs
+to expect) and runs as a job in the catalog that survives a router restart (`cluster jobs`, `jobs
 watch`, `jobs resume`). Anything that moves or deletes data asks first, or needs `--yes`.
 
 The example's first catalog is written by hand, which is also a readable account of what the
@@ -431,7 +431,7 @@ the right place while routers catch up, so change a node's fence in the same ste
 
 - **Health:** the router accepts connections once it has loaded the catalog; `pg_isready -h
   <router>` answers from then on. With the admin API on, `GET /v1/health` answers without a
-  token, and `snoutdata shards status` shows each router's last acknowledged catalog epoch.
+  token, and `snoutdata cluster status` shows each router's last acknowledged catalog epoch.
 - **Logs** go to standard output, filtered by `LEPIS_LOG`. At `info` they hold the start, catalog
   reloads and failed logins (by role), never a statement.
 - **Metrics:** none of its own yet. Each node's `pg_stat_activity` shows Lepis's sessions under
