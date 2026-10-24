@@ -4,6 +4,7 @@
 //! crashes and cut links.
 
 pub mod decide;
+pub mod serve;
 pub mod witness;
 
 #[cfg(test)]

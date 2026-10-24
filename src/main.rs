@@ -1,9 +1,36 @@
 //! The snout-lepis binary. Wiring only; everything it runs is in the library.
+//!
+//! `snout-lepis` alone is the router. `snout-lepis witness` is the third vote of L21's failover
+//! (`guard/serve.rs`), configured from its own `LEPIS_WITNESS_*` variables.
 
 use lepis::config::Config;
+use lepis::guard::serve::{WitnessConfig, serve_witness};
 use lepis::server::{self, App};
 
 async fn run() -> Result<(), String> {
+	let args: Vec<String> = std::env::args().skip(1).collect();
+	match args
+		.iter()
+		.map(String::as_str)
+		.collect::<Vec<_>>()
+		.as_slice()
+	{
+		[] => router().await,
+		["witness"] => {
+			let config = WitnessConfig::from_env()?;
+			tokio::select! {
+				result = serve_witness(config) => result,
+				_ = stopped() => Ok(()),
+			}
+		}
+		_ => Err(format!(
+			"usage: snout-lepis [witness] (got: {})",
+			args.join(" ")
+		)),
+	}
+}
+
+async fn router() -> Result<(), String> {
 	let config = Config::from_env().map_err(|e| e.to_string())?;
 	let address = format!("{}:{}", config.host, config.port);
 	let app = App::new(config)?;

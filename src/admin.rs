@@ -141,14 +141,16 @@ pub async fn serve_admin(
 	}
 }
 
-struct Request {
-	method: String,
-	path: String,
-	authorization: Option<String>,
-	body: Vec<u8>,
+pub(crate) struct Request {
+	pub(crate) method: String,
+	pub(crate) path: String,
+	pub(crate) authorization: Option<String>,
+	pub(crate) body: Vec<u8>,
 }
 
-async fn read_request<S: AsyncRead + Unpin>(s: &mut S) -> Result<Request, (u16, String)> {
+pub(crate) async fn read_request<S: AsyncRead + Unpin>(
+	s: &mut S,
+) -> Result<Request, (u16, String)> {
 	let mut buf = Vec::with_capacity(4096);
 	let head_end = loop {
 		if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -223,6 +225,11 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
 		Ok(Err((code, m))) => (code, error_body("bad_request", "bad_http", &m)),
 		Ok(Ok(req)) => handle(req, app, token, kick).await,
 	};
+	respond(&mut s, status, &body).await;
+}
+
+/// Writes one JSON response and closes the connection (the witness answers the same way).
+pub(crate) async fn respond<S: AsyncWrite + Unpin>(s: &mut S, status: u16, body: &Value) {
 	let reason = match status {
 		200 => "OK",
 		201 => "Created",
