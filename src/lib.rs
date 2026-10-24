@@ -13,6 +13,7 @@ pub mod config;
 pub mod cron;
 pub mod ddl;
 pub mod frame;
+pub mod guard;
 pub mod hash;
 pub mod live;
 pub mod merge;
