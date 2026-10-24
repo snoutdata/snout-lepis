@@ -57,7 +57,7 @@ done
 echo "== cargo tests against postgres:$major" >&2
 if [ -z "${LEPIS_IT_ONLY:-}" ]; then
 STACK_DEV_ARGS="--network $net -e LEPIS_IT_HOME=$pg:5432 -e LEPIS_ORACLE_REFERENCE=$ref:5432" \
-	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test passthrough --test oracle -- --test-threads 4
+	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test passthrough --test oracle --test unconfirmed -- --test-threads 4
 fi
 
 # Every tests/cluster*.rs runs here, one binary after another (each redistributes the data it

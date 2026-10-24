@@ -287,6 +287,31 @@ impl ErrorFields {
 	}
 }
 
+/// Postgres's WARNING when a commit stopped waiting for its synchronous standby because it was
+/// cancelled (`statement_timeout`, `pg_cancel_backend`, a client's cancel request): the commit is
+/// already durable on the primary, the client is about to be told `COMMIT`, and the standby may
+/// not have it, so a failover could lose a commit its client was told succeeded. Matched by the
+/// message, which Postgres translates: the nodes run with English messages (`lc_messages`, which
+/// only a superuser may change). Ending the session instead tells the client nothing, which is
+/// what Postgres does when the wait is ended by `pg_terminate_backend`.
+pub fn unconfirmed_commit(m: &Message) -> bool {
+	m.tag == b'N'
+		&& parse_error_fields(&m.body)
+			.iter()
+			.any(|(k, v)| *k == b'M' && v.starts_with("canceling wait for synchronous replication"))
+}
+
+/// What a client is told instead of that `COMMIT`: FATAL 08007 (transaction_resolution_unknown),
+/// and the session ends, so no driver can read the commit as a success.
+pub fn unconfirmed_commit_message() -> Message {
+	ErrorFields::fatal(
+		"08007",
+		"the commit was cancelled while it waited for the database's standby: it is committed on the primary, but the standby may not have it, so a failover could lose it",
+	)
+	.with_hint("Connect again and check whether the transaction's changes are there before retrying it.")
+	.message()
+}
+
 /// The fields of an `ErrorResponse` or `NoticeResponse` a node sent.
 pub fn parse_error_fields(body: &[u8]) -> Vec<(u8, String)> {
 	let mut out = Vec::new();

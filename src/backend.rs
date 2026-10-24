@@ -74,6 +74,9 @@ pub struct Simple {
 	pub tags: Vec<String>,
 	/// The transaction status ReadyForQuery reported: `I`, `T` or `E`.
 	pub status: u8,
+	/// A commit in it was cancelled while it waited for the synchronous standby
+	/// (`wire::unconfirmed_commit`): durable here, perhaps not on the standby.
+	pub unconfirmed: bool,
 }
 
 impl BackendError {
@@ -351,6 +354,7 @@ impl Backend {
 					out.tags.push(String::from_utf8_lossy(tag).into_owned());
 				}
 				b'E' => error = Some(m),
+				b'N' if wire::unconfirmed_commit(&m) => out.unconfirmed = true,
 				b'Z' => {
 					out.status = m.body.first().copied().unwrap_or(b'I');
 					break;

@@ -125,8 +125,22 @@ impl Participant for NodeSession {
 
 	async fn execute(&mut self, sql: &str) -> Result<String, BackendError> {
 		let mut r = self.backend.simple(sql).await?;
+		if r.unconfirmed {
+			return Err(unconfirmed_by_standby());
+		}
 		Ok(r.tags.pop().unwrap_or_default())
 	}
+}
+
+/// A PREPARE or COMMIT PREPARED whose wait for the node's synchronous standby was cancelled
+/// (`wire::unconfirmed_commit`) is not counted as done: a PREPARE that is not on the standby could
+/// vanish in a failover after the decision says commit, so the transaction is rolled back
+/// instead; a COMMIT PREPARED is left to in-doubt recovery, which finds it committed or commits
+/// the prepared transaction the standby holds.
+pub fn unconfirmed_by_standby() -> BackendError {
+	BackendError::Unreachable(
+		"the node's synchronous standby did not confirm it (its wait was cancelled)".into(),
+	)
 }
 
 /// What a commit did.

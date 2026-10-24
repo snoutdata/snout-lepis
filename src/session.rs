@@ -3,13 +3,15 @@
 //! Phase 0 is a pass-through: the client is authenticated by Lepis, a session is opened on the
 //! home node as the same role with the same startup parameters, and from the first
 //! `ReadyForQuery` on, bytes are relayed both ways. Phase 1 replaces the relay with routing.
+//! The relay reads the node's side as frames, only to stop at a commit its synchronous standby
+//! did not confirm (`relay_from_node`).
 //! A client has `AUTHENTICATION_TIMEOUT` to get that far, as Postgres gives it
 //! `authentication_timeout`; one that stalls is let go, so it cannot hold a slot.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
@@ -212,7 +214,7 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 		params,
 		user,
 		client_key,
-		mut backend,
+		backend,
 		minor,
 	}) = opened
 	else {
@@ -263,16 +265,115 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 				.run()
 				.await
 			}
-			None => {
-				tokio::io::copy_bidirectional(&mut client, &mut backend.stream).await?;
-				Ok::<(), WireError>(())
-			}
+			None => relay(client, backend.stream).await,
 		}
 	}
 	.await;
 	app.cancels.forget(pid);
 	crate::router::spread::clear(pid);
 	relayed
+}
+
+/// The pass-through: the client's bytes to the node as they are, the node's to the client through
+/// `relay_from_node`. Whichever side closes first ends the session.
+async fn relay(client: BoxStream, node: BoxStream) -> Result<(), WireError> {
+	let (mut client_r, mut client_w) = tokio::io::split(client);
+	let (mut node_r, mut node_w) = tokio::io::split(node);
+	let up = async {
+		tokio::io::copy(&mut client_r, &mut node_w).await?;
+		node_w.shutdown().await?;
+		Ok::<(), WireError>(())
+	};
+	tokio::select! {
+		r = up => r,
+		r = relay_from_node(&mut node_r, &mut client_w) => {
+			let _ = client_w.shutdown().await;
+			r
+		}
+	}
+}
+
+/// The largest notice held back to be read; a bigger one (never Postgres's own) passes unread.
+const MAX_HELD_NOTICE: usize = 64 * 1024;
+
+/// Copies the node's messages to the client as they arrive, reading only their headers, except a
+/// NoticeResponse, which is held until it is whole: if it says a commit stopped waiting for its
+/// synchronous standby (`wire::unconfirmed_commit`), the `COMMIT` after it would tell the client
+/// yes for a commit a failover could lose, so the client is sent FATAL 08007 instead and the
+/// session ends. Everything before the notice reaches the client first.
+pub async fn relay_from_node<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+	node: &mut R,
+	client: &mut W,
+) -> Result<(), WireError> {
+	let mut buf = vec![0u8; 64 * 1024];
+	let mut out: Vec<u8> = Vec::with_capacity(buf.len());
+	let mut header = [0u8; 5];
+	let mut header_len = 0usize;
+	// Body bytes left of the frame in progress; `held` collects it when it is a notice.
+	let mut left = 0usize;
+	let mut held: Option<Vec<u8>> = None;
+	loop {
+		let n = node.read(&mut buf).await?;
+		if n == 0 {
+			client.write_all(&out).await?;
+			client.flush().await?;
+			return Ok(());
+		}
+		let mut i = 0;
+		while i < n {
+			if left == 0 {
+				let take = (5 - header_len).min(n - i);
+				header[header_len..header_len + take].copy_from_slice(&buf[i..i + take]);
+				header_len += take;
+				i += take;
+				if header_len < 5 {
+					continue;
+				}
+				header_len = 0;
+				let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+				if len < 4 {
+					return Err(WireError::Protocol(format!(
+						"a node sent a message of length {len}"
+					)));
+				}
+				left = len - 4;
+				if header[0] == b'N' && left <= MAX_HELD_NOTICE {
+					let mut h = Vec::with_capacity(len + 1);
+					h.extend_from_slice(&header);
+					held = Some(h);
+				} else {
+					out.extend_from_slice(&header);
+				}
+			} else {
+				let take = left.min(n - i);
+				match &mut held {
+					Some(h) => h.extend_from_slice(&buf[i..i + take]),
+					None => out.extend_from_slice(&buf[i..i + take]),
+				}
+				left -= take;
+				i += take;
+			}
+			if left == 0
+				&& header_len == 0
+				&& let Some(h) = held.take()
+			{
+				let m = Message::new(b'N', h[5..].to_vec());
+				if wire::unconfirmed_commit(&m) {
+					tracing::warn!(
+						"a commit's wait for its standby was cancelled; ending the session"
+					);
+					out.extend_from_slice(&wire::unconfirmed_commit_message().encode());
+					client.write_all(&out).await?;
+					client.flush().await?;
+					return Ok(());
+				}
+				out.extend_from_slice(&h);
+			}
+		}
+		client.write_all(&out).await?;
+		client.flush().await?;
+		out.clear();
+	}
 }
 
 async fn accept(
@@ -389,6 +490,82 @@ mod tests {
 
 	use super::*;
 	use crate::config::Config;
+
+	/// A node that answers a few bytes at a time.
+	struct Trickle(Vec<u8>, usize);
+
+	impl AsyncRead for Trickle {
+		fn poll_read(
+			mut self: std::pin::Pin<&mut Self>,
+			_: &mut std::task::Context<'_>,
+			buf: &mut tokio::io::ReadBuf<'_>,
+		) -> std::task::Poll<std::io::Result<()>> {
+			let step = self.1;
+			let n = step.min(self.0.len()).min(buf.remaining());
+			let chunk: Vec<u8> = self.0.drain(..n).collect();
+			buf.put_slice(&chunk);
+			std::task::Poll::Ready(Ok(()))
+		}
+	}
+
+	fn notice(message: &str) -> Message {
+		let body = wire::Body::new()
+			.byte(b'S')
+			.cstr("WARNING")
+			.byte(b'C')
+			.cstr("01000")
+			.byte(b'M')
+			.cstr(message)
+			.byte(0);
+		body.message(b'N')
+	}
+
+	async fn relayed(bytes: &[u8], step: usize) -> Vec<u8> {
+		let mut node = Trickle(bytes.to_vec(), step);
+		let mut client = Vec::new();
+		relay_from_node(&mut node, &mut client).await.unwrap();
+		client
+	}
+
+	#[tokio::test]
+	async fn the_relay_passes_every_message_as_it_is_however_it_arrives() {
+		let mut stream = Vec::new();
+		for m in [
+			Message::new(b'T', vec![0, 0]),
+			Message::new(b'D', vec![7; 200_000]),
+			notice("an ordinary warning"),
+			Message::new(b'N', vec![b'x'; MAX_HELD_NOTICE + 10]),
+			Message::new(b'C', b"INSERT 0 1\0".to_vec()),
+			Message::new(b'Z', vec![b'I']),
+		] {
+			stream.extend_from_slice(&m.encode());
+		}
+		for step in [1, 2, 3, 5, 7, 4096, 1 << 20] {
+			assert_eq!(relayed(&stream, step).await, stream, "step {step}");
+		}
+	}
+
+	#[tokio::test]
+	async fn the_relay_ends_the_session_before_a_commit_its_standby_did_not_confirm() {
+		let mut before = Vec::new();
+		for m in [
+			Message::new(b'D', vec![1; 10]),
+			notice("an ordinary warning"),
+		] {
+			before.extend_from_slice(&m.encode());
+		}
+		let mut stream = before.clone();
+		stream.extend_from_slice(
+			&notice("canceling wait for synchronous replication due to user request").encode(),
+		);
+		stream.extend_from_slice(&Message::new(b'C', b"COMMIT\0".to_vec()).encode());
+		stream.extend_from_slice(&Message::new(b'Z', vec![b'I']).encode());
+		let mut want = before;
+		want.extend_from_slice(&wire::unconfirmed_commit_message().encode());
+		for step in [1, 3, 64, 1 << 20] {
+			assert_eq!(relayed(&stream, step).await, want, "step {step}");
+		}
+	}
 
 	#[tokio::test]
 	async fn a_client_that_never_logs_in_is_let_go() {

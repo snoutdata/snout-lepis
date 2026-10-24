@@ -112,6 +112,8 @@ pub struct Router {
 	client_r: Reader,
 	/// The client's own connection failed or closed: nothing more can be said to it.
 	client_gone: bool,
+	/// What the client is told when the session ends with an error, instead of "a node was lost".
+	end_with: Option<Message>,
 	out: Vec<u8>,
 	conns: HashMap<NodeId, Conn>,
 	/// The node the open transaction is on.
@@ -221,6 +223,7 @@ impl Router {
 			startup,
 			client_r: FrameReader::new(client),
 			client_gone: false,
+			end_with: None,
 			out: Vec::new(),
 			conns,
 			pinned: None,
@@ -283,7 +286,7 @@ impl Router {
 		if let Err(e) = &result
 			&& !self.client_gone
 		{
-			let fatal = node_lost_message(e);
+			let fatal = self.end_with.take().unwrap_or_else(|| node_lost_message(e));
 			let _ = self.flush_client().await;
 			let client = self.client_r.get_mut();
 			let _ = client.write_all(&fatal.encode()).await;
@@ -439,6 +442,15 @@ impl Router {
 
 	async fn on_node(&mut self, n: NodeId, m: Message) -> Result<(), WireError> {
 		let m = fence_refusal_as_retry(m);
+		// The COMMIT that follows this notice would tell the client yes for a commit its standby
+		// may not have: the session ends before it is read (L21).
+		if wire::unconfirmed_commit(&m) {
+			tracing::warn!(node = %n, "a commit's wait for its standby was cancelled; ending the session");
+			self.end_with = Some(wire::unconfirmed_commit_message());
+			return Err(WireError::Protocol(
+				"a commit its synchronous standby did not confirm".into(),
+			));
+		}
 		let Some(front) = self.inflight.front_mut() else {
 			// Asynchronous messages while idle: notifications, notices, parameter changes.
 			if matches!(m.tag, b'A' | b'N' | b'S') {
@@ -3096,6 +3108,7 @@ impl twopc::Participant for Part<'_> {
 		self.conn.prepared.remove("");
 		let mut tag = String::new();
 		let mut error = None;
+		let mut unconfirmed = false;
 		loop {
 			let m = self
 				.conn
@@ -3106,12 +3119,14 @@ impl twopc::Participant for Part<'_> {
 			match m.tag {
 				b'C' => tag = cstr(&m.body),
 				b'E' => error = Some(m),
+				b'N' if wire::unconfirmed_commit(&m) => unconfirmed = true,
 				b'Z' => break,
 				_ => {}
 			}
 		}
 		match error {
 			Some(e) => Err(BackendError::Refused(e)),
+			None if unconfirmed => Err(twopc::unconfirmed_by_standby()),
 			None => Ok(tag),
 		}
 	}
