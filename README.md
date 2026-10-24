@@ -532,6 +532,7 @@ Everything runs in the stack's dev container; Docker is the only requirement.
 bash scripts/dev.sh cargo test -p snout-lepis       # unit tests and the hash fixture
 bash scripts/it.sh [18|17]                    # against real Postgres nodes, then psql checks
 bash scripts/hash-check.sh [n] [major]        # the shard hash against Postgres, n values per type
+bash scripts/it-failover.sh [scenario...]     # the home's failover: guards, a witness, cut links
 bash bench/pgbench.sh [seconds] [clients]     # direct vs Lepis vs a session pooler
 bash scripts/fuzz.sh 300 lepis_wire lepis_scram lepis_hash lepis_analyze
 ```

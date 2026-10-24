@@ -281,26 +281,9 @@ impl World {
 
 	/// What the runner does with an answer to any call.
 	fn heard(&mut self, i: usize, answer: Option<Answer>) {
-		let now = self.now;
-		let role = self.copies[i].role;
-		let mem = &mut self.copies[i].mem;
-		match answer {
-			Some(Answer::Lease { eligible, .. }) => {
-				mem.renewed_at = Some(now);
-				mem.eligible = Some(eligible);
-			}
-			Some(Answer::Granted { epoch }) => {
-				mem.epoch = epoch;
-				mem.granted = Some(epoch);
-			}
-			Some(Answer::Demoted { epoch, .. }) => {
-				if role == Role::Primary {
-					mem.demoted = true;
-				} else {
-					mem.epoch = epoch;
-				}
-			}
-			Some(Answer::Held { .. } | Answer::Refused { .. }) | None => {}
+		let (now, c) = (self.now, &mut self.copies[i]);
+		if let Some(a) = answer {
+			c.mem.heard(now, c.role == Role::Primary, &a);
 		}
 	}
 
@@ -391,12 +374,7 @@ impl World {
 						c.role = Role::Primary;
 						c.last_receive = None;
 						c.last_reply = None;
-						c.mem = Memory {
-							epoch,
-							renewed_at: Some(self.now),
-							eligible: Some(false),
-							..Memory::default()
-						};
+						c.mem = Memory::promoted(epoch, self.now);
 						self.log(format!("{} promoted at epoch {epoch}", NAMES[i]));
 					}
 				}

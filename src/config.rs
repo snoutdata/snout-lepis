@@ -20,7 +20,7 @@ pub enum SslMode {
 }
 
 impl SslMode {
-	fn parse(s: &str) -> Option<SslMode> {
+	pub(crate) fn parse(s: &str) -> Option<SslMode> {
 		Some(match s {
 			"disable" => SslMode::Disable,
 			"require" => SslMode::Require,

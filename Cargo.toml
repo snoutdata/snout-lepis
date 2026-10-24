@@ -17,7 +17,7 @@ name = "snout-lepis"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "process"] }
 
 # TLS both ways: the certificate served to clients and the connections to nodes. ring is the
 # provider every other component already uses through rustls.

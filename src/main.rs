@@ -1,9 +1,11 @@
 //! The snout-lepis binary. Wiring only; everything it runs is in the library.
 //!
-//! `snout-lepis` alone is the router. `snout-lepis witness` is the third vote of L21's failover
-//! (`guard/serve.rs`), configured from its own `LEPIS_WITNESS_*` variables.
+//! `snout-lepis` alone is the router. `snout-lepis witness` and `snout-lepis guard` are L21's
+//! failover: the third vote (`guard/serve.rs`, `LEPIS_WITNESS_*`) and the process beside each copy
+//! of a Postgres (`guard/run.rs`, `LEPIS_GUARD_*`).
 
 use lepis::config::Config;
+use lepis::guard::run::{GuardConfig, run_guard};
 use lepis::guard::serve::{WitnessConfig, serve_witness};
 use lepis::server::{self, App};
 
@@ -23,8 +25,15 @@ async fn run() -> Result<(), String> {
 				_ = stopped() => Ok(()),
 			}
 		}
+		["guard"] => {
+			let config = GuardConfig::from_env()?;
+			tokio::select! {
+				result = run_guard(config) => result,
+				_ = stopped() => Ok(()),
+			}
+		}
 		_ => Err(format!(
-			"usage: snout-lepis [witness] (got: {})",
+			"usage: snout-lepis [witness | guard] (got: {})",
 			args.join(" ")
 		)),
 	}

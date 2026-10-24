@@ -8,6 +8,8 @@
 //! it became so (`GoSync`, then `Eligible(true)`). The lease is renewed every tick and decides only
 //! when a cut primary stops serving (`Fence`).
 
+use super::witness::Answer;
+
 /// What `synchronous_standby_names` says on a primary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncNames {
@@ -60,6 +62,43 @@ pub struct Memory {
 	/// standby is vouched for once it has flushed past it. `None`: not known (after a restart the
 	/// runner sets it to the current LSN).
 	pub sync_from_lsn: Option<u64>,
+}
+
+impl Memory {
+	/// What an answer from the witness teaches, to any call. `sent_at`: when the call went out (a
+	/// lease is counted from then); `primary`: this copy's Postgres is one.
+	pub fn heard(&mut self, sent_at: u64, primary: bool, answer: &Answer) {
+		match answer {
+			Answer::Lease { eligible, .. } => {
+				self.renewed_at = Some(sent_at);
+				self.eligible = Some(*eligible);
+			}
+			Answer::Granted { epoch } => {
+				self.epoch = *epoch;
+				self.granted = Some(*epoch);
+			}
+			// A primary at an older epoch has been replaced; a standby learns whose it is.
+			Answer::Demoted { epoch, .. } => {
+				if primary {
+					self.demoted = true;
+				} else {
+					self.epoch = *epoch;
+				}
+			}
+			Answer::Held { .. } | Answer::Refused { .. } => {}
+		}
+	}
+
+	/// Just promoted at `epoch`: the grant renewed the lease (asked at `asked_at`) and cleared
+	/// `eligible`, and `synchronous_standby_names` is empty.
+	pub fn promoted(epoch: u64, asked_at: u64) -> Memory {
+		Memory {
+			epoch,
+			renewed_at: Some(asked_at),
+			eligible: Some(false),
+			..Memory::default()
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
