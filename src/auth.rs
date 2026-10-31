@@ -101,13 +101,13 @@ impl VerifierSource {
 			("application_name".to_string(), "snout-lepis".to_string()),
 		];
 		backend::connect(
-			&self.config.home,
+			&self.config.home(),
 			self.tls.as_ref(),
 			&params,
 			ClientCredential::Password(s.password.clone()),
 		)
 		.await
-		.map_err(|e| format!("service login to {}: {e}", self.config.home))
+		.map_err(|e| format!("service login to {}: {e}", self.config.home()))
 	}
 
 	fn mock(&self, role: &str) -> Verifier {

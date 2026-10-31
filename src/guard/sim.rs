@@ -43,6 +43,8 @@ struct Copy {
 	last_receive: Option<u64>,
 	/// Primary: the standby's last reply and the flush it reported.
 	last_reply: Option<(u64, usize)>,
+	/// Whether `archive_command` carries the fence's guard.
+	archive_fenced: bool,
 }
 
 struct Witness {
@@ -98,6 +100,7 @@ impl World {
 			},
 			last_receive: None,
 			last_reply: None,
+			archive_fenced: false,
 		};
 		let cluster = Cluster::new("a", Some("b"), T, 0);
 		World {
@@ -263,6 +266,7 @@ impl World {
 					names: c.names,
 					standby,
 					lsn: c.wal.len() as u64,
+					archive_fenced: Some(c.archive_fenced),
 				}
 			}
 		}
@@ -368,9 +372,12 @@ impl World {
 						c.mem.sync_from_lsn = Some(c.wal.len() as u64);
 						self.log(format!("{} unfenced", NAMES[i]));
 					}
+					Action::FenceArchive => self.copies[i].archive_fenced = true,
+					Action::UnfenceArchive => self.copies[i].archive_fenced = false,
 					Action::Promote(epoch) => {
 						let c = &mut self.copies[i];
 						c.names = SyncNames::Off;
+						c.archive_fenced = false;
 						c.role = Role::Primary;
 						c.last_receive = None;
 						c.last_reply = None;
@@ -379,6 +386,14 @@ impl World {
 					}
 				}
 			}
+			// The archive is guarded in the tick that fences, never a tick later.
+			let c = &self.copies[i];
+			assert!(
+				c.role != Role::Primary || c.names != SyncNames::Fenced || c.archive_fenced,
+				"{} fenced with its archive open\n{}",
+				NAMES[i],
+				self.trace.join("\n")
+			);
 		}
 	}
 

@@ -38,6 +38,10 @@ pub enum Postgres {
 		names: SyncNames,
 		standby: Option<StandbySeen>,
 		lsn: u64,
+		/// Whether `archive_command` carries the fence's guard (`fence_archive_command`):
+		/// `Some(true)` it archives only segments the standby had flushed, `Some(false)` everything,
+		/// `None` no archive_command at all, so nothing to guard.
+		archive_fenced: Option<bool>,
 	},
 	/// In recovery; `receive_age_ms` since the last message from the primary (`None`: no stream).
 	Standby {
@@ -118,6 +122,13 @@ pub enum Action {
 	Ask,
 	/// Granted: clear `synchronous_standby_names`, `pg_promote()`, hold `epoch`.
 	Promote(u64),
+	/// `archive_command` guarded: only segments before the one holding the standby's last flush
+	/// are archived, so a fenced copy never feeds an archive-fed standby a branch. Always after
+	/// `Fence` (or with the copy already fenced), never instead of it: a failed reload here leaves
+	/// the fence as it is and is tried again on the next tick.
+	FenceArchive,
+	/// The guard taken off `archive_command` again, once the copy is out of the fence.
+	UnfenceArchive,
 }
 
 /// The name a fenced copy waits for. No standby ever connects with it.
@@ -136,15 +147,30 @@ pub fn decide(now: u64, lease_ms: u64, pg: Postgres, mem: &Memory) -> Vec<Action
 				Vec::new()
 			}
 		}
-		Postgres::Primary { names, standby, .. } => {
+		Postgres::Primary {
+			names,
+			standby,
+			archive_fenced,
+			..
+		} => {
 			if mem.demoted {
-				return if names == SyncNames::Fenced {
+				let mut out = if names == SyncNames::Fenced {
 					Vec::new()
 				} else {
 					vec![Action::Fence]
 				};
+				if archive_fenced == Some(false) {
+					out.push(Action::FenceArchive);
+				}
+				return out;
 			}
 			let mut out = vec![Action::Renew];
+			// Still holding a grant out of recovery: the promotion outlasted `pg_promote`'s wait
+			// and finished since, so it is recorded first (the runner, which does not promote
+			// again). The rest is decided as it stands, so a lapsed lease still fences.
+			if let Some(epoch) = mem.granted {
+				out.insert(0, Action::Promote(epoch));
+			}
 			// Half the lease, measured from when the renewal was sent: the witness's lease began
 			// after that, so this copy stops before the witness could hand its place to another.
 			let lease = mem
@@ -181,6 +207,15 @@ pub fn decide(now: u64, lease_ms: u64, pg: Postgres, mem: &Memory) -> Vec<Action
 					}
 				}
 			}
+			// The archive follows the fence: guarded from the tick that fences (after the fence,
+			// so a failure here cannot keep it from happening) until the tick that unfences.
+			let fenced = out.contains(&Action::Fence)
+				|| (names == SyncNames::Fenced && !out.contains(&Action::Unfence));
+			match archive_fenced {
+				Some(false) if fenced => out.push(Action::FenceArchive),
+				Some(true) if !fenced => out.push(Action::UnfenceArchive),
+				_ => {}
+			}
 			out
 		}
 	}
@@ -197,6 +232,16 @@ mod tests {
 			names,
 			standby,
 			lsn: 100,
+			archive_fenced: None,
+		}
+	}
+
+	fn archiving(names: SyncNames, standby: Option<StandbySeen>, fenced: bool) -> Postgres {
+		Postgres::Primary {
+			names,
+			standby,
+			lsn: 100,
+			archive_fenced: Some(fenced),
 		}
 	}
 
@@ -371,6 +416,87 @@ mod tests {
 	}
 
 	#[test]
+	fn the_archive_is_guarded_after_the_fence_and_tried_again_while_fenced() {
+		// Cut: no lease, no standby. The fence first, so a failure guarding the archive cannot keep
+		// commits from stopping.
+		let lapsed = renewed(0, true);
+		assert_eq!(
+			decide(T, T, archiving(SyncNames::Standby, None, false), &lapsed),
+			[Action::Renew, Action::Fence, Action::FenceArchive]
+		);
+		// Already fenced with the archive still open (the last reload failed): still fenced, and
+		// the archive tried again. Nothing unfences it for that.
+		assert_eq!(
+			decide(T, T, archiving(SyncNames::Fenced, None, false), &lapsed),
+			[Action::Renew, Action::FenceArchive]
+		);
+		assert_eq!(
+			decide(T, T, archiving(SyncNames::Fenced, None, true), &lapsed),
+			[Action::Renew]
+		);
+	}
+
+	#[test]
+	fn the_archive_opens_with_the_fence_and_not_before() {
+		// The lease is back: out of the fence, and the archive with it.
+		assert_eq!(
+			decide(
+				1_000,
+				T,
+				archiving(SyncNames::Fenced, None, true),
+				&renewed(1_000, true)
+			),
+			[Action::Renew, Action::Unfence, Action::UnfenceArchive]
+		);
+		// A copy found guarded while not fenced (an unfence whose archive half failed) opens it.
+		assert_eq!(
+			decide(
+				1_000,
+				T,
+				archiving(SyncNames::Standby, seen(100, true, 60), true),
+				&renewed(1_000, true)
+			),
+			[Action::Renew, Action::UnfenceArchive]
+		);
+		// Healthy and open: nothing to do. No archive_command: nothing to guard, ever.
+		assert_eq!(
+			decide(
+				1_000,
+				T,
+				archiving(SyncNames::Standby, seen(100, true, 60), false),
+				&renewed(1_000, true)
+			),
+			[Action::Renew]
+		);
+		assert_eq!(
+			decide(T, T, primary(SyncNames::Standby, None), &renewed(0, true)),
+			[Action::Renew, Action::Fence]
+		);
+	}
+
+	#[test]
+	fn a_demoted_copy_guards_its_archive_too() {
+		let m = Memory {
+			demoted: true,
+			..renewed(0, true)
+		};
+		assert_eq!(
+			decide(
+				0,
+				T,
+				archiving(SyncNames::Standby, seen(1, true, 1), false),
+				&m
+			),
+			[Action::Fence, Action::FenceArchive]
+		);
+		assert_eq!(
+			decide(0, T, archiving(SyncNames::Fenced, None, false), &m),
+			[Action::FenceArchive]
+		);
+		assert!(decide(0, T, archiving(SyncNames::Fenced, None, true), &m).is_empty());
+	}
+
+	#[test]
 	fn the_standby_asks_once_the_stream_is_gone_and_promotes_when_granted() {
 		let m = Memory {
 			epoch: 1,
@@ -424,5 +550,27 @@ mod tests {
 			),
 			[Action::Promote(2)]
 		);
+	}
+
+	#[test]
+	fn a_promotion_that_outlasted_its_wait_is_recorded_and_still_fenced_without_a_lease() {
+		let late = Memory {
+			epoch: 2,
+			granted: Some(2),
+			..Memory::default()
+		};
+		let primary = Postgres::Primary {
+			names: SyncNames::Off,
+			standby: None,
+			lsn: 0,
+			archive_fenced: None,
+		};
+		assert_eq!(
+			decide(10_000, T, primary, &late),
+			[Action::Promote(2), Action::Renew, Action::Fence]
+		);
+		let recorded = Memory::promoted(2, 10_000);
+		assert_eq!(recorded.granted, None);
+		assert_eq!(decide(10_000, T, primary, &recorded), [Action::Renew]);
 	}
 }

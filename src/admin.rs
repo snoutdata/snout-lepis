@@ -17,6 +17,7 @@
 //! | `POST /v1/jobs/<id>/cancel` | stop it (a move before its cutover rolls back) |
 //! | `POST /v1/jobs/<id>/resume` | run a failed job again from the step that failed |
 //! | `POST /v1/settings` | `{"max_write_pause_ms": 2000, ...}`: the cluster's L10 settings, the advisor's `advice_*` thresholds, and the router's `pool_mode`, `route_claim`, `route_claim_keyspace` (strings; null clears) |
+//! | `GET /v1/autopilot` | the autopilot's mode (`autopilot` in the settings: off unless set to `advise` or `auto`), its interval, and what it decided last |
 //! | `GET /v1/advice[?sample_ms=N]` | Phase 10's advisor: the facts it read, and each recommendation as a request `POST /v1/jobs` takes, with its reason and its plan. Runs nothing |
 //!
 //! Configuration, from the environment like everything else: `LEPIS_ADMIN_ADDR` (unset: no admin
@@ -330,6 +331,12 @@ async fn handle(req: Request, app: &Arc<App>, token: &str, kick: &Arc<Notify>) -
 				"ops": OPS,
 				"settings": Settings::default().to_json(),
 				"advice_settings": AdviceSettings::default().to_json(),
+				// A router with the autopilot says so here, with its defaults: off unless set.
+				"autopilot_settings": {
+					"autopilot": crate::ops::autopilot::Mode::Off.name(),
+					"autopilot_interval_ms": crate::ops::autopilot::DEFAULT_INTERVAL.as_millis() as u64,
+					"modes": ["off", "advise", "auto"],
+				},
 				"refusals": Kind::ALL.iter().map(|k| json!({"kind": k.name(), "status": k.http_status()})).collect::<Vec<_>>(),
 			}),
 		)),
@@ -355,6 +362,7 @@ async fn handle(req: Request, app: &Arc<App>, token: &str, kick: &Arc<Notify>) -
 				.map(|()| (200, json!({"settings": body}))),
 			Some(why) => Err(OpError::refused(Kind::BadSetting, why)),
 		},
+		("GET", ["v1", "autopilot"]) => crate::ops::autopilot::show(&mut h).await.map(|v| (200, v)),
 		("GET", ["v1", "jobs"]) => engine::list(&mut h, 50)
 			.await
 			.map(|v| (200, json!({"jobs": v}))),
@@ -514,6 +522,13 @@ fn router_settings_json(settings: &Value) -> Value {
 		"pool_mode": if s.transaction_pool { "transaction" } else { "session" },
 		"route_claim": s.route_claim,
 		"route_claim_keyspace": s.route_claim_keyspace,
+		"read_replicas": s.read_replicas.iter().map(|(name, r)| (name.clone(), json!({
+			"host": r.host,
+			"port": r.port,
+			"sslmode": r.sslmode.as_str(),
+			"dbname": r.dbname,
+			"max_lag_bytes": r.max_lag_bytes,
+		}))).collect::<serde_json::Map<String, Value>>(),
 	})
 }
 
@@ -528,7 +543,13 @@ fn settings_problem(body: &Value) -> Option<String> {
 		"copy_mb_per_s",
 	];
 	numbers.extend(advisor::SETTING_NAMES);
-	let strings = ["pool_mode", "route_claim", "route_claim_keyspace"];
+	numbers.push("autopilot_interval_ms");
+	let strings = [
+		"pool_mode",
+		"route_claim",
+		"route_claim_keyspace",
+		"autopilot",
+	];
 	let usage = || {
 		format!(
 			"settings are numbers named {}, or {} (strings, or null to clear)",
@@ -541,6 +562,12 @@ fn settings_problem(body: &Value) -> Option<String> {
 	};
 	for (k, v) in o {
 		let k = k.as_str();
+		if k == "read_replicas" {
+			if let Some(p) = crate::replica::problem(v) {
+				return Some(p);
+			}
+			continue;
+		}
 		if numbers.contains(&k) {
 			if !v.is_u64() {
 				return Some(format!("{k} is a number"));
@@ -559,6 +586,9 @@ fn settings_problem(body: &Value) -> Option<String> {
 		match k {
 			"pool_mode" if !matches!(t, "session" | "transaction") => {
 				return Some("pool_mode is session or transaction".into());
+			}
+			"autopilot" if !matches!(t, "off" | "advise" | "auto") => {
+				return Some("autopilot is off, advise or auto".into());
 			}
 			"route_claim" | "route_claim_keyspace"
 				if t.is_empty() || t.len() > 63 || t.chars().any(char::is_control) =>
@@ -594,6 +624,8 @@ mod tests {
 			json!({"pool_mode": "session", "route_claim": "tenant_id", "route_claim_keyspace": "tenant"}),
 			json!({"route_claim": null}),
 			json!({"drain_timeout_ms": 5, "pool_mode": null}),
+			json!({"read_replicas": {"n2": {"host": "10.0.0.5", "port": 5432}}}),
+			json!({"read_replicas": null}),
 		] {
 			assert_eq!(settings_problem(&ok), None, "{ok}");
 		}
@@ -606,6 +638,8 @@ mod tests {
 			json!({"route_claim": "x".repeat(64)}),
 			json!({"max_write_pause_ms": "2000"}),
 			json!({"no_such": 1}),
+			json!({"read_replicas": {"n2": {"host": "10.0.0.5"}}}),
+			json!({"read_replicas": ["n2"]}),
 		] {
 			assert!(settings_problem(&bad).is_some(), "{bad}");
 		}
@@ -613,7 +647,14 @@ mod tests {
 			router_settings_json(&json!({"pool_mode": "transaction", "route_claim": "tenant_id"}));
 		assert_eq!(
 			shown,
-			json!({"pool_mode": "transaction", "route_claim": "tenant_id", "route_claim_keyspace": null})
+			json!({"pool_mode": "transaction", "route_claim": "tenant_id", "route_claim_keyspace": null, "read_replicas": {}})
+		);
+		let shown = router_settings_json(
+			&json!({"read_replicas": {"n2": {"host": "h", "port": 6432, "sslmode": "require"}}}),
+		);
+		assert_eq!(
+			shown["read_replicas"],
+			json!({"n2": {"host": "h", "port": 6432, "sslmode": "require", "dbname": null, "max_lag_bytes": crate::replica::DEFAULT_MAX_LAG_BYTES}})
 		);
 	}
 	use crate::ops::spec::{Step, TransferSpec};

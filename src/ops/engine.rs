@@ -81,6 +81,8 @@ async fn lead(app: &Arc<App>, kick: &Arc<Notify>, me: &str) -> Result<(), OpErro
 		}
 	}
 	tracing::info!(runner = me, "this router runs the cluster's jobs");
+	// The autopilot's last pass (`autopilot.rs`): it runs only while there is no job to run.
+	let mut piloted: Option<std::time::Instant> = None;
 	loop {
 		let next = h
 			.simple(
@@ -94,6 +96,22 @@ async fn lead(app: &Arc<App>, kick: &Arc<Notify>, me: &str) -> Result<(), OpErro
 		{
 			Some(id) => run_job(app, &mut h, id, me).await?,
 			None => {
+				let cluster: Value = h
+					.value("select settings::text from lepis.cluster where id = 1", &[])
+					.await?
+					.and_then(|v| serde_json::from_str(&v).ok())
+					.unwrap_or(Value::Null);
+				if super::autopilot::Mode::from_settings(&cluster) != super::autopilot::Mode::Off
+					&& piloted.is_none_or(|t| t.elapsed() >= super::autopilot::interval(&cluster))
+				{
+					piloted = Some(std::time::Instant::now());
+					// A pass that fails is logged; it never stops the runner.
+					match super::autopilot::tick(app, &mut h, &cluster).await {
+						Ok(super::autopilot::Next::Submit { .. }) => continue,
+						Ok(_) => {}
+						Err(e) => tracing::warn!("autopilot: {e}"),
+					}
+				}
 				tokio::select! {
 					_ = tokio::time::sleep(IDLE) => {}
 					_ = kick.notified() => {}
@@ -406,7 +424,7 @@ pub async fn list(h: &mut Pg, limit: i64) -> Result<Value, OpError> {
 	let rows = h
 		.query(
 			"select coalesce(json_agg(j order by id desc), '[]')::text from (select id, op, state, error, \
-			created_at, finished_at, (select count(*) from lepis.job_step s where s.job_id = job.id) steps, \
+			coalesce(args->>'actor', 'person') actor, created_at, finished_at, (select count(*) from lepis.job_step s where s.job_id = job.id) steps, \
 			(select count(*) from lepis.job_step s where s.job_id = job.id and s.state in ('done', 'skipped')) steps_done \
 			from lepis.job order by id desc limit $1) j",
 			&[&limit.to_string()],

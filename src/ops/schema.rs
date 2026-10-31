@@ -223,6 +223,15 @@ pub async fn ensure_table(src: &mut Pg, dst: &mut Pg, rel: &RelationName) -> Res
 /// sharded by `key` in `ks` (L15): every primary key and unique constraint includes the key, the
 /// key's type is the keyspace's, no sequence fills a column, and no foreign key reaches a table
 /// on another node.
+/// Whether a foreign key from `from_cols` to `to_cols` (U+001F-separated, in order) pairs the
+/// referencing table's distribution key `from_key` with the referenced one's `to_key`.
+pub fn joins_on_keys(from_cols: &str, to_cols: &str, from_key: &str, to_key: &str) -> bool {
+	from_cols
+		.split('\u{1f}')
+		.zip(to_cols.split('\u{1f}'))
+		.any(|(f, t)| f == from_key && t == to_key)
+}
+
 pub async fn check_movable(
 	pg: &mut Pg,
 	rel: &RelationName,
@@ -296,6 +305,36 @@ pub async fn check_movable(
 			),
 		));
 	}
+	// A view or materialized view over the table, however deep (a view on a view on it): the
+	// router knows only the table, so a read of the view would go to the home node alone and see
+	// the rows the home still owns, without an error. ddl.rs refuses making one after the fact;
+	// this refuses distributing under one made before.
+	let views = pg
+		.query(
+			"with recursive dep(oid) as ( \
+				select r.ev_class from pg_depend d join pg_rewrite r on r.oid = d.objid \
+				where d.classid = 'pg_rewrite'::regclass and d.refclassid = 'pg_class'::regclass \
+				and d.refobjid = $1::regclass and r.ev_class <> $1::regclass \
+				union \
+				select r.ev_class from dep join pg_depend d on d.refobjid = dep.oid \
+				and d.refclassid = 'pg_class'::regclass and d.classid = 'pg_rewrite'::regclass \
+				join pg_rewrite r on r.oid = d.objid where r.ev_class <> dep.oid) \
+			select c.oid::regclass::text from dep join pg_class c on c.oid = dep.oid \
+			where c.relkind in ('v', 'm') order by 1",
+			&[&t],
+		)
+		.await?;
+	if !views.is_empty() {
+		let names: Vec<String> = views.iter().map(|r| text(r, 0)).collect();
+		return Err(OpError::refused(
+			Kind::TableNotShardable,
+			format!(
+				"{rel} is read by {}: a view over a distributed table would read only the home node's rows; drop {} and query {rel} directly, then distribute it",
+				names.join(", "),
+				if names.len() == 1 { "it" } else { "them" }
+			),
+		));
+	}
 	let sequences = pg
 		.query(
 			"select a.attname from pg_attribute a left join pg_attrdef d \
@@ -314,9 +353,14 @@ pub async fn check_movable(
 			),
 		));
 	}
+	// With each key's columns on both sides, in order, joined by U+001F.
 	let fks = pg
 		.query(
-			"select c.conname, rn.nspname, r.relname, fn.nspname, f.relname \
+			"select c.conname, rn.nspname, r.relname, fn.nspname, f.relname, \
+			(select string_agg(a.attname, chr(31) order by k.ord) from unnest(c.conkey) with ordinality k(attnum, ord) \
+				join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum), \
+			(select string_agg(a.attname, chr(31) order by k.ord) from unnest(c.confkey) with ordinality k(attnum, ord) \
+				join pg_attribute a on a.attrelid = c.confrelid and a.attnum = k.attnum) \
 			from pg_constraint c \
 			join pg_class r on r.oid = c.conrelid join pg_namespace rn on rn.oid = r.relnamespace \
 			join pg_class f on f.oid = c.confrelid join pg_namespace fn on fn.oid = f.relnamespace \
@@ -334,11 +378,34 @@ pub async fn check_movable(
 			table: text(&r, 4),
 		};
 		let other = if &from == rel { &to } else { &from };
+		let (from_cols, to_cols) = (text(&r, 5), text(&r, 6));
 		if other == rel {
-			continue;
+			// A key to itself holds on each node only when a row references rows of its own key.
+			if joins_on_keys(&from_cols, &to_cols, key, key) {
+				continue;
+			}
+			return Err(OpError::refused(
+				Kind::TableNotShardable,
+				format!(
+					"foreign key {} links rows of {rel} that may have different values of {key}, so they would be on different nodes: include {key} in the key on both sides, or drop the key (L9)",
+					text(&r, 0)
+				),
+			));
 		}
 		let ok = match catalog.relations.get(other) {
-			Some(RelationKind::Sharded { keyspace, .. }) => keyspace == &ks.name,
+			// Colocated only when the key joins this table's distribution key to the other's:
+			// otherwise a row and the row it references hash to different nodes.
+			Some(RelationKind::Sharded {
+				keyspace,
+				key_column,
+			}) => {
+				let (from_key, to_key) = if &from == rel {
+					(key, key_column.as_str())
+				} else {
+					(key_column.as_str(), key)
+				};
+				keyspace == &ks.name && joins_on_keys(&from_cols, &to_cols, from_key, to_key)
+			}
 			Some(RelationKind::Reference) => &from == rel,
 			_ => false,
 		};
@@ -346,7 +413,7 @@ pub async fn check_movable(
 			return Err(OpError::refused(
 				Kind::TableNotShardable,
 				format!(
-					"foreign key {} links {rel} to {other}, which will not be on the same node: colocate {other} in keyspace {}, make it a reference table, or drop the key (L9)",
+					"foreign key {} links {rel} to {other}, which will not be on the same node: colocate {other} in keyspace {} with the key joining the two distribution keys, make it a reference table, or drop the key (L9)",
 					text(&r, 0),
 					ks.name
 				),

@@ -25,9 +25,11 @@ router="$run-router"
 ref="$run-ref"
 # The Phase 1 cluster: its own three nodes, so its catalog never meets the Phase 0 tests.
 cluster=("$run-c1" "$run-c2" "$run-c3")
+# The home node's streaming standby, the read replica of tests/cluster_replica.rs.
+replica="$run-c1r"
 
 cleanup() {
-	"$engine" rm -fv "$pg" "$ref" "$router" "${cluster[@]}" >/dev/null 2>&1 || true
+	"$engine" rm -fv "$pg" "$ref" "$router" "$replica" "${cluster[@]}" >/dev/null 2>&1 || true
 	"$engine" network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -53,11 +55,24 @@ for c in "$pg" "$ref" "${cluster[@]}"; do
 		sleep 2
 	done
 done
+# The home lets its standby in, which copies it (pg_basebackup -R) and streams from it. A standby
+# needs max_prepared_transactions at least the primary's. Its postmaster is not the container's
+# PID 1 (no exec), so tests/cluster_replica.rs can kill it as a crash would.
+"$engine" exec "${cluster[0]}" sh -c 'echo "host replication all all scram-sha-256" >> "$(psql -U postgres -Atc "show hba_file")" && psql -U postgres -Atc "select pg_reload_conf()" >/dev/null'
+"$engine" run -d --name "$replica" --network "$net" --user postgres --entrypoint bash \
+	"docker.io/library/postgres:$major" -c "pg_basebackup -d 'host=${cluster[0]} user=postgres password=x' \
+	-D /tmp/standby -R -X stream -c fast && chmod 700 /tmp/standby \
+	&& postgres -D /tmp/standby -c max_prepared_transactions=64; echo \"the standby exited \$?\"" >/dev/null
+for i in $(seq 1 120); do
+	[ "$("$engine" exec "$replica" psql -U postgres -Atc 'select pg_is_in_recovery()' 2>/dev/null)" = t ] && break
+	[ "$i" = 120 ] && { echo "the home's standby never came up:" >&2; "$engine" logs "$replica" >&2; exit 1; }
+	sleep 1
+done
 
 echo "== cargo tests against postgres:$major" >&2
 if [ -z "${LEPIS_IT_ONLY:-}" ]; then
 STACK_DEV_ARGS="--network $net -e LEPIS_IT_HOME=$pg:5432 -e LEPIS_ORACLE_REFERENCE=$ref:5432" \
-	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test passthrough --test oracle --test unconfirmed -- --test-threads 4
+	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test passthrough --test oracle --test unconfirmed --test follow --test home_passthrough --test copy_router -- --test-threads 4
 fi
 
 # Every tests/cluster*.rs runs here, one binary after another (each redistributes the data it
@@ -70,7 +85,7 @@ for f in "$here"/../tests/cluster*.rs; do
 		cluster_tests+=(--test "$t")
 	fi
 done
-STACK_DEV_ARGS="--network $net -e LEPIS_IT_HOME=${cluster[0]}:5432 -e LEPIS_IT_DATA_NODES=${cluster[1]}:5432,${cluster[2]}:5432 -e LEPIS_ORACLE_REFERENCE=$ref:5432 -e LEPIS_GEN_N -e LEPIS_GEN_SEED -e LEPIS_GEN_ONLY" 	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis "${cluster_tests[@]}" -- --test-threads 1 --nocapture
+STACK_DEV_ARGS="--network $net -e LEPIS_IT_HOME=${cluster[0]}:5432 -e LEPIS_IT_DATA_NODES=${cluster[1]}:5432,${cluster[2]}:5432 -e LEPIS_ORACLE_REFERENCE=$ref:5432 -e LEPIS_IT_HOME_REPLICA=$replica:5432 -e LEPIS_GEN_N -e LEPIS_GEN_SEED -e LEPIS_GEN_ONLY" 	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis "${cluster_tests[@]}" -- --test-threads 1 --nocapture
 if [ -n "${LEPIS_IT_SKIP_PSQL:-}" ]; then
 	exit 0
 fi

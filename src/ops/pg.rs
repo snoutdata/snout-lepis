@@ -89,7 +89,7 @@ impl Target {
 				host: n.host.clone(),
 				port: n.port,
 				sslmode: n.sslmode,
-				ca_file: app.config.home.ca_file.clone(),
+				ca_file: app.config.home().ca_file.clone(),
 			},
 			dbname: n.dbname.clone(),
 		}
@@ -97,8 +97,8 @@ impl Target {
 
 	pub fn home(app: &App) -> Target {
 		Target {
-			label: format!("home ({})", app.config.home),
-			address: app.config.home.clone(),
+			label: format!("home ({})", app.config.home()),
+			address: app.config.home(),
 			dbname: app.config.service.database.clone(),
 		}
 	}
@@ -208,11 +208,8 @@ impl Pg {
 /// subscription). Only ever written into the node's own catalog, never logged.
 pub fn conninfo(app: &Arc<App>, peer_host: &str, n: &Node) -> String {
 	let q = |v: &str| format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'"));
-	let sslmode = match n.sslmode {
-		crate::config::SslMode::Disable => "disable",
-		crate::config::SslMode::Require => "require",
-		crate::config::SslMode::VerifyFull => "verify-full",
-	};
+	// A node's mode is the catalog's (disable, require or verify-full), never verify-ca.
+	let sslmode = n.sslmode.as_str();
 	format!(
 		"host={} port={} dbname={} user={} password={} sslmode={sslmode} application_name={}",
 		q(peer_host),

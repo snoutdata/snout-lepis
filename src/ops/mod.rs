@@ -22,6 +22,8 @@
 
 pub mod advisor;
 pub mod attach;
+pub mod auto;
+pub mod autopilot;
 pub mod engine;
 pub mod failover;
 pub mod pg;

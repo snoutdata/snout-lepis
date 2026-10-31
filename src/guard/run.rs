@@ -199,8 +199,186 @@ pub fn timeout_settings(lease_ms: u64) -> [(&'static str, String); 3] {
 	]
 }
 
+/// Whether `action` is a call to the witness (the rest act on this copy alone).
+pub fn calls_witness(action: Action) -> bool {
+	matches!(action, Action::Renew | Action::Eligible(_) | Action::Ask)
+}
+
+/// A tick's actions as the runner takes them: what acts on this copy first, then the calls to the
+/// witness, each kind in `decide`'s order. A call can take a quarter lease to give up on a silent
+/// witness, and a fence decided in the same tick must not wait for it (the 2026-10-26 network cut
+/// fenced at +9 s behind two such calls); and after one unanswered call the tick makes no more.
+pub fn in_tick_order(actions: Vec<Action>) -> Vec<Action> {
+	let (calls, local): (Vec<Action>, Vec<Action>) =
+		actions.into_iter().partition(|a| calls_witness(*a));
+	local.into_iter().chain(calls).collect()
+}
+
+/// How long a renewal may wait for the witness: a quarter lease, but never past the moment this
+/// copy's own lease runs out (half a lease after the last renewal accepted, `decide`), less a
+/// floor of a twentieth, so the decision that fences comes then and not a call's timeout later.
+pub fn renew_wait_ms(now: u64, renewed_at: Option<u64>, lease_ms: u64) -> u64 {
+	let quarter = lease_ms / 4;
+	match renewed_at {
+		Some(t) => (t + lease_ms / 2)
+			.saturating_sub(now)
+			.clamp(lease_ms / 20, quarter.max(lease_ms / 20)),
+		None => quarter,
+	}
+}
+
+/// The standby's stream, from one reading of its receiver's `age` (since the last message, `None`
+/// with no receiver streaming): since when it has been gone, and when the last message came. Gone
+/// counts from that last message, not from when the receiver gave up (`wal_receiver_timeout`, half
+/// a lease later): a silent cut lost the stream at the cut, and was granted at +15.7 s for it.
+pub fn stream_gone(
+	gone_since: Option<u64>,
+	last_receipt: Option<u64>,
+	age: Option<u64>,
+	now: u64,
+) -> (Option<u64>, Option<u64>) {
+	match age {
+		Some(a) => (None, Some(now.saturating_sub(a))),
+		None => (
+			Some(gone_since.or(last_receipt).unwrap_or(now)),
+			last_receipt,
+		),
+	}
+}
+
 fn sql_literal(s: &str) -> String {
 	format!("'{}'", s.replace('\'', "''"))
+}
+
+/// `archive_command` as the guard reads it: empty when `archive_mode` is off, where Postgres shows
+/// it as `(disabled)` whatever it holds, so a copy that archives nothing is never "guarded".
+macro_rules! archive_command_sql {
+	() => {
+		"CASE WHEN current_setting('archive_mode') = 'off' THEN '' \
+		 ELSE current_setting('archive_command') END"
+	};
+}
+
+/// The guard a fenced primary's `archive_command` carries, before the command it had: the shell
+/// archives a file only when its name sorts before the segment holding the standby's last flush.
+/// Every segment before that one the standby has whole, so nothing past the fork reaches the
+/// archive, where an archive-fed standby would replay it and never reach the new timeline (the
+/// 2026-10-26 network cut). The `x` keeps `expr` from reading two all-digit names
+/// as numbers, and `LC_ALL=C` makes the order bytewise (WAL names are fixed-width hex).
+const ARCHIVE_GUARD_HEAD: &str = "LC_ALL=C expr \"x%f\" \"<\" \"x";
+const ARCHIVE_GUARD_TAIL: &str = "\" >/dev/null && ";
+
+/// The bound a fence gives the archive: the WAL file name holding the standby's last flush, or,
+/// with no flush ever seen or a name that is not one, `0`, which every file name sorts after, so
+/// nothing more is archived. A stale flush is an earlier segment: it archives less, never more.
+pub fn archive_bound(walfile: Option<&str>) -> String {
+	match walfile {
+		Some(n)
+			if n.len() == 24
+				&& n.bytes()
+					.all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)) =>
+		{
+			n.to_string()
+		}
+		_ => "0".to_string(),
+	}
+}
+
+/// `command` with the fence's guard at `bound` in front (any guard it had replaced).
+pub fn fence_archive_command(command: &str, bound: &str) -> String {
+	format!(
+		"{ARCHIVE_GUARD_HEAD}{bound}{ARCHIVE_GUARD_TAIL}{}",
+		unfence_archive_command(command)
+	)
+}
+
+/// `command` without the fence's guard: the command it had before the fence.
+pub fn unfence_archive_command(command: &str) -> &str {
+	let Some(rest) = command.strip_prefix(ARCHIVE_GUARD_HEAD) else {
+		return command;
+	};
+	let bound = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
+	rest[bound..]
+		.strip_prefix(ARCHIVE_GUARD_TAIL)
+		.unwrap_or(command)
+}
+
+pub fn archive_is_fenced(command: &str) -> bool {
+	unfence_archive_command(command) != command
+}
+
+/// What a promotion's `restore_command` carries in front of the command it had, from the reload
+/// before `pg_promote` until it returns. Ending recovery asks the archive for a file five times
+/// (the WAL segment past the stream twice, the next timeline's history twice, the current one's
+/// once), and with pgBackRest reading S3 each miss is most of a second: the 4.1 s promotion of the
+/// 2026-10-26 drill, where 0.16 s is Postgres's own. A segment is refused at once: the stream had
+/// every acknowledged commit, and a fenced primary archives nothing past the standby's flush. A
+/// history file `pg_wal` has is refused too, since Postgres then reads its own copy, which is what
+/// it does when the archive misses. A history file `pg_wal` lacks still goes to the archive, so a
+/// timeline another copy took there is never chosen again.
+const RESTORE_GUARD: &str =
+	"case \"%f\" in *.history) [ -f \"pg_wal/%f\" ] && exit 1;; *) exit 1;; esac; ";
+
+/// `command` with the promotion's guard in front (any guard it had replaced).
+pub fn promote_restore_command(command: &str) -> String {
+	format!("{RESTORE_GUARD}{}", plain_restore_command(command))
+}
+
+/// `command` without the promotion's guard: the command it had.
+pub fn plain_restore_command(command: &str) -> &str {
+	command.strip_prefix(RESTORE_GUARD).unwrap_or(command)
+}
+
+/// The completed segments of the timeline just left, among `pg_wal`'s file names, for a copy now
+/// on `timeline` (hex, as in a WAL file name). A promoted standby archives none of what it
+/// received (`archive_mode = on`), and a fenced primary held back whatever it had not archived
+/// yet, so these may be missing from the archive. Pushing one already there is harmless: the
+/// archiver refuses only a different file under the same name, which is a branch.
+pub fn left_timeline_segments<'a>(timeline: &str, names: &[&'a str]) -> Vec<&'a str> {
+	let Ok(now) = u32::from_str_radix(timeline, 16) else {
+		return Vec::new();
+	};
+	// Timelines start at 1: the first has none before it.
+	let Some(left) = now.checked_sub(1).filter(|t| *t >= 1) else {
+		return Vec::new();
+	};
+	let prefix = format!("{left:08X}");
+	let mut out: Vec<&str> = names
+		.iter()
+		.copied()
+		.filter(|n| {
+			n.len() == 24 && n.starts_with(&prefix) && n.bytes().all(|b| b.is_ascii_hexdigit())
+		})
+		.collect();
+	out.sort_unstable();
+	out
+}
+
+/// One shell script running `command` (an `archive_command`, `%p`, `%f` and `%%` as Postgres
+/// expands them, from the data directory) for each of `names`, printing `pushed <name>` or
+/// `failed <name>` for each.
+pub fn push_script(command: &str, names: &[&str]) -> String {
+	let mut cmd = String::new();
+	let mut chars = command.chars();
+	while let Some(c) = chars.next() {
+		match (c, c == '%') {
+			(_, true) => match chars.next() {
+				Some('p') => cmd.push_str("\"pg_wal/$f\""),
+				Some('f') => cmd.push_str("\"$f\""),
+				Some('%') => cmd.push('%'),
+				Some(other) => {
+					cmd.push('%');
+					cmd.push(other);
+				}
+				None => cmd.push('%'),
+			},
+			_ => cmd.push(c),
+		}
+	}
+	format!(
+		"for f in {}; do if ( {cmd} ) >/dev/null 2>&1; then echo \"pushed $f\"; else echo \"failed $f\"; fi; done",
+		names.join(" ")
+	)
 }
 
 /// The state file: the epoch, the only memory a guard keeps across a restart.
@@ -298,6 +476,56 @@ async fn sync_barrier(cfg: GuardConfig, expect: String) -> Result<u64, String> {
 	Ok(lsn(rows.first().map(|r| &r[0])))
 }
 
+/// After a promotion: the timeline just left, pushed to the archive with the copy's own
+/// `archive_command`, from its own data directory (`COPY ... FROM PROGRAM`, as the guard's
+/// superuser), so a segment the old primary never archived (a fence holds back everything from
+/// the segment its standby was in) is not missing from the archive. Returns how many were pushed
+/// and the names that failed.
+async fn push_left_timeline(
+	cfg: GuardConfig,
+	command: String,
+) -> Result<(usize, Vec<String>), String> {
+	let mut b = pg_connect(&cfg).await?;
+	let found = b
+		.query(
+			"SELECT substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8), \
+			 coalesce((SELECT string_agg(name, ' ') FROM pg_ls_waldir()), '')",
+			&[],
+		)
+		.await
+		.map_err(pg_error)?;
+	let row = found.first().ok_or("no row")?;
+	let timeline = row[0].clone().unwrap_or_default();
+	let all = row[1].clone().unwrap_or_default();
+	let names: Vec<&str> = all.split_whitespace().collect();
+	let left = left_timeline_segments(&timeline, &names);
+	if left.is_empty() {
+		b.close().await;
+		return Ok((0, Vec::new()));
+	}
+	b.simple("CREATE TEMP TABLE lepis_pushed (line text)")
+		.await
+		.map_err(pg_error)?;
+	b.simple(&format!(
+		"COPY lepis_pushed FROM PROGRAM {}",
+		sql_literal(&push_script(&command, &left))
+	))
+	.await
+	.map_err(pg_error)?;
+	let lines = b
+		.query("SELECT line FROM lepis_pushed", &[])
+		.await
+		.map_err(pg_error)?;
+	b.close().await;
+	let lines: Vec<String> = lines.iter().filter_map(|r| r[0].clone()).collect();
+	let pushed = lines.iter().filter(|l| l.starts_with("pushed ")).count();
+	let failed = lines
+		.iter()
+		.filter_map(|l| l.strip_prefix("failed ").map(str::to_string))
+		.collect();
+	Ok((pushed, failed))
+}
+
 /// One HTTP/1.1 request to the witness, read to the close.
 async fn http(
 	at: &NodeAddress,
@@ -351,7 +579,9 @@ async fn http(
 	Ok((status, body))
 }
 
-/// What the status file says, for the host agent and the CLI.
+/// What the status file says, for the host agent and the CLI. A contract: the host agent
+/// (`snoutpod/src/host/guard.ts`, `parseGuardStatus`) and snout-metis (which takes the primary's
+/// region from it) read these field names and values, so a change here is a change there.
 fn status_json(g: &Guard, pg: &Postgres, now: u64) -> Value {
 	let (role, names, standby) = match pg {
 		Postgres::Down => ("down", None, None),
@@ -366,12 +596,20 @@ fn status_json(g: &Guard, pg: &Postgres, now: u64) -> Value {
 			Some(standby.is_some_and(|s| s.reply_age_ms < g.lease_ms / 2)),
 		),
 	};
+	let archive = match pg {
+		Postgres::Primary {
+			archive_fenced: Some(fenced),
+			..
+		} => Some(if *fenced { "fenced" } else { "open" }),
+		_ => None,
+	};
 	json!({
 		"copy": g.cfg.copy,
 		"cluster": g.cfg.cluster,
 		"role": role,
 		"synchronous": names,
 		"standby_up": standby,
+		"archive": archive,
 		"epoch": g.mem.epoch,
 		"eligible": g.mem.eligible,
 		"demoted": g.mem.demoted,
@@ -391,6 +629,13 @@ struct Guard {
 	reply: Option<(String, u64)>,
 	/// Since when the standby has heard nothing (its stream gone), on this guard's clock.
 	stream_gone_since: Option<u64>,
+	/// Standby: when the last message from the primary arrived, as last read while it streamed.
+	last_receipt_at: Option<u64>,
+	/// This tick: a call to the witness went unanswered, so no more are made until the next.
+	witness_silent: bool,
+	/// Primary: the highest flush its standby has reported (`pg_stat_replication`), kept after the
+	/// standby's row is gone. What `FenceArchive` lets the archive have.
+	last_flush: Option<u64>,
 	/// Bumped by every change to `synchronous_standby_names`, so a barrier that finishes after a
 	/// later change is thrown away.
 	names_generation: u64,
@@ -451,9 +696,12 @@ impl Guard {
 	async fn read(&mut self, now: u64) -> Result<Postgres, String> {
 		let head = self
 			.rows(
-				"SELECT pg_is_in_recovery()::text, current_setting('synchronous_standby_names'), \
-				 CASE WHEN pg_is_in_recovery() THEN NULL \
-				 ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::text END",
+				concat!(
+					"SELECT pg_is_in_recovery()::text, current_setting('synchronous_standby_names'), \
+					 CASE WHEN pg_is_in_recovery() THEN NULL \
+					 ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::text END, ",
+					archive_command_sql!()
+				),
 				&[],
 			)
 			.await?;
@@ -472,10 +720,8 @@ impl Guard {
 				.and_then(|r| r[0].as_deref())
 				.and_then(|s| s.parse::<i64>().ok())
 				.map(|ms| ms.max(0) as u64);
-			self.stream_gone_since = match age {
-				Some(_) => None,
-				None => Some(self.stream_gone_since.unwrap_or(now)),
-			};
+			(self.stream_gone_since, self.last_receipt_at) =
+				stream_gone(self.stream_gone_since, self.last_receipt_at, age, now);
 			return Ok(Postgres::Standby {
 				receive_age_ms: age,
 			});
@@ -497,6 +743,12 @@ impl Guard {
 				&[&peer],
 			)
 			.await?;
+		// The standby's flush as last read, kept when its row goes: what a fence lets the archive have.
+		// Flush only moves forward, so an old reading is a lower bound, never past the fork.
+		if let Some(r) = rep.first() {
+			let flush = lsn(r.get(1));
+			self.last_flush = Some(self.last_flush.map_or(flush, |f| f.max(flush)));
+		}
 		let standby = match rep.first() {
 			Some(r) if names.is_some() => {
 				let reply = r[2].clone().unwrap_or_default();
@@ -518,10 +770,12 @@ impl Guard {
 				None
 			}
 		};
+		let archive = row.get(3).cloned().flatten().unwrap_or_default();
 		Ok(Postgres::Primary {
 			names: names.unwrap_or(SyncNames::Standby),
 			standby,
 			lsn: current,
+			archive_fenced: (!archive.trim().is_empty()).then(|| archive_is_fenced(&archive)),
 		})
 	}
 
@@ -535,7 +789,10 @@ impl Guard {
 			self.cfg.token,
 			body.len()
 		);
-		let wait = Duration::from_millis(self.lease_ms / 4);
+		let wait = Duration::from_millis(match &call {
+			Call::Renew { .. } => renew_wait_ms(sent, self.mem.renewed_at, self.lease_ms),
+			_ => self.lease_ms / 4,
+		});
 		let got = tokio::time::timeout(
 			wait,
 			http(&self.cfg.witness, self.witness_tls.as_ref(), request),
@@ -553,6 +810,7 @@ impl Guard {
 				return None;
 			}
 			Err(m) => {
+				self.witness_silent = true;
 				self.trouble(m);
 				return None;
 			}
@@ -629,6 +887,72 @@ impl Guard {
 			self.run_sql(&sql).await?;
 		}
 		self.run_sql("SELECT pg_reload_conf()").await
+	}
+
+	/// `archive_command` now, and its `pg_settings.context`.
+	async fn archive_command(&mut self) -> Result<(String, Option<String>), String> {
+		let r = self
+			.rows(
+				concat!(
+					"SELECT ",
+					archive_command_sql!(),
+					", (SELECT context FROM pg_settings WHERE name = 'archive_command')"
+				),
+				&[],
+			)
+			.await?;
+		let row = r.first().ok_or("no row")?;
+		Ok((row[0].clone().unwrap_or_default(), row[1].clone()))
+	}
+
+	/// `restore_command` now, and its `pg_settings.context` (`sighup` since Postgres 14).
+	async fn restore_command(&mut self) -> Result<(String, Option<String>), String> {
+		let r = self
+			.rows(
+				"SELECT current_setting('restore_command'), \
+				 (SELECT context FROM pg_settings WHERE name = 'restore_command')",
+				&[],
+			)
+			.await?;
+		let row = r.first().ok_or("no row")?;
+		Ok((row[0].clone().unwrap_or_default(), row[1].clone()))
+	}
+
+	/// `restore_command` back as it was, wherever a promotion's guard is left on it (a promotion
+	/// that ended, or a guard that stopped in the middle of one). Best effort: a failure is logged,
+	/// and the guard only refuses archive reads, never a write.
+	async fn restore_plain(&mut self) {
+		match self.restore_command().await {
+			Ok((command, context)) if plain_restore_command(&command) != command => {
+				let plain = plain_restore_command(&command).to_string();
+				if context.as_deref() != Some("sighup") {
+					self.trouble(format!(
+						"restore_command takes {context:?} here, not a reload: the promotion's guard is left on it"
+					));
+				} else if let Err(m) = self.set(&[("restore_command", Some(plain))]).await {
+					self.trouble(format!("restore_command could not be put back: {m}"));
+				}
+			}
+			Ok(_) => {}
+			Err(m) => self.trouble(format!("restore_command could not be read: {m}")),
+		}
+	}
+
+	/// `archive_command` set by a reload, never a restart: refused unless Postgres says a reload
+	/// applies it (`sighup`, as it has since 8.3). An error leaves everything else as it was, the
+	/// fence included, and the next tick reads the command again and tries again.
+	async fn set_archive(&mut self, command: &str, context: Option<&str>) -> Result<(), String> {
+		// Nothing archives (or archiving went off since the reading): nothing to guard or open.
+		if unfence_archive_command(command).trim().is_empty() {
+			return Ok(());
+		}
+		if context != Some("sighup") {
+			return Err(format!(
+				"archive_command takes {context:?} here, not a reload: left as it is"
+			));
+		}
+		self.set(&[("archive_command", Some(command.to_string()))])
+			.await
 	}
 
 	async fn act(&mut self, action: Action, pg: &Postgres) -> Result<(), String> {
@@ -708,31 +1032,111 @@ impl Guard {
 				.await?;
 				tracing::info!("unfenced: commits wait for the standby");
 			}
+			Action::FenceArchive => {
+				let flush = self
+					.last_flush
+					.map(|l| format!("{:X}/{:X}", l >> 32, l & 0xffff_ffff))
+					.unwrap_or_default();
+				let r = self
+					.rows(
+						concat!(
+							"SELECT ",
+							archive_command_sql!(),
+							", (SELECT context FROM pg_settings WHERE name = 'archive_command'), \
+							 CASE WHEN $1 = '' THEN NULL ELSE pg_walfile_name($1::pg_lsn) END"
+						),
+						&[&flush],
+					)
+					.await?;
+				let row = r.first().ok_or("no row")?;
+				let (command, context) = (row[0].clone().unwrap_or_default(), row[1].clone());
+				let bound = archive_bound(row[2].as_deref());
+				self.set_archive(&fence_archive_command(&command, &bound), context.as_deref())
+					.await?;
+				tracing::warn!(
+					%bound,
+					"the archive fenced too: only segments before the standby's last flush"
+				);
+			}
+			Action::UnfenceArchive => {
+				let (command, context) = self.archive_command().await?;
+				self.set_archive(unfence_archive_command(&command), context.as_deref())
+					.await?;
+				tracing::info!("the archive is open again");
+			}
+			// Out of recovery while still holding the grant: the promotion outlasted
+			// `pg_promote`'s wait (half a lease) below and finished since. Recorded now, as an
+			// answer in time would have been (`decide`).
+			Action::Promote(epoch) if matches!(pg, Postgres::Primary { .. }) => {
+				let (command, _) = self.archive_command().await?;
+				tracing::warn!(epoch, "the promotion finished after pg_promote's wait");
+				self.promoted(epoch, unfence_archive_command(&command).to_string());
+			}
 			Action::Promote(epoch) => {
-				self.set(&[
+				// The archive opened in the same reload: a copy fenced as a primary once, and a
+				// standby since, may still carry the guard, and the new timeline sorts past its bound.
+				let (command, context) = self.archive_command().await?;
+				let open = unfence_archive_command(&command).to_string();
+				let mut settings = vec![
 					("synchronous_standby_names", Some(String::new())),
 					("default_transaction_read_only", None),
-				])
-				.await?;
+				];
+				if open != command && context.as_deref() == Some("sighup") {
+					settings.push(("archive_command", Some(open.clone())));
+				}
+				// And the archive asked only for what a promotion cannot do without (RESTORE_GUARD).
+				let (restore, restore_context) = self.restore_command().await?;
+				if !plain_restore_command(&restore).trim().is_empty()
+					&& restore_context.as_deref() == Some("sighup")
+				{
+					settings.push(("restore_command", Some(promote_restore_command(&restore))));
+				}
+				self.set(&settings).await?;
 				let wait = (self.lease_ms / 2000).max(1).to_string();
 				let done = self
 					.rows("SELECT pg_promote(true, $1::int)::text", &[&wait])
 					.await;
+				// Whatever it answered: a promotion still under way reads the archive as before.
+				self.restore_plain().await;
 				match done {
 					// A promotion already under way refuses a second one; the next tick sees which.
 					Ok(r) if r.first().and_then(|r| r[0].as_deref()) == Some("true") => {
-						self.mem = Memory::promoted(epoch, self.asked_at);
-						self.reply = None;
-						self.names_generation += 1;
-						tracing::warn!(epoch, "promoted: this copy is the primary");
-						self.hook(&self.cfg.on_promote.clone(), "promote");
+						self.promoted(epoch, open);
 					}
+					// Still under way: the grant is kept, and the tick that finds the copy out of
+					// recovery records it (the arm above).
 					Ok(_) => return Err("pg_promote did not finish in time".into()),
 					Err(m) => return Err(format!("pg_promote: {m}")),
 				}
 			}
 		}
 		Ok(())
+	}
+
+	/// The promotion at `epoch` is done: remember it, run `on_promote`, and push what the archive
+	/// is missing of the timeline left (`open` is the unguarded `archive_command`).
+	fn promoted(&mut self, epoch: u64, open: String) {
+		self.mem = Memory::promoted(epoch, self.asked_at);
+		self.reply = None;
+		self.names_generation += 1;
+		tracing::warn!(epoch, "promoted: this copy is the primary");
+		self.hook(&self.cfg.on_promote.clone(), "promote");
+		if !open.trim().is_empty() {
+			let cfg = self.cfg.clone();
+			tokio::spawn(async move {
+				match push_left_timeline(cfg, open).await {
+					Ok((pushed, failed)) if failed.is_empty() => {
+						tracing::info!(pushed, "the timeline left is in the archive")
+					}
+					Ok((pushed, failed)) => tracing::warn!(
+						pushed,
+						?failed,
+						"segments of the timeline left could not be archived"
+					),
+					Err(m) => tracing::warn!("archiving the timeline left: {m}"),
+				}
+			});
+		}
 	}
 
 	/// Starts the barrier when the standby is named and its starting LSN is unknown, and takes the
@@ -818,11 +1222,30 @@ impl Guard {
 		}
 		self.barrier(&pg).await;
 		let mut failed = false;
-		for action in decide(now, self.lease_ms, pg, &self.mem) {
+		self.witness_silent = false;
+		let granted_before = self.mem.granted;
+		for action in in_tick_order(decide(now, self.lease_ms, pg, &self.mem)) {
+			if self.witness_silent && calls_witness(action) {
+				continue;
+			}
 			if let Err(m) = self.act(action, &pg).await {
 				self.trouble(format!("{action:?}: {m}"));
 				failed = true;
 				break;
+			}
+		}
+		// A grant that came in this tick is acted on in it, as the next tick's `decide` would (a
+		// standby holding a grant is promoted, whatever else it reads), a tick sooner: a second of
+		// the live drill's 4.1 s from the grant to the promotion.
+		if !failed
+			&& granted_before.is_none()
+			&& matches!(pg, Postgres::Standby { .. })
+			&& let Some(epoch) = self.mem.granted
+		{
+			let action = Action::Promote(epoch);
+			if let Err(m) = self.act(action, &pg).await {
+				self.trouble(format!("{action:?}: {m}"));
+				failed = true;
 			}
 		}
 		if !failed && self.last_error.is_some() && !matches!(pg, Postgres::Down) {
@@ -856,6 +1279,9 @@ pub async fn run_guard(cfg: GuardConfig) -> Result<(), String> {
 		pg: None,
 		reply: None,
 		stream_gone_since: None,
+		last_receipt_at: None,
+		witness_silent: false,
+		last_flush: None,
 		names_generation: 0,
 		barrier: None,
 		asked_at: 0,
@@ -864,7 +1290,12 @@ pub async fn run_guard(cfg: GuardConfig) -> Result<(), String> {
 	};
 	tracing::info!(copy = %g.cfg.copy, cluster = %g.cfg.cluster, epoch, witness = %g.cfg.witness, "snout-lepis guard starting");
 	let now = g.now();
-	if let Postgres::Primary { .. } = g.facts(now).await {
+	let pg = g.facts(now).await;
+	// A guard stopped between a promotion's reload and its end left RESTORE_GUARD on: off it comes.
+	if !matches!(pg, Postgres::Down) {
+		g.restore_plain().await;
+	}
+	if let Postgres::Primary { .. } = pg {
 		let copy = g.cfg.copy.clone();
 		g.call(Call::Renew { copy, epoch }, true).await;
 	}
@@ -935,6 +1366,293 @@ mod tests {
 		// A keeper could stand in for the standby: never read as the standby alone.
 		assert_eq!(names_of("FIRST 1 (toronto, keeper)", "toronto"), None);
 		assert_eq!(names_of("*", "toronto"), None);
+	}
+
+	const PUSH: &str = "snoutpod-pgbackrest archive-push %p";
+
+	/// What the archiver runs for `name`: `command` with `%p` and `%f` expanded as Postgres does,
+	/// run by `sh` in `dir`; its output.
+	fn archiver(command: &str, name: &str, dir: &Path) -> String {
+		let cmd = command
+			.replace("%p", &format!("pg_wal/{name}"))
+			.replace("%f", name);
+		let out = std::process::Command::new("sh")
+			.arg("-c")
+			.arg(&cmd)
+			.current_dir(dir)
+			.output()
+			.expect("sh runs");
+		String::from_utf8_lossy(&out.stdout).trim().to_string()
+	}
+
+	fn archived<'a>(command: &str, names: &[&'a str]) -> Vec<&'a str> {
+		let dir = std::env::temp_dir();
+		names
+			.iter()
+			.copied()
+			.filter(|n| archiver(command, n, &dir) == format!("archived {n}"))
+			.collect()
+	}
+
+	const GET: &str = "snoutpod-pgbackrest archive-get %f \"%p\"";
+
+	/// What a promotion's `restore_command` does for `name` in a data directory whose `pg_wal`
+	/// holds `local`: whether it found the file, and what the command it had was asked.
+	fn restored(command: &str, name: &str, local: &[&str]) -> (bool, String) {
+		let dir = std::env::temp_dir().join(format!("lepis-restore-{}-{name}", std::process::id()));
+		std::fs::create_dir_all(dir.join("pg_wal")).unwrap();
+		for f in local {
+			std::fs::write(dir.join("pg_wal").join(f), "").unwrap();
+		}
+		let out = std::process::Command::new("sh")
+			.arg("-c")
+			.arg(
+				command
+					.replace("%p", "pg_wal/RECOVERYXLOG")
+					.replace("%f", name),
+			)
+			.current_dir(&dir)
+			.output()
+			.expect("sh runs");
+		std::fs::remove_dir_all(&dir).unwrap();
+		(
+			out.status.success(),
+			String::from_utf8_lossy(&out.stdout).trim().to_string(),
+		)
+	}
+
+	#[test]
+	fn a_promotion_asks_the_archive_only_for_a_timeline_it_has_not_seen() {
+		// The 2026-10-26 drill's promoted copy: on timeline 3, its history in pg_wal.
+		let guarded = promote_restore_command("echo asked %f");
+		let local = ["00000003.history", "000000030000001B000000D2"];
+		// Segments: never asked, whether pg_wal has them or not.
+		for seg in ["000000030000001B000000D3", "000000030000001B000000D2"] {
+			assert_eq!(
+				restored(&guarded, seg, &local),
+				(false, String::new()),
+				"{seg}"
+			);
+		}
+		// Its own timeline's history: Postgres reads pg_wal's copy.
+		assert_eq!(
+			restored(&guarded, "00000003.history", &local),
+			(false, String::new())
+		);
+		// The next timeline's: still asked, so one another copy took is never chosen again.
+		assert_eq!(
+			restored(&guarded, "00000004.history", &local),
+			(true, "asked 00000004.history".to_string())
+		);
+		// Unguarded, everything is asked, as before.
+		assert_eq!(
+			restored("echo asked %f", "000000030000001B000000D3", &local).1,
+			"asked 000000030000001B000000D3"
+		);
+		// On and off, never stacked, and nothing else is touched by the strip.
+		assert_eq!(plain_restore_command(&promote_restore_command(GET)), GET);
+		let twice = promote_restore_command(&promote_restore_command(GET));
+		assert_eq!(twice.matches("case").count(), 1);
+		assert_eq!(plain_restore_command(GET), GET);
+		assert_eq!(plain_restore_command(""), "");
+	}
+
+	#[test]
+	fn the_fence_guard_goes_on_and_comes_off_the_command_it_had() {
+		let fenced = fence_archive_command(PUSH, "000000030000001B000000D2");
+		assert!(archive_is_fenced(&fenced));
+		assert_eq!(unfence_archive_command(&fenced), PUSH);
+		// A second fence moves the bound; it never stacks a second guard.
+		let again = fence_archive_command(&fenced, "000000030000001B000000D4");
+		assert_eq!(again.matches("expr").count(), 1);
+		assert!(again.contains("x000000030000001B000000D4"));
+		assert_eq!(unfence_archive_command(&again), PUSH);
+		// The command as it was is never touched by the strip, nor anything that only looks close.
+		assert!(!archive_is_fenced(PUSH));
+		assert_eq!(unfence_archive_command(PUSH), PUSH);
+		let near = "LC_ALL=C expr \"x%f\" \"<\" \"x0\" && something";
+		assert_eq!(unfence_archive_command(near), near);
+		assert_eq!(
+			archive_bound(Some("000000030000001B000000D2")),
+			"000000030000001B000000D2"
+		);
+		for odd in [
+			None,
+			Some(""),
+			Some("00000003.history"),
+			Some("000000030000001b000000d2"),
+		] {
+			assert_eq!(archive_bound(odd), "0");
+		}
+	}
+
+	#[test]
+	fn a_fenced_primary_archives_nothing_past_the_fork() {
+		// The 2026-10-26 cut: the standby's last flush in D2, the fenced copy writing on into D4.
+		let fenced = fence_archive_command("echo archived %f", "000000030000001B000000D2");
+		let pg_wal = [
+			"000000030000001B000000D0",
+			"000000030000001B000000D1",
+			"000000030000001B000000D2",
+			"000000030000001B000000D3",
+			"000000030000001B000000D4",
+		];
+		assert_eq!(
+			archived(&fenced, &pg_wal),
+			["000000030000001B000000D0", "000000030000001B000000D1"]
+		);
+		// All-digit names are compared as strings, not numbers; a later timeline sorts after.
+		let digits = fence_archive_command("echo archived %f", "000000030000002000000010");
+		assert_eq!(
+			archived(
+				&digits,
+				&[
+					"000000030000002000000009",
+					"000000030000002000000011",
+					"000000040000002000000001"
+				]
+			),
+			["000000030000002000000009"]
+		);
+		// No flush ever seen: nothing more at all.
+		let blind = fence_archive_command("echo archived %f", &archive_bound(None));
+		assert!(archived(&blind, &pg_wal).is_empty());
+		assert!(archived(&blind, &["00000003.history"]).is_empty());
+		// Open again, the command as it was archives everything.
+		assert_eq!(archived(unfence_archive_command(&fenced), &pg_wal), pg_wal);
+	}
+
+	#[test]
+	fn a_stale_flush_archives_less_and_the_promotion_pushes_what_it_held_back() {
+		// The last reading said D1; the standby had really flushed into D2. Whole and before the
+		// fork, D1 is then held back too: less, never more.
+		let pg_wal = [
+			"000000030000001B000000D0",
+			"000000030000001B000000D1",
+			"000000030000001B000000D2",
+			"000000030000001B000000D3",
+		];
+		let stale = archived(
+			&fence_archive_command("echo archived %f", "000000030000001B000000D1"),
+			&pg_wal,
+		);
+		let fresh = archived(
+			&fence_archive_command("echo archived %f", "000000030000001B000000D2"),
+			&pg_wal,
+		);
+		assert_eq!(stale, ["000000030000001B000000D0"]);
+		assert!(stale.iter().all(|n| fresh.contains(n)));
+		assert!(
+			!stale.contains(&"000000030000001B000000D1")
+				&& fresh.contains(&"000000030000001B000000D1")
+		);
+		// The promoted standby holds D1 whole (and the fork's segment only as its new timeline's
+		// copy and a .partial): its push after the promotion takes D1, and nothing past the fork.
+		let promoted = [
+			"000000030000001B000000D0",
+			"000000030000001B000000D1",
+			"000000030000001B000000D2.partial",
+			"00000004.history",
+			"000000040000001B000000D2",
+			"000000040000001B000000D3",
+			"000000020000001A000000EB",
+		];
+		assert_eq!(
+			left_timeline_segments("00000004", &promoted),
+			["000000030000001B000000D0", "000000030000001B000000D1"]
+		);
+		assert!(left_timeline_segments("00000001", &["000000000000000000000001"]).is_empty());
+		assert!(left_timeline_segments("zz", &promoted).is_empty());
+	}
+
+	#[test]
+	fn the_promotion_push_runs_the_archive_command_from_the_data_directory() {
+		let dir = std::env::temp_dir().join(format!("lepis-push-{}", std::process::id()));
+		std::fs::create_dir_all(dir.join("pg_wal")).expect("dir");
+		std::fs::write(dir.join("pg_wal/000000030000001B000000D0"), "wal").expect("file");
+		let command = "test -f %p && echo %f 100%% >> pushed.txt";
+		let script = push_script(
+			command,
+			&["000000030000001B000000D0", "000000030000001B000000D1"],
+		);
+		let out = std::process::Command::new("sh")
+			.arg("-c")
+			.arg(&script)
+			.current_dir(&dir)
+			.output()
+			.expect("sh runs");
+		let lines = String::from_utf8_lossy(&out.stdout).to_string();
+		assert_eq!(
+			lines.lines().collect::<Vec<_>>(),
+			[
+				"pushed 000000030000001B000000D0",
+				"failed 000000030000001B000000D1"
+			]
+		);
+		assert_eq!(
+			std::fs::read_to_string(dir.join("pushed.txt"))
+				.expect("pushed")
+				.trim(),
+			"000000030000001B000000D0 100%"
+		);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn a_fence_never_waits_behind_a_call_to_the_witness() {
+		assert_eq!(
+			in_tick_order(vec![Action::Renew, Action::Fence, Action::FenceArchive]),
+			[Action::Fence, Action::FenceArchive, Action::Renew]
+		);
+		assert_eq!(
+			in_tick_order(vec![Action::Renew, Action::Eligible(false)]),
+			[Action::Renew, Action::Eligible(false)]
+		);
+		assert_eq!(
+			in_tick_order(vec![Action::Renew, Action::Unfence, Action::UnfenceArchive]),
+			[Action::Unfence, Action::UnfenceArchive, Action::Renew]
+		);
+		assert!(calls_witness(Action::Ask) && !calls_witness(Action::Promote(2)));
+	}
+
+	#[test]
+	fn a_renewal_waits_no_longer_than_the_lease_it_would_keep() {
+		const L: u64 = 10_000;
+		// Just renewed: a quarter lease, as before.
+		assert_eq!(renew_wait_ms(100, Some(0), L), 2_500);
+		// A second of the lease left: a second, so the next decision comes when it runs out.
+		assert_eq!(renew_wait_ms(4_000, Some(0), L), 1_000);
+		// Run out already: the floor, a twentieth.
+		assert_eq!(renew_wait_ms(6_000, Some(0), L), 500);
+		// Never renewed: a quarter lease.
+		assert_eq!(renew_wait_ms(6_000, None, L), 2_500);
+	}
+
+	#[test]
+	fn a_lost_stream_counts_from_the_last_message_not_from_the_receiver_giving_up() {
+		// Streaming, the last message 300 ms ago.
+		assert_eq!(stream_gone(None, None, Some(300), 1_000), (None, Some(700)));
+		// The receiver gave up at wal_receiver_timeout: gone since the message at 700.
+		assert_eq!(
+			stream_gone(None, Some(700), None, 6_000),
+			(Some(700), Some(700))
+		);
+		// And it stays that, reading after reading.
+		assert_eq!(
+			stream_gone(Some(700), Some(700), None, 9_000),
+			(Some(700), Some(700))
+		);
+		// Back, then gone again: from the newer message.
+		assert_eq!(
+			stream_gone(Some(700), Some(700), Some(0), 20_000),
+			(None, Some(20_000))
+		);
+		assert_eq!(
+			stream_gone(None, Some(20_000), None, 26_000),
+			(Some(20_000), Some(20_000))
+		);
+		// A guard that never saw it stream: from its first reading, as before.
+		assert_eq!(stream_gone(None, None, None, 5_000), (Some(5_000), None));
 	}
 
 	#[test]

@@ -117,11 +117,7 @@ pub async fn open(
 	if answer != b'S' {
 		return Err(BackendError::Unsupported(format!(
 			"{address} does not accept TLS (sslmode={})",
-			if node.sslmode == SslMode::Require {
-				"require"
-			} else {
-				"verify-full"
-			}
+			node.sslmode.as_str()
 		)));
 	}
 	let name = tls::server_name(&node.host).map_err(BackendError::Unsupported)?;
@@ -211,7 +207,7 @@ pub async fn connect(
 						match (&credential, node.sslmode) {
 							(
 								Some(ClientCredential::Password(p)),
-								SslMode::Require | SslMode::VerifyFull,
+								SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull,
 							) => {
 								let p = p.clone();
 								wire::write_all(&mut stream, &wire::password_message(&p).encode())

@@ -66,11 +66,7 @@ impl NodeSpec {
 }
 
 pub fn sslmode_name(m: SslMode) -> &'static str {
-	match m {
-		SslMode::Disable => "disable",
-		SslMode::Require => "require",
-		SslMode::VerifyFull => "verify-full",
-	}
+	m.as_str()
 }
 
 /// A node named by id (`3`) or by name (`"n3"`).
@@ -130,6 +126,12 @@ pub enum Op {
 	},
 	TableGlobal {
 		table: RelationName,
+	},
+	/// A distribution key chosen for every table of `schemas` from the schema alone (`auto.rs`).
+	TableAuto {
+		keyspace: String,
+		schemas: Vec<String>,
+		min_bytes: u64,
 	},
 	RangeSplit {
 		keyspace: String,
@@ -191,7 +193,7 @@ pub enum Op {
 }
 
 /// Every operation's name, for the API's own description of itself.
-pub const OPS: [&str; 20] = [
+pub const OPS: [&str; 21] = [
 	"node.add",
 	"node.drain",
 	"node.remove",
@@ -199,6 +201,7 @@ pub const OPS: [&str; 20] = [
 	"table.distribute",
 	"table.reference",
 	"table.global",
+	"table.auto",
 	"range.split",
 	"range.merge",
 	"range.move",
@@ -268,6 +271,45 @@ impl Op {
 			"table.global" => Op::TableGlobal {
 				table: relation_name(&s(v, "table")?)?,
 			},
+			"table.auto" => {
+				let schemas = match v.get("schemas") {
+					None | Some(Value::Null) => vec!["public".to_string()],
+					Some(Value::Array(a)) => a
+						.iter()
+						.map(|x| {
+							x.as_str()
+								.filter(|t| !t.is_empty() && !t.contains(','))
+								.map(str::to_string)
+								.ok_or_else(|| {
+									OpError::refused(
+										Kind::BadRequest,
+										"schemas: a list of schema names, none with a comma",
+									)
+								})
+						})
+						.collect::<Result<Vec<_>, _>>()?,
+					Some(_) => {
+						return Err(OpError::refused(
+							Kind::BadRequest,
+							"schemas: a list of schema names",
+						));
+					}
+				};
+				if schemas.is_empty() {
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						"schemas: name at least one",
+					));
+				}
+				Op::TableAuto {
+					keyspace: s(v, "keyspace")?,
+					schemas,
+					min_bytes: v
+						.get("min_bytes")
+						.and_then(Value::as_u64)
+						.unwrap_or(super::auto::MIN_BYTES),
+				}
+			}
 			"range.split" => Op::RangeSplit {
 				keyspace: s(v, "keyspace")?,
 				range: i(v, "range")?,
@@ -347,6 +389,7 @@ impl Op {
 			Op::TableDistribute { .. } => "table.distribute",
 			Op::TableReference { .. } => "table.reference",
 			Op::TableGlobal { .. } => "table.global",
+			Op::TableAuto { .. } => "table.auto",
 			Op::RangeSplit { .. } => "range.split",
 			Op::RangeMerge { .. } => "range.merge",
 			Op::RangeMove { .. } => "range.move",

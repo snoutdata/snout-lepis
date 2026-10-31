@@ -54,9 +54,29 @@ struct Opened {
 	minor: u32,
 }
 
-/// Everything before the session is relayed: TLS, the startup packet, SCRAM and the home node's
-/// session. None when the connection ended there (a cancel request, a refusal).
-async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireError> {
+/// What a client's first packets came to, once encryption is settled. Shared by the routing
+/// listener and the home pass-through (`passthrough.rs`), so both answer TLS, GSSAPI and a
+/// repeated request the same way.
+pub(crate) enum Preamble {
+	/// The connection ended there: direct TLS with no certificate or without the `postgresql`
+	/// ALPN, or encryption asked for twice (the client was told).
+	Closed,
+	/// A cancel request, for the caller to deliver; the connection ends after it.
+	Cancel { pid: i32, key: Vec<u8> },
+	/// A startup packet, read on `client` (TLS when `encrypted`).
+	Startup {
+		client: BoxStream,
+		encrypted: bool,
+		/// The version exactly as requested.
+		version: u32,
+		params: Vec<(String, String)>,
+	},
+}
+
+/// TLS (by SSLRequest, or direct), GSSAPI declined, then the first packet that is not about
+/// encryption. A client that asks for no encryption is served in the clear, as Postgres serves it
+/// when `pg_hba` allows `host`.
+pub(crate) async fn preamble(app: &App, tcp: TcpStream) -> Result<Preamble, WireError> {
 	tcp.set_nodelay(true).ok();
 
 	// A Postgres 17+ client may skip SSLRequest and start TLS at once (sslnegotiation=direct);
@@ -67,11 +87,11 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 	let mut encrypted = false;
 	if direct_tls {
 		let Some(acceptor) = &app.tls_acceptor else {
-			return Ok(None);
+			return Ok(Preamble::Closed);
 		};
 		let tls = acceptor.accept(tcp).await?;
 		if tls.get_ref().1.alpn_protocol() != Some(ALPN_POSTGRESQL) {
-			return Ok(None);
+			return Ok(Preamble::Closed);
 		}
 		client = Box::new(tls);
 		encrypted = true;
@@ -79,7 +99,7 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 		client = Box::new(tcp);
 	}
 
-	let (version, params) = loop {
+	loop {
 		match wire::read_startup(&mut client).await? {
 			Startup::SslRequest if !encrypted => match &app.tls_acceptor {
 				Some(acceptor) => {
@@ -91,20 +111,42 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 			},
 			Startup::GssEncRequest if !encrypted => client.write_all(b"N").await?,
 			Startup::SslRequest | Startup::GssEncRequest => {
-				return refuse(
+				refuse(
 					&mut client,
 					ErrorFields::fatal("08P01", "encryption requested twice"),
 				)
-				.await
-				.map(|_| None);
+				.await?;
+				return Ok(Preamble::Closed);
 			}
-			Startup::Cancel { pid, key } => {
-				app.cancels.cancel(pid, &key).await;
-				crate::router::spread::cancel(pid, &key).await;
-				return Ok(None);
+			Startup::Cancel { pid, key } => return Ok(Preamble::Cancel { pid, key }),
+			Startup::Startup { version, params } => {
+				return Ok(Preamble::Startup {
+					client,
+					encrypted,
+					version,
+					params,
+				});
 			}
-			Startup::Startup { version, params } => break (version, params),
 		}
+	}
+}
+
+/// Everything before the session is relayed: TLS, the startup packet, SCRAM and the home node's
+/// session. None when the connection ended there (a cancel request, a refusal).
+async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireError> {
+	let (mut client, encrypted, version, params) = match preamble(app, tcp).await? {
+		Preamble::Closed => return Ok(None),
+		Preamble::Cancel { pid, key } => {
+			app.cancels.cancel(pid, &key).await;
+			crate::router::spread::cancel(pid, &key).await;
+			return Ok(None);
+		}
+		Preamble::Startup {
+			client,
+			encrypted,
+			version,
+			params,
+		} => (client, encrypted, version, params),
 	};
 
 	// Protocol version and `_pq_.` options: Lepis knows no options, and speaks up to 3.2.
@@ -163,7 +205,7 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 	};
 
 	// The same session on the home node, as the same role.
-	let node = &app.config.home;
+	let node = &app.config.home();
 	let backend = match backend::connect(
 		node,
 		app.node_tls.as_ref(),
@@ -220,7 +262,7 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 	else {
 		return Ok(());
 	};
-	let node = &app.config.home;
+	let node = &app.config.home();
 	let key_len = if minor >= 2 { 32 } else { 4 };
 	let (pid, key) = app.cancels.register(
 		key_len,
@@ -275,8 +317,9 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 }
 
 /// The pass-through: the client's bytes to the node as they are, the node's to the client through
-/// `relay_from_node`. Whichever side closes first ends the session.
-async fn relay(client: BoxStream, node: BoxStream) -> Result<(), WireError> {
+/// `relay_from_node`. Whichever side closes first ends the session. Also the home pass-through's
+/// relay (`passthrough.rs`), from the startup packet on.
+pub(crate) async fn relay(client: BoxStream, node: BoxStream) -> Result<(), WireError> {
 	let (mut client_r, mut client_w) = tokio::io::split(client);
 	let (mut node_r, mut node_w) = tokio::io::split(node);
 	let up = async {
@@ -383,7 +426,7 @@ async fn accept(
 	Ok(acceptor.accept(stream).await?)
 }
 
-async fn refuse(client: &mut BoxStream, fields: ErrorFields) -> Result<(), WireError> {
+pub(crate) async fn refuse(client: &mut BoxStream, fields: ErrorFields) -> Result<(), WireError> {
 	wire::write_all(client, &fields.message().encode()).await
 }
 

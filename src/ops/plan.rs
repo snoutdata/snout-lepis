@@ -458,6 +458,7 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			}
 		}
 		Op::TableGlobal { table } => table_global(c, table, home)?,
+		Op::TableAuto { .. } => super::auto::plan(app, c, home, op).await?.steps,
 		Op::RangeSplit {
 			keyspace,
 			range,
@@ -732,7 +733,7 @@ async fn node_add(
 			host: spec.host.clone(),
 			port: spec.port,
 			sslmode: spec.sslmode,
-			ca_file: app.config.home.ca_file.clone(),
+			ca_file: app.config.home().ca_file.clone(),
 		},
 		dbname: spec.dbname.clone(),
 	};
@@ -1170,8 +1171,21 @@ pub async fn plan(
 	settings: Settings,
 ) -> Result<Planned, OpError> {
 	let c = load_catalog(h).await?;
-	let steps = expand(app, &c, op).await?;
-	let summary = summarize(app, &c, op, &steps, settings).await?;
+	// table.auto says, per table, what it chose and why, beside the moves.
+	let (steps, choices) = match op {
+		Op::TableAuto { .. } => {
+			let home = c.home().map(|n| n.id).ok_or_else(|| {
+				OpError::refused(Kind::CatalogInvalid, "the catalog has no home node")
+			})?;
+			let a = super::auto::plan(app, &c, home, op).await?;
+			(a.steps, Some(a.choices))
+		}
+		_ => (expand(app, &c, op).await?, None),
+	};
+	let mut summary = summarize(app, &c, op, &steps, settings).await?;
+	if let Some(choices) = choices {
+		summary["choices"] = choices.iter().map(|c| c.to_json()).collect();
+	}
 	Ok(Planned { steps, summary })
 }
 

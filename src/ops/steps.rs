@@ -346,7 +346,7 @@ async fn node_check(cx: &mut StepCtx, h: &mut Pg, spec: &NodeSpec) -> Result<(),
 			host: spec.host.clone(),
 			port: spec.port,
 			sslmode: spec.sslmode,
-			ca_file: cx.app.config.home.ca_file.clone(),
+			ca_file: cx.app.config.home().ca_file.clone(),
 		},
 		dbname: spec.dbname.clone(),
 	};
@@ -430,7 +430,7 @@ async fn node_insert(
 			host: spec.host.clone(),
 			port: spec.port,
 			sslmode: spec.sslmode,
-			ca_file: cx.app.config.home.ca_file.clone(),
+			ca_file: cx.app.config.home().ca_file.clone(),
 		},
 		dbname: spec.dbname.clone(),
 	};

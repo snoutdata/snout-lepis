@@ -28,7 +28,7 @@ pub fn target_of(app: &App, spec: &NodeSpec) -> Target {
 			host: spec.host.clone(),
 			port: spec.port,
 			sslmode: spec.sslmode,
-			ca_file: app.config.home.ca_file.clone(),
+			ca_file: app.config.home().ca_file.clone(),
 		},
 		dbname: spec.dbname.clone(),
 	}

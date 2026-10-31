@@ -95,6 +95,10 @@ impl Freshness {
 }
 
 async fn service_conn(app: &App) -> Result<Conn, String> {
+	service_conn_to(app, &app.config.home()).await
+}
+
+async fn service_conn_to(app: &App, node: &crate::config::NodeAddress) -> Result<Conn, String> {
 	let s = &app.config.service;
 	let params = vec![
 		("user".to_string(), s.user.clone()),
@@ -105,14 +109,33 @@ async fn service_conn(app: &App) -> Result<Conn, String> {
 		),
 	];
 	backend::connect(
-		&app.config.home,
+		node,
 		app.node_tls.as_ref(),
 		&params,
 		ClientCredential::Password(s.password.clone()),
 	)
 	.await
 	.map(|b| FrameReader::new(b.stream))
-	.map_err(|e| format!("service login to {}: {e}", app.config.home))
+	.map_err(|e| format!("service login to {node}: {e}"))
+}
+
+/// Whether `node` takes writes now: out of recovery, and not `default_transaction_read_only`
+/// (which a guard's fence turns on). What `follow.rs` asks each home of a set of copies.
+pub(crate) async fn takes_writes(
+	app: &App,
+	node: &crate::config::NodeAddress,
+) -> Result<bool, String> {
+	let mut b = service_conn_to(app, node).await?;
+	let rows = one(
+		&mut b,
+		"select pg_is_in_recovery()::text, current_setting('default_transaction_read_only')",
+	)
+	.await?;
+	let _ = b.get_mut().shutdown().await;
+	Ok(matches!(
+		rows.first().map(|r| (r.first().cloned().flatten(), r.get(1).cloned().flatten())),
+		Some((Some(recovery), Some(read_only))) if recovery == "false" && read_only == "off"
+	))
 }
 
 /// One simple-protocol statement and its rows as text. Notifications that arrive meanwhile are

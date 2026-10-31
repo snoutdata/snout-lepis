@@ -70,26 +70,54 @@ pub fn client_config(node: &NodeAddress) -> Result<Option<Arc<ClientConfig>>, St
 			.dangerous()
 			.with_custom_certificate_verifier(Arc::new(EncryptOnly(provider())))
 			.with_no_client_auth(),
+		SslMode::VerifyCa => {
+			let path = node
+				.ca_file
+				.as_ref()
+				.ok_or("sslmode=verify-ca needs a certificate file to trust (LEPIS_HOME_CA)")?;
+			let (roots, certs) = trusted(path)?;
+			builder
+				.dangerous()
+				.with_custom_certificate_verifier(Arc::new(CaOnly {
+					provider: provider(),
+					roots,
+					certs,
+				}))
+				.with_no_client_auth()
+		}
 		SslMode::VerifyFull => {
-			let mut roots = RootCertStore::empty();
-			match &node.ca_file {
-				Some(path) => {
-					for cert in CertificateDer::pem_file_iter(path)
-						.map_err(|e| format!("{}: {e}", path.display()))?
-					{
-						let cert = cert.map_err(|e| format!("{}: {e}", path.display()))?;
-						roots
-							.add(cert)
-							.map_err(|e| format!("{}: {e}", path.display()))?;
-					}
+			let roots = match &node.ca_file {
+				Some(path) => trusted(path)?.0,
+				None => {
+					let mut roots = RootCertStore::empty();
+					roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+					roots
 				}
-				None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-			}
+			};
 			builder.with_root_certificates(roots).with_no_client_auth()
 		}
 	};
 	config.alpn_protocols = vec![ALPN_POSTGRESQL.to_vec()];
 	Ok(Some(Arc::new(config)))
+}
+
+/// A PEM file's certificates, as roots and as they are.
+fn trusted(path: &Path) -> Result<(RootCertStore, Vec<CertificateDer<'static>>), String> {
+	let mut roots = RootCertStore::empty();
+	let mut certs = Vec::new();
+	for cert in
+		CertificateDer::pem_file_iter(path).map_err(|e| format!("{}: {e}", path.display()))?
+	{
+		let cert = cert.map_err(|e| format!("{}: {e}", path.display()))?;
+		// A self-signed server certificate is often a CA one, which webpki will not take as a
+		// root; it is still pinned, by its bytes.
+		let _ = roots.add(cert.clone());
+		certs.push(cert);
+	}
+	if certs.is_empty() {
+		return Err(format!("{}: no certificate in it", path.display()));
+	}
+	Ok((roots, certs))
 }
 
 pub fn server_name(host: &str) -> Result<ServerName<'static>, String> {
@@ -143,6 +171,77 @@ impl ServerCertVerifier for EncryptOnly {
 
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
 		self.0.signature_verification_algorithms.supported_schemes()
+	}
+}
+
+/// `sslmode=verify-ca`: the server's certificate is one of the trusted file's, byte for byte, or
+/// chains to one of them; its name is never checked (libpq's `verify-ca`). A home's own
+/// self-signed certificate, pinned by its digest and handed to a copy's router, is the first case:
+/// `openssl req -x509` makes it a CA certificate, which webpki refuses as a server's own, so the
+/// pin is checked by its bytes and the chain only for a certificate a real CA signed. The
+/// handshake's signatures are checked either way, so holding the certificate is not enough.
+#[derive(Debug)]
+struct CaOnly {
+	provider: Arc<CryptoProvider>,
+	roots: RootCertStore,
+	certs: Vec<CertificateDer<'static>>,
+}
+
+impl ServerCertVerifier for CaOnly {
+	fn verify_server_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		intermediates: &[CertificateDer<'_>],
+		_server_name: &ServerName<'_>,
+		_ocsp_response: &[u8],
+		now: UnixTime,
+	) -> Result<ServerCertVerified, rustls::Error> {
+		if self.certs.iter().any(|c| c.as_ref() == end_entity.as_ref()) {
+			return Ok(ServerCertVerified::assertion());
+		}
+		let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+		rustls::client::verify_server_cert_signed_by_trust_anchor(
+			&parsed,
+			&self.roots,
+			intermediates,
+			now,
+			self.provider.signature_verification_algorithms.all,
+		)?;
+		Ok(ServerCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		verify_tls12_signature(
+			message,
+			cert,
+			dss,
+			&self.provider.signature_verification_algorithms,
+		)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, rustls::Error> {
+		verify_tls13_signature(
+			message,
+			cert,
+			dss,
+			&self.provider.signature_verification_algorithms,
+		)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.provider
+			.signature_verification_algorithms
+			.supported_schemes()
 	}
 }
 
@@ -325,6 +424,77 @@ mod tests {
 
 	fn hex(b: &[u8]) -> String {
 		b.iter().map(|x| format!("{x:02x}")).collect()
+	}
+
+	fn verify_ca(file: &str) -> CaOnly {
+		let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/certs")
+			.join(file);
+		let (roots, certs) = trusted(&path).expect("fixture");
+		CaOnly {
+			provider: provider(),
+			roots,
+			certs,
+		}
+	}
+
+	#[test]
+	fn verify_ca_takes_the_pinned_certificate_under_any_name_and_nothing_else() {
+		let pinned = verify_ca("rsa-sha256.crt");
+		let now = UnixTime::now();
+		// The home is reached by its private address; the certificate names the pod. Under any
+		// name, the pinned certificate is the home.
+		for name in ["10.0.1.20", "snoutpod-b7kq2m9xt4rvz", "anything.example"] {
+			assert!(
+				pinned
+					.verify_server_cert(
+						&fixture("rsa-sha256.crt"),
+						&[],
+						&server_name(name).expect("name"),
+						&[],
+						now
+					)
+					.is_ok(),
+				"{name}"
+			);
+		}
+		// Another certificate, self-signed too, is refused whatever it names.
+		for other in ["ecdsa-sha256.crt", "rsa-sha384.crt"] {
+			assert!(
+				pinned
+					.verify_server_cert(
+						&fixture(other),
+						&[],
+						&server_name("10.0.1.20").expect("name"),
+						&[],
+						now
+					)
+					.is_err(),
+				"{other}"
+			);
+		}
+	}
+
+	#[test]
+	fn verify_ca_without_a_file_or_with_an_empty_one_is_refused_before_any_connection() {
+		let node = |ca_file: Option<std::path::PathBuf>| NodeAddress {
+			host: "10.0.1.20".into(),
+			port: 15432,
+			sslmode: SslMode::VerifyCa,
+			ca_file,
+		};
+		assert!(client_config(&node(None)).is_err());
+		let empty = std::env::temp_dir().join(format!("lepis-empty-ca-{}.pem", std::process::id()));
+		std::fs::write(&empty, "").expect("file");
+		assert!(client_config(&node(Some(empty.clone()))).is_err());
+		let _ = std::fs::remove_file(&empty);
+		let pinned =
+			Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/certs/rsa-sha256.crt");
+		assert!(
+			client_config(&node(Some(pinned)))
+				.expect("config")
+				.is_some()
+		);
 	}
 
 	/// The fixtures are `openssl req -x509` certificates (PEM, no keys; `.crt` so nothing mistakes

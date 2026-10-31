@@ -300,7 +300,7 @@ pub fn node_address(app: &App, node: &Node) -> NodeAddress {
 		host: node.host.clone(),
 		port: node.port,
 		sslmode: node.sslmode,
-		ca_file: app.config.home.ca_file.clone(),
+		ca_file: app.config.home().ca_file.clone(),
 	}
 }
 
@@ -333,7 +333,7 @@ async fn service_connect(
 /// Lepis's service login on the home node's cluster database (where `lepis.*` lives).
 pub async fn home_service(app: &App, purpose: &str) -> Result<Backend, BackendError> {
 	service_connect(
-		&app.config.home,
+		&app.config.home(),
 		app.node_tls.as_ref(),
 		&app.config.service,
 		&app.config.service.database,
@@ -439,7 +439,7 @@ const IDLE_LOG_CONNECTIONS: usize = 4;
 impl Coordinator {
 	pub fn new(app: &App, settings: Settings) -> Coordinator {
 		Coordinator {
-			home: app.config.home.clone(),
+			home: app.config.home(),
 			tls: app.node_tls.clone(),
 			service: app.config.service.clone(),
 			settings,
@@ -453,7 +453,9 @@ impl Coordinator {
 		static ALL: OnceLock<StdMutex<HashMap<String, Arc<Coordinator>>>> = OnceLock::new();
 		let key = format!(
 			"{}/{}/{}",
-			app.config.home, app.config.service.database, app.config.service.user
+			app.config.home(),
+			app.config.service.database,
+			app.config.service.user
 		);
 		let mut all = ALL
 			.get_or_init(Default::default)

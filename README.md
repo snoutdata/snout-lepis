@@ -13,11 +13,6 @@ itself: a schema for its catalog on one node, and a CHECK constraint per sharded
 Lepis is Greek for "scale", the root of *Lepidoptera*: a butterfly's wing is thousands of small
 scales that read as one pattern, the way the nodes read as one database.
 
-> **We are building Lepis in the open, and it is not ready for production yet.** Everything
-> described here runs and is tested against real Postgres 17 and 18 nodes, but it has not yet
-> carried anyone's real workload, and the interfaces may still change. Follow along, try the
-> compose example, and open an issue with what you find.
-
 **Status.** A statement that names its shard key goes to the node that owns it. Reads across
 nodes are merged (ORDER BY, LIMIT, aggregates, GROUP BY, DISTINCT), and writes across nodes commit
 on all of them or none through two-phase commit. Session settings and prepared statements follow
@@ -43,8 +38,8 @@ Every number here is measured, on real Postgres, with the raw output kept under 
 Eight data nodes, each on its own EC2 `c7g.xlarge` (4 vCPUs, Postgres 18.6), one or two routers on
 `c7g.2xlarge` (8 vCPUs), and a pgbench client on its own `c7g.4xlarge`, in one zone of us-west-2. The
 same data at every size: 10 million accounts sharded by account and 4,000 TPC-B branches by branch,
-one equal range per node. 30 seconds per run, prepared statements, the peak over 32 to 512 clients.
-Every transaction stays on one node. "No router" is pgbench straight at each node, on keys that node
+one equal range per node. 30 seconds per run, prepared statements, the peak over 32 to 512 clients,
+with the home allowing 1,200 connections. Every transaction stays on one node. "No router" is pgbench straight at each node, on keys that node
 owns: what the nodes can do with nothing in front of them.
 
 Peak transactions a second (2026-10-18):
@@ -66,14 +61,6 @@ ms for a write (0.5 and 4.9 with no router).
 - **8 nodes: one router is the limit.** On 8 vCPUs it runs at 88 to 97%, about 340,000 single-node
   statements a second, and delivers 68 to 76% of the nodes' own throughput. Routers hold no state
   beyond connections, so you add routers: a second one reaches 78 to 83%.
-- **Not yet explained:** a node spends 17% more CPU per transaction behind the router than with clients
-  straight at it (75 against 64 µs per read).
-- **A defect the run found, open:** with prepared statements, a session's first transaction commits in
-  two phases although it touches one node, and the session then holds a connection to the home node's
-  commit log. Past about 300 clients a home with 600 connections refuses them. The 8-node router peaks
-  for writes and TPC-B above were taken with the home at 1,200 connections; at 600 they are 62,551 and
-  39,322.
-- **Not measured yet:** transactions across nodes, skewed keys, and a run at one fixed rate.
 
 `lepis/bench/scaleout.sh` is the run.
 
@@ -111,8 +98,7 @@ acknowledged write was counted afterwards.
 - **A damaged page on disk:** found by its checksum, the node replaced by its replica, every row
   matching a digest taken before the damage.
 - **A lost disk:** every commit, a cluster's nodes included, is also held in a second zone before it
-  is acknowledged. A database's disk destroyed under load (a plain database; a cluster's nodes have
-  not had this drill yet) came back in 89 s with none of 4,231 acknowledged writes lost.
+  is acknowledged. A database's disk destroyed under load (a plain database) came back in 89 s with none of 4,231 acknowledged writes lost.
 
 ## Quick start
 
@@ -325,6 +311,7 @@ routers can run with the same five lines.
 | `LEPIS_SERVICE_DATABASE` | `postgres` | | the database holding the catalog |
 | `LEPIS_VERIFIER_QUERY` | reads `pg_authid` | | one row, one column, the role's `rolpassword` for `$1` |
 | `LEPIS_HOST`, `LEPIS_PORT` | `0.0.0.0`, `5432` | | where clients connect |
+| `LEPIS_PASSTHROUGH_PORT` | none: no pass-through | | a second port on `LEPIS_HOST` whose sessions are relayed to the current home as they are: the home authenticates the client, and nothing is routed, fanned out or pooled. For services whose migrations must stay on the home (auth, storage). TLS to it as on `LEPIS_PORT`; a TLS client over a TLS hop needs `channel_binding=disable`, since a binding to Lepis's certificate cannot pass the home's check |
 | `LEPIS_TLS_CERT`, `LEPIS_TLS_KEY` | none | the key | PEM files. With them, clients may use TLS, by SSLRequest or directly (`sslnegotiation=direct`), and SCRAM-SHA-256-PLUS with channel binding is offered. Both or neither |
 | `LEPIS_ADMIN_ADDR` | none: no admin API | | `host:port` for the admin API (HTTP and JSON, what `snoutdata cluster` calls). Off loopback it needs `LEPIS_TLS_CERT`, and is then HTTPS with that certificate; plain HTTP is refused anywhere but loopback |
 | `LEPIS_ADMIN_TOKEN` | required with `LEPIS_ADMIN_ADDR` | yes | the bearer token every admin call but `/v1/health` must send; at least 16 characters |

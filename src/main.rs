@@ -46,9 +46,21 @@ async fn router() -> Result<(), String> {
 	let listener = tokio::net::TcpListener::bind(&address)
 		.await
 		.map_err(|e| format!("{address}: {e}"))?;
-	tracing::info!(%address, home = %app.config.home, "snout-lepis listening");
+	// Bound now, so a port in use stops the router at once; it opens once the home is chosen.
+	let passthrough = match app.config.passthrough_port {
+		None => None,
+		Some(port) => {
+			let at = format!("{}:{port}", app.config.host);
+			Some(
+				tokio::net::TcpListener::bind(&at)
+					.await
+					.map_err(|e| format!("LEPIS_PASSTHROUGH_PORT {at}: {e}"))?,
+			)
+		}
+	};
+	tracing::info!(%address, home = %app.config.home(), "snout-lepis listening");
 	tokio::select! {
-		result = server::serve(app, listener) => result.map_err(|e| e.to_string()),
+		result = server::serve_with(app, listener, passthrough) => result.map_err(|e| e.to_string()),
 		_ = stopped() => Ok(()),
 	}
 }

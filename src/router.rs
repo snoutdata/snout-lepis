@@ -38,11 +38,12 @@ use tokio::io::AsyncWriteExt;
 
 use crate::analyze;
 use crate::backend::{self, Backend, BackendError, BoxStream};
-use crate::catalog::{Catalog, NodeId};
+use crate::catalog::{Catalog, Node, NodeId};
 use crate::config::NodeAddress;
 use crate::ddl::{self, DdlPlan};
 use crate::frame::FrameReader;
 use crate::merge::{self, Gathered, MergeError, RankRequest, Ranks, Row};
+use crate::replica;
 use crate::roles::{self, RoleChange};
 use crate::route::{self, AnalyzeError, ParamValue, Route, SessionVerb, Statement, TxVerb};
 use crate::scatter;
@@ -102,7 +103,24 @@ struct InFlight {
 	swallow: VecDeque<bool>,
 	/// The batch ROLLed BACK (for the SET bookkeeping).
 	rolls_back: bool,
+	/// A read sent to a replica: its answers are held back until its ReadyForQuery, so one the
+	/// replica refuses as a write (25006) is run again on the primary unseen (replica.rs).
+	retry: Option<Retry>,
 }
+
+/// A replica read's way back to its node.
+struct Retry {
+	primary: NodeId,
+	batch: Vec<Message>,
+	/// The answers so far, for the client once the replica has answered the whole batch.
+	held: Vec<u8>,
+	/// The replica refused it as a write.
+	refused: bool,
+}
+
+/// How much of a replica read's answer is held back before it goes to the client as it comes
+/// (and can no longer be run again on the primary).
+const HOLD_AT: usize = 1 << 20;
 
 pub struct Router {
 	app: Arc<App>,
@@ -183,6 +201,9 @@ pub struct Router {
 	parked_until: Option<tokio::time::Instant>,
 	/// The JWT claim the transaction (or session) is routed by.
 	claim: Option<Claim>,
+	/// The session sent something that may write: its reads stay on the primaries from now on,
+	/// so it reads what it wrote (replica.rs).
+	wrote: bool,
 }
 
 impl Router {
@@ -265,6 +286,7 @@ impl Router {
 			parked: Vec::new(),
 			parked_until: None,
 			claim: None,
+			wrote: false,
 			settings_read: std::time::Instant::now()
 				.checked_sub(settings::FRESH * 2)
 				.unwrap_or_else(std::time::Instant::now),
@@ -326,7 +348,10 @@ impl Router {
 			let event = match (node_reader, parked_until) {
 				(Some(r), _) => tokio::select! {
 					m = client_r.next() => Event::client(m),
-					m = r.next() => Event::Node(listen_node.expect("set"), m?),
+					m = r.next() => match m {
+						Ok(m) => Event::Node(listen_node.expect("set"), m),
+						Err(e) => Event::NodeLost(listen_node.expect("set"), e),
+					},
 				},
 				(None, Some(until)) => tokio::select! {
 					m = client_r.next() => Event::client(m),
@@ -361,16 +386,24 @@ impl Router {
 					self.on_node(n, m).await?;
 					// The rest of what this node has already sent, without another wait: a
 					// node's answer usually arrives in one read.
-					while self.inflight.front().is_some_and(|f| f.node == n)
-						&& let Some(m) = self
-							.conns
-							.get_mut(&n)
-							.map(|c| c.reader.take())
-							.transpose()?
-							.flatten()
-					{
+					while self.inflight.front().is_some_and(|f| f.node == n) {
+						let next = match self.conns.get_mut(&n).map(|c| c.reader.take()).transpose()
+						{
+							Ok(next) => next.flatten(),
+							Err(e) => {
+								self.node_lost(n, e).await?;
+								break;
+							}
+						};
+						let Some(m) = next else {
+							break;
+						};
 						self.on_node(n, m).await?;
 					}
+					self.dispatch().await?;
+				}
+				Event::NodeLost(n, e) => {
+					self.node_lost(n, e).await?;
 					self.dispatch().await?;
 				}
 				Event::Idle => self.publish(),
@@ -459,6 +492,9 @@ impl Router {
 			return Ok(());
 		};
 		debug_assert_eq!(front.node, n);
+		if front.retry.is_some() {
+			return self.on_replica_answer(m).await;
+		}
 		let mut forward = match front.owner {
 			Owner::Client => true,
 			Owner::ErrorOnly => matches!(m.tag, b'E' | b'N' | b'Z'),
@@ -487,6 +523,89 @@ impl Router {
 		}
 		if forward {
 			put_message(&mut self.out, &m);
+		}
+		Ok(())
+	}
+
+	/// A node's connection broke. A replica's, while it answers a read nothing of which has reached
+	/// the client yet (its `Retry` still holds the answer), costs the session nothing: the replica
+	/// is passed over until its next reading says it keeps up, and the read runs on the node.
+	/// Anything else ends the session, as a node lost always has.
+	async fn node_lost(&mut self, n: NodeId, e: WireError) -> Result<(), WireError> {
+		let retrying = self
+			.inflight
+			.front()
+			.is_some_and(|f| f.node == n && f.retry.is_some());
+		if !retrying {
+			return Err(e);
+		}
+		let done = self.inflight.pop_front().expect("front exists");
+		let retry = done.retry.expect("a replica read");
+		tracing::warn!(node = %retry.primary, "a read replica's connection broke mid-read ({e}); the read runs on its node");
+		self.replica_down(n);
+		self.ensure_conn(retry.primary).await?;
+		self.catch_up_sets(retry.primary).await?;
+		self.forward(retry.primary, retry.batch, false).await
+	}
+
+	/// A replica whose connection broke: its session is dropped, and it serves no read until its
+	/// next reading says it keeps up (replica.rs `mark_down`).
+	fn replica_down(&mut self, id: NodeId) {
+		self.conns.remove(&id);
+		let primary = replica::primary_of(id).and_then(|p| self.catalog.nodes.get(&p).cloned());
+		if let (Some(p), Some(r)) = (primary, self.node_of(id)) {
+			replica::mark_down(&p, &r);
+		}
+	}
+
+	/// One answer to a read on a replica (`Retry`): held back, and at its ReadyForQuery either
+	/// given to the client or, if the replica refused the read as a write, dropped while the
+	/// batch runs again on the node.
+	async fn on_replica_answer(&mut self, m: Message) -> Result<(), WireError> {
+		let front = self.inflight.front_mut().expect("front exists");
+		let mut forward = true;
+		match m.tag {
+			b'1' | b'3' => {
+				if front.swallow.pop_front() == Some(true) {
+					forward = false;
+				}
+			}
+			b'E' => {
+				let refused = wire::parse_error_fields(&m.body)
+					.into_iter()
+					.any(|(k, v)| k == b'C' && v == replica::READ_ONLY);
+				if refused {
+					front.retry.as_mut().expect("a replica read").refused = true;
+				}
+			}
+			b'Z' => {
+				let done = self.inflight.pop_front().expect("front exists");
+				let retry = done.retry.expect("a replica read");
+				self.flush_due = true;
+				if retry.refused {
+					tracing::debug!(node = %retry.primary, "a read a replica refused as a write runs on its node");
+					self.wrote = true;
+					self.ensure_conn(retry.primary).await?;
+					self.catch_up_sets(retry.primary).await?;
+					return self.forward(retry.primary, retry.batch, false).await;
+				}
+				let status = m.body.first().copied().unwrap_or(b'I');
+				self.after_ready(done.node, status, done.rolls_back);
+				self.out.extend_from_slice(&retry.held);
+				put_message(&mut self.out, &m);
+				return Ok(());
+			}
+			_ => {}
+		}
+		let retry = front.retry.as_mut().expect("a replica read");
+		if forward {
+			put_message(&mut retry.held, &m);
+		}
+		if retry.held.len() >= HOLD_AT && !retry.refused {
+			// Too long to hold: it goes to the client as it comes, and can no longer run again.
+			let held = std::mem::take(&mut retry.held);
+			front.retry = None;
+			self.out.extend_from_slice(&held);
 		}
 		Ok(())
 	}
@@ -558,6 +677,7 @@ impl Router {
 					return Err(e);
 				}
 			};
+			let (plan, retry_on) = self.on_replica(plan, &batch).await;
 			let target = match &plan {
 				Plan::Node { node, .. } => Some(*node),
 				Plan::Local { .. }
@@ -573,15 +693,196 @@ impl Router {
 				self.queued.push_front(batch);
 				return Ok(());
 			}
-			self.execute(plan, batch).await?;
+			let kept = retry_on.map(|primary| (primary, batch.clone()));
+			match (self.execute(plan, batch).await, kept, target) {
+				(Ok(()), Some((primary, batch)), _) => {
+					if let Some(f) = self.inflight.back_mut() {
+						f.retry = Some(Retry {
+							primary,
+							batch,
+							held: Vec::new(),
+							refused: false,
+						});
+					}
+				}
+				(Ok(()), None, _) => {}
+				// The replica's connection broke as the read went out: the read runs on the node.
+				(Err(e), Some((primary, batch)), Some(at)) => {
+					tracing::warn!(node = %primary, "a read replica's connection broke ({e}); the read runs on its node");
+					self.inflight.retain(|f| f.node != at);
+					self.replica_down(at);
+					self.ensure_conn(primary).await?;
+					self.catch_up_sets(primary).await?;
+					self.forward(primary, batch, false).await?;
+				}
+				(Err(e), _, _) => return Err(e),
+			}
 		}
 		Ok(())
 	}
 
 	fn busy_elsewhere(&self, target: Option<NodeId>) -> bool {
+		// A replica read may yet run again on its primary: nothing goes out behind it.
+		if self.inflight.iter().any(|f| f.retry.is_some()) {
+			return true;
+		}
 		match target {
 			None => !self.inflight.is_empty(),
 			Some(n) => self.inflight.iter().any(|f| f.node != n),
+		}
+	}
+
+	/// Every statement of a batch, by its text: its Query, its Parse, or the statement its Bind
+	/// names. None when a Bind names one Lepis does not hold.
+	fn batch_statements(&self, batch: &[Message]) -> Option<Vec<String>> {
+		let mut out = Vec::new();
+		let mut parsed = Vec::new();
+		for m in batch {
+			match m.tag {
+				b'Q' => out.push(cstr(&m.body)),
+				b'P' => {
+					let (name, sql) = parse_parse(&m.body).ok()?;
+					parsed.push(name);
+					out.push(sql);
+				}
+				b'B' => {
+					let (_, stmt) = bind_names(&m.body).ok()?;
+					if !parsed.contains(&stmt) {
+						out.push(self.statements.get(&stmt)?.sql.clone());
+					}
+				}
+				_ => {}
+			}
+		}
+		Some(out)
+	}
+
+	/// Whether every statement of the batch only reads (replica.rs `read_only`), apart from
+	/// transaction control and session commands, which write nothing.
+	fn batch_reads(&self, statements: &[String]) -> bool {
+		statements.iter().all(|sql| match &*self.analyze(sql) {
+			Ok(stmts) => stmts
+				.iter()
+				.all(|s| s.tx.is_some() || s.session.is_some() || replica::read_only(&s.sql)),
+			Err(_) => false,
+		})
+	}
+
+	/// The node `id` names: a catalog node, or a node's replica at its address (replica.rs).
+	fn node_of(&self, id: NodeId) -> Option<Node> {
+		match replica::primary_of(id) {
+			Some(primary) => {
+				let n = self.catalog.nodes.get(&primary)?;
+				Some(self.settings.read_replicas.get(&n.name)?.node(n))
+			}
+			None => self.catalog.nodes.get(&id).cloned(),
+		}
+	}
+
+	/// The replica a node's reads may go to now, connected: configured, keeping up, reachable.
+	async fn replica_for(&mut self, node: NodeId) -> Option<NodeId> {
+		let n = self.catalog.nodes.get(&node)?.clone();
+		let r = self.settings.read_replicas.get(&n.name)?.clone();
+		let rn = r.node(&n);
+		if !replica::usable(&self.app, &n, &rn, r.max_lag_bytes).await {
+			return None;
+		}
+		if self.ensure_conn(rn.id).await.is_err() || self.catch_up_sets(rn.id).await.is_err() {
+			self.conns.remove(&rn.id);
+			replica::mark_down(&n, &rn);
+			return None;
+		}
+		Some(rn.id)
+	}
+
+	/// A read of a session that asked for replicas, moved to them (replica.rs): one node's read
+	/// to its replica, with the node to run it again on if the replica refuses it as a write; a
+	/// read across nodes with each node's worker on its replica where it has one. Marks the
+	/// session written by anything else.
+	async fn on_replica(&mut self, plan: Plan, batch: &[Message]) -> (Plan, Option<NodeId>) {
+		// Nothing to read from, or a session that did not ask: nothing to look at.
+		if self.settings.read_replicas.is_empty()
+			|| !replica::wants_replica(&self.startup, &self.sets)
+		{
+			return (plan, None);
+		}
+		let reads = match &plan {
+			Plan::Refuse(_) | Plan::Local { .. } => true,
+			_ => self
+				.batch_statements(batch)
+				.is_some_and(|s| self.batch_reads(&s)),
+		};
+		if !reads {
+			self.wrote = true;
+		}
+		let one_sync = batch
+			.iter()
+			.filter(|m| matches!(m.tag, b'S' | b'Q'))
+			.count() == 1
+			&& !batch.iter().any(|m| m.tag == b'F');
+		let reads_data = self.batch_statements(batch).is_some_and(|s| {
+			!s.is_empty()
+				&& s.iter().all(|sql| match &*self.analyze(sql) {
+					Ok(stmts) => {
+						!stmts.is_empty() && stmts.iter().all(|s| replica::read_only(&s.sql))
+					}
+					Err(_) => false,
+				})
+		});
+		if !reads
+			|| self.wrote
+			|| !one_sync
+			|| !reads_data
+			|| self.in_tx()
+			|| self.pinned.is_some()
+			|| self.tx_status != b'I'
+			|| self.unbound_begin.is_some()
+			|| !self.participants.is_empty()
+		{
+			return (plan, None);
+		}
+		match plan {
+			Plan::Node {
+				node,
+				sessions,
+				rolls_back,
+				begin: None,
+				join: false,
+			} if sessions.is_empty() => match self.replica_for(node).await {
+				Some(r) => (
+					Plan::Node {
+						node: r,
+						sessions,
+						rolls_back,
+						begin: None,
+						join: false,
+					},
+					Some(node),
+				),
+				None => (
+					Plan::Node {
+						node,
+						sessions,
+						rolls_back,
+						begin: None,
+						join: false,
+					},
+					None,
+				),
+			},
+			Plan::Gather { nodes, sql, .. }
+				if scatter::explained(&sql).is_none() && nodes.len() > 1 =>
+			{
+				let mut on = Vec::with_capacity(nodes.len());
+				for n in &nodes {
+					on.push(self.replica_for(*n).await.unwrap_or(*n));
+				}
+				if on == nodes {
+					on.clear();
+				}
+				(Plan::Gather { nodes, sql, on }, None)
+			}
+			other => (other, None),
 		}
 	}
 
@@ -1086,6 +1387,7 @@ impl Router {
 			return Ok(Plan::Gather {
 				nodes: nodes.clone(),
 				sql: sql.clone(),
+				on: Vec::new(),
 			});
 		}
 		if let [(n, sql)] = explains.as_slice()
@@ -1097,6 +1399,7 @@ impl Router {
 			return Ok(Plan::Gather {
 				nodes: vec![*n],
 				sql: sql.clone(),
+				on: Vec::new(),
 			});
 		}
 		targets.sort();
@@ -1236,7 +1539,7 @@ impl Router {
 	async fn execute(&mut self, plan: Plan, batch: Vec<Message>) -> Result<(), WireError> {
 		match plan {
 			Plan::Refuse(r) => self.refuse(r, &batch).await,
-			Plan::Gather { nodes, sql } => self.gather(nodes, sql, batch).await,
+			Plan::Gather { nodes, sql, on } => self.gather(nodes, sql, on, batch).await,
 			Plan::EndTx { commit } => self.end_tx(commit, &batch).await,
 			Plan::Fanout(f) => self.fanout(f, batch).await,
 			Plan::Job(sql) => self.job(sql, batch).await,
@@ -1480,6 +1783,7 @@ impl Router {
 					VecDeque::new()
 				},
 				rolls_back,
+				retry: None,
 			});
 		}
 		Ok(())
@@ -1548,7 +1852,7 @@ impl Router {
 		if self.take_pooled(node).await? {
 			return Ok(());
 		}
-		let n = self.catalog.nodes.get(&node).cloned();
+		let n = self.node_of(node);
 		let Some(n) = n else {
 			return Err(WireError::Protocol(format!("{node} is not in the catalog")));
 		};
@@ -1556,7 +1860,7 @@ impl Router {
 			host: n.host.clone(),
 			port: n.port,
 			sslmode: n.sslmode,
-			ca_file: self.app.config.home.ca_file.clone(),
+			ca_file: self.app.config.home().ca_file.clone(),
 		};
 		let tls = crate::tls::client_config(&address).map_err(WireError::Protocol)?;
 		let mut params: Vec<(String, String)> = self
@@ -1594,14 +1898,14 @@ impl Router {
 		if node == self.cancel_node {
 			return;
 		}
-		let (Some(conn), Some(n)) = (self.conns.get(&node), self.catalog.nodes.get(&node)) else {
+		let (Some(conn), Some(n)) = (self.conns.get(&node), self.node_of(node)) else {
 			return;
 		};
 		let address = NodeAddress {
 			host: n.host.clone(),
 			port: n.port,
 			sslmode: n.sslmode,
-			ca_file: self.app.config.home.ca_file.clone(),
+			ca_file: self.app.config.home().ca_file.clone(),
 		};
 		let tls = self.tls_of(&address);
 		self.app.cancels.retarget(
@@ -1745,6 +2049,7 @@ impl Router {
 					owner: Owner::ErrorOnly,
 					swallow: VecDeque::new(),
 					rolls_back: false,
+					retry: None,
 				});
 			}
 			return Ok(());
@@ -1963,6 +2268,7 @@ impl Router {
 		&mut self,
 		nodes: Vec<NodeId>,
 		sql: String,
+		on: Vec<NodeId>,
 		batch: Vec<Message>,
 	) -> Result<(), WireError> {
 		let home = self.home();
@@ -2008,6 +2314,7 @@ impl Router {
 		if !all.contains(&home) {
 			all.push(home);
 		}
+		all.extend(on.iter().filter(|n| !nodes.contains(n)).copied());
 		for n in &all {
 			self.ensure_conn(*n).await?;
 			self.catch_up_sets(*n).await?;
@@ -2161,18 +2468,41 @@ impl Router {
 		if let Some(p) = &planned
 			&& !explain
 		{
-			return self
-				.gather_stream(
-					&nodes,
-					p,
-					&d,
-					&shown_fields,
-					bind.as_ref(),
-					&result_formats,
-					&batch,
-					simple,
-				)
-				.await;
+			if !on.is_empty() {
+				match self
+					.gather_stream(
+						&nodes,
+						&on,
+						p,
+						&d,
+						&shown_fields,
+						bind.as_ref(),
+						&result_formats,
+						&batch,
+						simple,
+					)
+					.await?
+				{
+					Streamed::Answered => return Ok(()),
+					// A replica refused its worker as a write: the read runs again on the nodes.
+					Streamed::Refused => self.wrote = true,
+					// A replica broke: the same, and the session may read from replicas again.
+					Streamed::Lost => {}
+				}
+			}
+			self.gather_stream(
+				&nodes,
+				&nodes,
+				p,
+				&d,
+				&shown_fields,
+				bind.as_ref(),
+				&result_formats,
+				&batch,
+				simple,
+			)
+			.await?;
+			return Ok(());
 		}
 		let answers = match self
 			.run_worker(&nodes, &worker, &d.params, bind.as_ref(), &formats)
@@ -4047,6 +4377,17 @@ enum Pulled {
 	More,
 	Finished,
 	Failed(Message),
+	/// A replica's connection broke (only a replica's: a node's ends the session).
+	Lost(WireError),
+}
+
+/// How a read across nodes ended (`gather_stream`).
+enum Streamed {
+	Answered,
+	/// A replica refused its worker as a write (25006) before the client had anything.
+	Refused,
+	/// A replica's connection broke before the client had anything.
+	Lost,
 }
 
 /// The cancel keys of the node sessions a statement runs on, beyond the one the cancel registry
@@ -4108,12 +4449,12 @@ pub(crate) mod spread {
 impl Router {
 	/// Where a cancel for this session's connection to `node` goes.
 	fn cancel_target(&self, node: NodeId) -> Option<crate::cancel::Target> {
-		let (conn, n) = (self.conns.get(&node)?, self.catalog.nodes.get(&node)?);
+		let (conn, n) = (self.conns.get(&node)?, self.node_of(node)?);
 		let address = NodeAddress {
 			host: n.host.clone(),
 			port: n.port,
 			sslmode: n.sslmode,
-			ca_file: self.app.config.home.ca_file.clone(),
+			ca_file: self.app.config.home().ca_file.clone(),
 		};
 		let tls = self.tls_of(&address);
 		Some(crate::cancel::Target {
@@ -4142,6 +4483,19 @@ impl Router {
 
 	/// Reads one window of a node's portal into `buf`; `fields` gets its RowDescription.
 	async fn pull(
+		&mut self,
+		node: NodeId,
+		first: bool,
+		buf: &mut VecDeque<Row>,
+		fields: &mut Vec<Field>,
+	) -> Result<Pulled, WireError> {
+		match self.pull_window(node, first, buf, fields).await {
+			Err(e) if replica::primary_of(node).is_some() => Ok(Pulled::Lost(e)),
+			other => other,
+		}
+	}
+
+	async fn pull_window(
 		&mut self,
 		node: NodeId,
 		first: bool,
@@ -4180,14 +4534,31 @@ impl Router {
 			Body::new().byte(b'P').cstr(PORTAL).message(b'C'),
 			Message::new(b'S', vec![]),
 		];
+		let mut lost = Vec::new();
 		for n in nodes {
-			self.send(*n, &close).await?;
+			if let Err(e) = self.send(*n, &close).await {
+				if replica::primary_of(*n).is_none() {
+					return Err(e);
+				}
+				lost.push(*n);
+			}
 		}
 		let mut failed = false;
 		for n in nodes {
+			if lost.contains(n) {
+				continue;
+			}
 			let conn = self.conns.get_mut(n).expect("connected");
 			loop {
-				let m = conn.reader.next().await?;
+				let m = match conn.reader.next().await {
+					Ok(m) => m,
+					// A replica that breaks here has given every row it was asked for.
+					Err(_) if replica::primary_of(*n).is_some() => {
+						lost.push(*n);
+						break;
+					}
+					Err(e) => return Err(e),
+				};
 				match m.tag {
 					b'N' | b'A' | b'S' => put_message(&mut self.out, &m),
 					b'Z' => {
@@ -4198,14 +4569,22 @@ impl Router {
 				}
 			}
 		}
+		for n in lost {
+			self.replica_down(n);
+		}
 		Ok(failed)
 	}
 
-	/// A read across nodes, merged as the rows arrive (see the section's header).
+	/// A read across nodes, merged as the rows arrive (see the section's header). Node `i`'s
+	/// worker runs on `on[i]`: the node, or its replica. A replica that refuses its worker as a
+	/// write, or whose connection breaks, before anything reached the client leaves the read
+	/// unanswered (`Refused`, `Lost`), and `gather` runs it again on the nodes; once the client
+	/// has rows, a broken replica ends the session.
 	#[allow(clippy::too_many_arguments)]
 	async fn gather_stream(
 		&mut self,
 		nodes: &[NodeId],
+		on: &[NodeId],
 		p: &scatter::Planned,
 		d: &DescribeResult,
 		shown_fields: &[Field],
@@ -4213,14 +4592,17 @@ impl Router {
 		result_formats: &[i16],
 		batch: &[Message],
 		simple: bool,
-	) -> Result<(), WireError> {
+	) -> Result<Streamed, WireError> {
 		let home = self.home();
 		let (pformats, values) = match bind {
 			Some(b) => (b.param_formats.clone(), b.values.clone()),
 			None => (Vec::new(), Vec::new()),
 		};
-		self.spread_cancel(nodes);
-		for n in nodes {
+		let replicas = on != nodes;
+		// A replica whose connection broke, and how.
+		let mut lost: Option<(NodeId, WireError)> = None;
+		self.spread_cancel(on);
+		for (n, at) in nodes.iter().zip(on) {
 			// Each node reads only the rows it owns (scatter::per_node_workers); checked above that
 			// every node has its worker.
 			let open = [
@@ -4230,9 +4612,15 @@ impl Router {
 				Body::new().cstr(PORTAL).i32(WINDOW).message(b'E'),
 				Message::new(b'H', vec![]),
 			];
-			self.send(*n, &open).await?;
+			if let Err(e) = self.send(*at, &open).await {
+				if replica::primary_of(*at).is_none() || lost.is_some() {
+					return Err(e);
+				}
+				lost = Some((*at, e));
+				continue;
+			}
 			self.conns
-				.get_mut(n)
+				.get_mut(at)
 				.expect("connected")
 				.prepared
 				.remove("");
@@ -4243,14 +4631,25 @@ impl Router {
 		let mut types: Vec<u32> = Vec::new();
 		let mut error: Option<Message> = None;
 		for i in 0..k {
+			if lost.as_ref().is_some_and(|(at, _)| *at == on[i]) {
+				finished[i] = true;
+				continue;
+			}
 			let mut fields = Vec::new();
 			let mut buf = std::mem::take(&mut bufs[i]);
-			match self.pull(nodes[i], true, &mut buf, &mut fields).await? {
+			match self.pull(on[i], true, &mut buf, &mut fields).await? {
 				Pulled::More => {}
 				Pulled::Finished => finished[i] = true,
 				Pulled::Failed(e) => {
 					finished[i] = true;
 					error.get_or_insert(e);
+				}
+				Pulled::Lost(e) => {
+					finished[i] = true;
+					if lost.is_some() {
+						return Err(e);
+					}
+					lost = Some((on[i], e));
 				}
 			}
 			bufs[i] = buf;
@@ -4274,11 +4673,18 @@ impl Router {
 				));
 			}
 		}
-		let ranks_sync = !nodes.contains(&home);
+		let ranks_sync = !on.contains(&home);
 
 		let mut emitted: u64 = 0;
 		let mut head = false;
 		let result: Result<(), Message> = 'run: {
+			if lost.is_some() {
+				break 'run Err(refusal_message(
+					"08006",
+					"a read replica's connection broke",
+					"",
+				));
+			}
 			if let Some(e) = error.take() {
 				break 'run Err(e);
 			}
@@ -4289,15 +4695,23 @@ impl Router {
 					while !finished[i] {
 						let mut buf = std::mem::take(&mut bufs[i]);
 						let mut f = Vec::new();
-						match self.pull(nodes[i], false, &mut buf, &mut f).await? {
+						match self.pull(on[i], false, &mut buf, &mut f).await? {
 							Pulled::More => {}
 							Pulled::Finished => finished[i] = true,
 							Pulled::Failed(e) => break 'run Err(e),
+							Pulled::Lost(e) => {
+								lost = Some((on[i], e));
+								break 'run Err(refusal_message(
+									"08006",
+									"a read replica's connection broke",
+									"",
+								));
+							}
 						}
 						bufs[i] = buf;
 					}
 				}
-				let failed = self.end_portals(nodes).await?;
+				let failed = self.end_portals(on).await?;
 				self.unspread_cancel();
 				let all: Vec<Vec<Row>> = bufs.into_iter().map(Vec::from).collect();
 				let answers: Vec<Answer> = all
@@ -4326,7 +4740,7 @@ impl Router {
 					},
 				};
 				self.answer(batch, simple, Some((d, shown_fields)), outcome);
-				return Ok(());
+				return Ok(Streamed::Answered);
 			}
 			let mut merge = match p.merge.row_merge(k, &types, &p.formats) {
 				Ok(m) => m,
@@ -4367,20 +4781,49 @@ impl Router {
 					Ok(merge::Step::Need(i)) => {
 						let mut buf = std::mem::take(&mut bufs[i]);
 						let mut f = Vec::new();
-						match self.pull(nodes[i], false, &mut buf, &mut f).await? {
+						match self.pull(on[i], false, &mut buf, &mut f).await? {
 							Pulled::More => {}
 							Pulled::Finished => finished[i] = true,
 							Pulled::Failed(e) => break 'run Err(e),
+							Pulled::Lost(e) => {
+								lost = Some((on[i], e));
+								break 'run Err(refusal_message(
+									"08006",
+									"a read replica's connection broke",
+									"",
+								));
+							}
 						}
 						bufs[i] = buf;
 					}
 				}
 			}
 		};
-		let failed = self.end_portals(nodes).await?;
+		let alive: Vec<NodeId> = on
+			.iter()
+			.copied()
+			.filter(|n| lost.as_ref().is_none_or(|(at, _)| at != n))
+			.collect();
+		let failed = self.end_portals(&alive).await?;
 		self.unspread_cancel();
+		if let Some((at, e)) = lost {
+			self.replica_down(at);
+			if head {
+				return Err(e);
+			}
+			tracing::warn!(node = ?replica::primary_of(at), "a read replica's connection broke mid-read ({e}); the read runs on the nodes");
+			return Ok(Streamed::Lost);
+		}
 		if (failed || result.is_err()) && self.in_tx() {
 			self.tx_status = b'E';
+		}
+		if replicas
+			&& !head && let Err(e) = &result
+			&& wire::parse_error_fields(&e.body)
+				.into_iter()
+				.any(|(k, v)| k == b'C' && v == replica::READ_ONLY)
+		{
+			return Ok(Streamed::Refused);
 		}
 		match result {
 			Err(e) if !head => {
@@ -4401,7 +4844,7 @@ impl Router {
 				self.stream_tail(batch, simple, result.map(|_| emitted));
 			}
 		}
-		Ok(())
+		Ok(Streamed::Answered)
 	}
 
 	/// What the client is sent before the rows: as `answer` sends it.
@@ -4537,6 +4980,8 @@ pub struct Settings {
 	pub route_claim: Option<String>,
 	/// `route_claim_keyspace`: the keyspace that claim is a value of (optional with one keyspace).
 	pub route_claim_keyspace: Option<String>,
+	/// `read_replicas`: each node's read replica, by node name (replica.rs).
+	pub read_replicas: std::collections::BTreeMap<String, replica::Replica>,
 }
 
 impl Settings {
@@ -4552,6 +4997,7 @@ impl Settings {
 			transaction_pool: s("pool_mode").as_deref() == Some("transaction"),
 			route_claim: s("route_claim"),
 			route_claim_keyspace: s("route_claim_keyspace"),
+			read_replicas: replica::from_settings(v.get("read_replicas")),
 		}
 	}
 }
@@ -4602,7 +5048,7 @@ pub(crate) mod settings {
 	/// reading kept) while the others go on with the reading they have. A cluster without the
 	/// column, or a home node that does not answer, has the defaults.
 	pub async fn get(app: &Arc<App>) -> Arc<Settings> {
-		let key = format!("{}/{}", app.config.home, app.config.service.database);
+		let key = format!("{}/{}", app.config.home(), app.config.service.database);
 		let conn = {
 			let mut c = cache().lock().expect("settings");
 			match c.get_mut(&key) {
@@ -4712,7 +5158,7 @@ pub fn pooled(node: &str, role: &str) -> usize {
 
 impl Router {
 	fn pool_key(&self, node: NodeId) -> Option<pool::Key> {
-		let n = self.catalog.nodes.get(&node)?;
+		let n = self.node_of(node)?;
 		Some((
 			format!("{}:{}/{}", n.host, n.port, n.dbname),
 			self.role.clone(),
@@ -4765,7 +5211,7 @@ impl Router {
 				host: home.host.clone(),
 				port: home.port,
 				sslmode: home.sslmode,
-				ca_file: self.app.config.home.ca_file.clone(),
+				ca_file: self.app.config.home().ca_file.clone(),
 			};
 			let tls = self.tls_of(&address);
 			self.app.cancels.retarget(
@@ -5570,6 +6016,8 @@ enum Event {
 	/// Reading from the client failed: it is gone, and nothing more is said to it.
 	ClientGone(WireError),
 	Node(NodeId, Message),
+	/// Reading from this node's connection failed.
+	NodeLost(NodeId, WireError),
 	/// The client stayed idle past `PARK`: its node sessions go to the pool.
 	Idle,
 }
@@ -5657,6 +6105,8 @@ enum Plan {
 	Gather {
 		nodes: Vec<NodeId>,
 		sql: String,
+		/// Where each node's worker runs, when not on the node itself: its replica (replica.rs).
+		on: Vec<NodeId>,
 	},
 	Refuse(route::Refusal),
 }
