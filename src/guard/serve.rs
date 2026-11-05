@@ -3,12 +3,20 @@
 //!
 //! | Method and path | Who | What |
 //! | --- | --- | --- |
-//! | `GET /v1/health` | anyone | `{"ok": true}` |
+//! | `GET /v1/health` | anyone | `{"ok": true, "features": [...], "build": "0.1.x"}`: `request` (changes asked of a pair) and `move` (`freeze`, `adopt`, `moved`, `thaw`), and its build (`guard::BUILD`); a witness from before them says none of them |
 //! | `POST /v1/clusters/<id>/call` | the cluster's guards (its token) | a `Call` in, an `Answer` out |
 //! | `PUT /v1/clusters/<id>` | the operator | `{"primary", "standby", "lease_ms", "token"}`: a new cluster at epoch 1; 409 if it exists |
 //! | `GET /v1/clusters/<id>` | the operator | its state and `lease_left_ms` |
 //! | `POST /v1/clusters/<id>/standby` | the operator | `{"standby": name or null}`: a rebuilt or new standby; `eligible` goes false |
 //! | `POST /v1/clusters/<id>/accept-loss` | the operator | the next grant may skip `eligible` (the standby may lack acknowledged commits) |
+//! | `POST /v1/clusters/<id>/request` | the operator | `{"id", "kind": "handover" or "replace", "to"}`: a change the primary's guard carries out; 409 with the reason when it cannot be asked |
+//! | `POST /v1/clusters/<id>/freeze` | the operator | the pair is moving: any request ended, leases still renewed, nothing else changes |
+//! | `POST /v1/clusters/<id>/moved` | the operator | `{"to": "host:port"}`, once frozen and taken over there: every call is answered with it |
+//! | `POST /v1/clusters/<id>/thaw` | the operator | a move given up before the pair was taken over elsewhere: the freeze ends |
+//!
+//! `PUT` with `"adopt": {"epoch", "primary", "standby", "eligible", "accept_loss"}` (a frozen state
+//! read from the witness the pair moves from) takes the pair over at that state instead of epoch 1;
+//! its lease starts at its first call.
 //!
 //! A cluster's file is written and fsynced, then renamed into place and its directory fsynced,
 //! before any answer that depends on it goes out; a write that fails leaves the state as it was and
@@ -32,7 +40,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use super::witness::{Answer, Call, Cluster};
+use super::witness::{Answer, Call, Cluster, Moving, Request, RequestKind};
 use crate::admin::{read_request, respond};
 use crate::scram::constant_time_eq;
 
@@ -41,6 +49,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// what a flood can make the witness hold to tens of MiB, inside the unit's memory cap; the rest
 /// wait in the kernel's backlog. Two guards a cluster need a handful.
 const MAX_CONNECTIONS: usize = 32;
+/// What this witness takes beyond the leases and grants every witness does: a host keeping pairs on
+/// it asks for nothing a witness does not say here (a witness from before them says none).
+pub const FEATURES: [&str; 2] = ["request", "move"];
 
 pub struct WitnessConfig {
 	pub addr: String,
@@ -164,7 +175,10 @@ impl Witness {
 			.unwrap_or_default()
 			.trim_end_matches('/');
 		if method == "GET" && path == "/v1/health" {
-			return (200, json!({"ok": true}));
+			return (
+				200,
+				json!({"ok": true, "features": FEATURES, "build": super::BUILD}),
+			);
 		}
 		let Some(rest) = path.strip_prefix("/v1/clusters/") else {
 			return error(404, "no such path");
@@ -253,8 +267,20 @@ impl Witness {
 						"lease_ms is 2000-600000, and the standby is another copy",
 					);
 				}
+				let cluster = match body.get("adopt") {
+					None | Some(Value::Null) => Cluster::new(primary, standby, lease_ms, now),
+					Some(adopt) => {
+						let Some(frozen) = adopted(adopt, primary, standby, lease_ms) else {
+							return error(
+								400,
+								"adopt is {\"epoch\", \"primary\", \"standby\", \"eligible\", \"accept_loss\"}, the primary and standby as given",
+							);
+						};
+						Cluster::adopt(&frozen, lease_ms)
+					}
+				};
 				let e = Entry {
-					cluster: Cluster::new(primary, standby, lease_ms, now),
+					cluster,
 					token_sha256: sha256_hex(token),
 				};
 				if let Err(m) = self.persist(id, &e) {
@@ -265,20 +291,99 @@ impl Witness {
 					primary,
 					?standby,
 					lease_ms,
-					"cluster created at epoch 1"
+					epoch = e.cluster.epoch,
+					adopted = e.cluster.adopted,
+					"cluster created"
 				);
 				let state = state_json(&e.cluster, now);
 				clusters.insert(id.to_string(), e);
 				(201, state)
 			}
-			("GET", "") => match clusters.get(id) {
-				Some(e) => (200, state_json(&e.cluster, now)),
+			("GET", "") => match clusters.get_mut(id) {
+				Some(e) => {
+					// A request not carried out in time ends here too, so its end can be read.
+					let before = e.cluster.clone();
+					if e.cluster.expire(now)
+						&& let Err(m) = self.persist(id, e)
+					{
+						e.cluster = before;
+						return error(500, &m);
+					}
+					(200, state_json(&e.cluster, now))
+				}
 				None => error(404, "no such cluster on this witness"),
 			},
+			("POST", "request" | "freeze" | "moved" | "thaw") => {
+				let Some(e) = clusters.get_mut(id) else {
+					return error(404, "no such cluster on this witness");
+				};
+				let before = e.cluster.clone();
+				let changed = match verb {
+					"request" => {
+						let kind = body
+							.get("kind")
+							.and_then(Value::as_str)
+							.and_then(RequestKind::parse);
+						let rid = body.get("id").and_then(Value::as_str).filter(|v| {
+							!v.is_empty()
+								&& v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic())
+						});
+						let to = body
+							.get("to")
+							.and_then(Value::as_str)
+							.filter(|v| !v.is_empty());
+						let (Some(kind), Some(rid), Some(to)) = (kind, rid, to) else {
+							return error(
+								400,
+								"send {\"id\", \"kind\": \"handover\"|\"replace\", \"to\"}",
+							);
+						};
+						let request = Request {
+							id: rid.to_string(),
+							kind,
+							to: to.to_string(),
+						};
+						match e.cluster.ask_for(request, now) {
+							Ok(changed) => changed,
+							Err(m) => return error(409, &m),
+						}
+					}
+					"freeze" => e.cluster.freeze(),
+					"thaw" => match e.cluster.thaw() {
+						Ok(changed) => changed,
+						Err(m) => return error(409, &m),
+					},
+					_ => {
+						let to = body.get("to").and_then(Value::as_str).filter(|t| {
+							t.rsplit_once(':').is_some_and(|(h, p)| {
+								!h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0)
+							})
+						});
+						let Some(to) = to else {
+							return error(400, "send {\"to\": \"host:port\"}");
+						};
+						match e.cluster.moved(to) {
+							Ok(changed) => changed,
+							Err(m) => return error(409, &m),
+						}
+					}
+				};
+				if changed {
+					if let Err(m) = self.persist(id, e) {
+						e.cluster = before;
+						return error(500, &m);
+					}
+					tracing::warn!(cluster = id, verb, "set by the operator");
+				}
+				(200, state_json(&e.cluster, now))
+			}
 			("POST", "standby" | "accept-loss") => {
 				let Some(e) = clusters.get_mut(id) else {
 					return error(404, "no such cluster on this witness");
 				};
+				if e.cluster.moving.is_some() {
+					return error(409, "the pair is moving to another witness");
+				}
 				let before = e.cluster.clone();
 				if verb == "standby" {
 					let standby = body.get("standby").and_then(Value::as_str);
@@ -313,9 +418,33 @@ fn log_change(id: &str, call: &Call, answer: &Answer, c: &Cluster) {
 	}
 }
 
+/// A frozen state sent with `PUT`'s `adopt`, as a cluster to take over, its roles as the body names.
+fn adopted(v: &Value, primary: &str, standby: Option<&str>, lease_ms: u64) -> Option<Cluster> {
+	let named_primary = v.get("primary")?.as_str()?;
+	let named_standby = v.get("standby").and_then(Value::as_str);
+	if named_primary != primary || named_standby != standby {
+		return None;
+	}
+	let mut c = Cluster::new(primary, standby, lease_ms, 0);
+	c.epoch = v.get("epoch")?.as_u64().filter(|e| *e >= 1)?;
+	c.eligible = v.get("eligible")?.as_bool()?;
+	c.accept_loss = v
+		.get("accept_loss")
+		.and_then(Value::as_bool)
+		.unwrap_or(false);
+	if c.eligible && standby.is_none() {
+		return None;
+	}
+	Some(c)
+}
+
 fn state_json(c: &Cluster, now: u64) -> Value {
 	let mut v = c.to_json();
 	v["lease_left_ms"] = json!(c.lease_until.saturating_sub(now));
+	v["adopted"] = json!(c.adopted);
+	if let Some(Moving::Moved(to)) = &c.moving {
+		v["moved_to"] = json!(to);
+	}
 	v
 }
 
@@ -442,6 +571,7 @@ mod tests {
 				copy: "a".into(),
 				epoch: 1,
 				eligible: true,
+				standby: None,
 			},
 		);
 		assert_eq!((status, answer["eligible"].as_bool()), (200, Some(true)));
@@ -512,6 +642,7 @@ mod tests {
 				copy: "a".into(),
 				epoch: 1,
 				eligible: true,
+				standby: None,
 			},
 		);
 		let auth = format!("Bearer {OP}");
@@ -528,5 +659,165 @@ mod tests {
 		let (_, s) = w.handle("POST", "/v1/clusters/cp/accept-loss", Some(&auth), b"");
 		assert_eq!(s["accept_loss"].as_bool(), Some(true));
 		std::fs::remove_dir_all(&d).unwrap();
+	}
+
+	#[test]
+	fn a_change_is_asked_through_the_operator_and_its_end_is_read_back() {
+		let d = dir("request");
+		let w = Witness::open(&d, OP).unwrap();
+		create(&w);
+		let auth = format!("Bearer {OP}");
+		let ask = |body: &str| {
+			w.handle(
+				"POST",
+				"/v1/clusters/cp/request",
+				Some(&auth),
+				body.as_bytes(),
+			)
+		};
+		let (status, answer) = ask(r#"{"id": "x", "kind": "handover", "to": "b"}"#);
+		assert_eq!(status, 409, "not eligible yet: {answer}");
+		call(
+			&w,
+			Call::Eligible {
+				copy: "a".into(),
+				epoch: 1,
+				eligible: true,
+				standby: None,
+			},
+		);
+		assert_eq!(ask(r#"{"id": "x", "kind": "handover"}"#).0, 400);
+		let (status, state) = ask(r#"{"id": "x", "kind": "handover", "to": "b"}"#);
+		assert_eq!((status, state["request"]["id"].as_str()), (200, Some("x")));
+		assert_eq!(ask(r#"{"id": "y", "kind": "replace", "to": "c"}"#).0, 409);
+		let (_, lease) = call(
+			&w,
+			Call::Renew {
+				copy: "a".into(),
+				epoch: 1,
+			},
+		);
+		assert_eq!(lease["request"]["kind"], "handover");
+		let (_, answer) = call(
+			&w,
+			Call::Handover {
+				copy: "a".into(),
+				epoch: 1,
+				id: "x".into(),
+			},
+		);
+		assert_eq!(
+			(answer["answer"].as_str(), answer["epoch"].as_u64()),
+			(Some("demoted"), Some(2))
+		);
+		drop(w);
+		let w = Witness::open(&d, OP).unwrap();
+		let (_, state) = w.handle("GET", "/v1/clusters/cp", Some(&auth), b"");
+		assert_eq!(
+			(
+				state["primary"].as_str(),
+				state["ended"]["id"].as_str(),
+				state["ended"]["done"].as_bool()
+			),
+			(Some("b"), Some("x"), Some(true))
+		);
+		std::fs::remove_dir_all(&d).unwrap();
+	}
+
+	#[test]
+	fn a_pair_moves_by_freezing_here_adopting_there_and_pointing_here_at_there() {
+		let (d1, d2) = (dir("move-from"), dir("move-to"));
+		let (from, to) = (
+			Witness::open(&d1, OP).unwrap(),
+			Witness::open(&d2, OP).unwrap(),
+		);
+		create(&from);
+		call(
+			&from,
+			Call::Eligible {
+				copy: "a".into(),
+				epoch: 1,
+				eligible: true,
+				standby: None,
+			},
+		);
+		let auth = format!("Bearer {OP}");
+		assert_eq!(
+			from.handle(
+				"POST",
+				"/v1/clusters/cp/moved",
+				Some(&auth),
+				br#"{"to": "10.0.0.9:7445"}"#
+			)
+			.0,
+			409,
+			"freeze first"
+		);
+		let (_, health) = from.handle("GET", "/v1/health", None, b"");
+		assert_eq!(health["features"], json!(["request", "move"]));
+		assert_eq!(health["build"], json!(crate::guard::BUILD));
+		// A move given up before the pair was taken over elsewhere: thawed, nothing else changed.
+		from.handle("POST", "/v1/clusters/cp/freeze", Some(&auth), b"");
+		let (status, thawed) = from.handle("POST", "/v1/clusters/cp/thaw", Some(&auth), b"");
+		assert_eq!(
+			(
+				status,
+				thawed["moving"].is_null(),
+				thawed["eligible"].as_bool()
+			),
+			(200, true, Some(true))
+		);
+		let (_, frozen) = from.handle("POST", "/v1/clusters/cp/freeze", Some(&auth), b"");
+		assert_eq!(frozen["moving"], "frozen");
+		let body = json!({
+			"primary": "a", "standby": "b", "lease_ms": 2_000, "token": TOKEN,
+			"adopt": {"epoch": frozen["epoch"], "primary": "a", "standby": "b", "eligible": frozen["eligible"], "accept_loss": false},
+		})
+		.to_string();
+		let (status, there) = to.handle("PUT", "/v1/clusters/cp", Some(&auth), body.as_bytes());
+		assert_eq!(
+			(
+				status,
+				there["eligible"].as_bool(),
+				there["adopted"].as_bool()
+			),
+			(201, Some(true), Some(true))
+		);
+		let (status, _) = from.handle(
+			"POST",
+			"/v1/clusters/cp/moved",
+			Some(&auth),
+			br#"{"to": "10.0.0.9:7445"}"#,
+		);
+		assert_eq!(status, 200);
+		assert_eq!(
+			from.handle("POST", "/v1/clusters/cp/thaw", Some(&auth), b"")
+				.0,
+			409,
+			"held there now"
+		);
+		let (_, answer) = call(
+			&from,
+			Call::Renew {
+				copy: "a".into(),
+				epoch: 1,
+			},
+		);
+		assert_eq!(
+			(answer["answer"].as_str(), answer["witness"].as_str()),
+			(Some("moved"), Some("10.0.0.9:7445"))
+		);
+		// The old one keeps its tombstone: a second create there is refused, so it never starts again at epoch 1.
+		assert_eq!(create(&from).0, 409);
+		let (_, lease) = call(
+			&to,
+			Call::Renew {
+				copy: "a".into(),
+				epoch: 1,
+			},
+		);
+		assert_eq!(lease["answer"], "lease");
+		std::fs::remove_dir_all(&d1).unwrap();
+		std::fs::remove_dir_all(&d2).unwrap();
 	}
 }

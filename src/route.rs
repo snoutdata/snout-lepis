@@ -22,6 +22,9 @@ pub enum KeyValue {
 	/// A value cast to a type (its name as the parser gives it, unqualified): the value is
 	/// that type's, and only a type whose values hash as the key's may pin it.
 	Cast(Box<KeyValue>, String),
+	/// A row's key and second key, in a keyspace with a second key:
+	/// only an INSERT's row names both, so only an INSERT is placed by them.
+	Pair(Box<KeyValue>, Box<KeyValue>),
 }
 
 /// One relation a statement reads or writes, with what the WHERE clause pins its key to.
@@ -418,6 +421,137 @@ pub fn route(facts: &Facts, catalog: &Catalog, params: Params) -> Route {
 	}
 }
 
+/// Which chunk table each chunked relation of a statement routed to ONE node names:
+/// the chunk holding every row the statement can reach of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chunking {
+	/// Relation → chunk number. A relation missing here is left as the shell, which is never
+	/// wrong for a read, UPDATE or DELETE (the node's chunks, through inheritance), only slower.
+	pub map: std::collections::HashMap<RelationName, u32>,
+	/// INSERT … VALUES into a chunked table: each row's chunk, in VALUES order.
+	pub insert_rows: Option<Vec<u32>>,
+	/// An INSERT into this chunked table whose rows' chunks cannot be told (INSERT … SELECT):
+	/// the shell would refuse it, so the router does, with a sentence.
+	pub insert_unknown: Option<RelationName>,
+}
+
+/// The chunks a statement's chunked relations can be named by (`Chunking`). Pure, like `route`;
+/// called only for a statement `route` sent to one node or split by row.
+pub fn chunking(facts: &Facts, catalog: &Catalog, params: Params) -> Result<Chunking, Route> {
+	let mut out = Chunking::default();
+	if catalog.chunked.is_empty() {
+		return Ok(out);
+	}
+	let mut sharded: Vec<(usize, &str, &str)> = Vec::new();
+	for (i, t) in facts.tables.iter().enumerate() {
+		if let Some(RelationKind::Sharded {
+			keyspace,
+			key_column,
+		}) = catalog.relations.get(&t.name)
+		{
+			sharded.push((i, keyspace, key_column));
+		}
+	}
+	if !sharded
+		.iter()
+		.any(|(i, _, _)| catalog.chunked.contains(&facts.tables[*i].name))
+	{
+		return Ok(out);
+	}
+	let chunk_of = |keyspace: &str, v: &KeyValue| -> Result<Option<u32>, Route> {
+		let Some(ks) = catalog.keyspaces.get(keyspace) else {
+			return Ok(None);
+		};
+		Ok(key_hash(catalog, keyspace, v, params)?
+			.and_then(|h| ks.chunk_of_hash(h))
+			.map(|c| c.number))
+	};
+	let mut conflicted: BTreeSet<RelationName> = BTreeSet::new();
+	let mut assign = |out: &mut Chunking, rel: &RelationName, n: u32| {
+		if !catalog.chunked.contains(rel) || conflicted.contains(rel) {
+			return;
+		}
+		match out.map.get(rel) {
+			Some(m) if *m != n => {
+				out.map.remove(rel);
+				conflicted.insert(rel.clone());
+			}
+			_ => {
+				out.map.insert(rel.clone(), n);
+			}
+		}
+	};
+	// INSERT … VALUES: each row's chunk; one chunk for all of them names the target's.
+	let insert_target = (facts.kind == Kind::Insert)
+		.then(|| {
+			facts
+				.tables
+				.iter()
+				.find(|t| t.written && catalog.chunked.contains(&t.name))
+		})
+		.flatten();
+	if let (Some(target), Some(keys)) = (insert_target, &facts.insert_keys) {
+		let keyspace = sharded
+			.iter()
+			.find(|(i, _, _)| facts.tables[*i].name == target.name)
+			.map(|(_, k, _)| *k)
+			.unwrap_or_default();
+		let mut rows = Vec::with_capacity(keys.len());
+		for k in keys {
+			match chunk_of(keyspace, k)? {
+				Some(n) => rows.push(n),
+				// A NULL key: route() refuses it before a node sees it.
+				None => return Ok(out),
+			}
+		}
+		if let Some(first) = rows.first().copied()
+			&& rows.iter().all(|r| *r == first)
+		{
+			assign(&mut out, &target.name, first);
+		}
+		out.insert_rows = Some(rows);
+	} else if let Some(target) = insert_target {
+		out.insert_unknown = Some(target.name.clone());
+	}
+	for group in key_components(&sharded, facts) {
+		let mut chunks: Option<BTreeSet<u32>> = None;
+		for i in &group {
+			let Some(values) = &facts.tables[*i].key_values else {
+				continue;
+			};
+			let keyspace = sharded
+				.iter()
+				.find(|(j, _, _)| j == i)
+				.map(|(_, k, _)| *k)
+				.unwrap_or_default();
+			let mut here = BTreeSet::new();
+			for v in values {
+				if let Some(n) = chunk_of(keyspace, v)? {
+					here.insert(n);
+				}
+			}
+			chunks = Some(match chunks {
+				None => here,
+				Some(prev) => prev.intersection(&here).copied().collect(),
+			});
+		}
+		if let Some(set) = chunks
+			&& set.len() == 1
+		{
+			let n = *set.iter().next().expect("one");
+			for i in &group {
+				let t = &facts.tables[*i];
+				// An INSERT's target is named by its rows, above.
+				if insert_target.is_some_and(|it| it.name == t.name) && t.written {
+					continue;
+				}
+				assign(&mut out, &t.name, n);
+			}
+		}
+	}
+	Ok(out)
+}
+
 /// The sharded tables grouped by key-equality joins (union-find), each group a list of indexes
 /// into `facts.tables`.
 fn key_components(sharded: &[(usize, &str, &str)], facts: &Facts) -> Vec<Vec<usize>> {
@@ -454,6 +588,72 @@ fn owner(
 	v: &KeyValue,
 	params: Params,
 ) -> Result<Option<NodeId>, Route> {
+	if let KeyValue::Pair(..) = v {
+		let h = key_hash(catalog, keyspace, v, params)?;
+		return Ok(h.and_then(|h| catalog.keyspaces.get(keyspace).map(|k| k.owner_of_hash(h))));
+	}
+	resolve(
+		catalog,
+		keyspace,
+		v,
+		params,
+		&|s| catalog.owner(keyspace, s),
+		&|b| catalog.owner_binary(keyspace, b),
+	)
+}
+
+/// The L5 hash of one key value; Ok(None) for NULL.
+fn key_hash(
+	catalog: &Catalog,
+	keyspace: &str,
+	v: &KeyValue,
+	params: Params,
+) -> Result<Option<i64>, Route> {
+	if let KeyValue::Pair(a, b) = v {
+		let Some(second) = catalog.keyspaces.get(keyspace).and_then(|k| k.second) else {
+			return Err(refuse(
+				"22P02",
+				format!("keyspace {keyspace} has no second key"),
+				"Name only the distribution key.",
+			));
+		};
+		let Some(first) = key_hash(catalog, keyspace, a, params)? else {
+			return Ok(None);
+		};
+		// The second key's hash is seeded by the first's (catalog::Keyspace::hash_sql).
+		let seed = first as u64;
+		let ce = |e: crate::hash::KeyError| crate::catalog::CatalogError(e.to_string());
+		return resolve_as(
+			second,
+			b,
+			params,
+			&|s| second.hash_text_value(s, seed).map_err(ce),
+			&|x| second.hash_binary_value(x, seed).map_err(ce),
+		);
+	}
+	resolve(
+		catalog,
+		keyspace,
+		v,
+		params,
+		&|s| catalog.hash_text(keyspace, s),
+		&|b| catalog.hash_binary(keyspace, b),
+	)
+}
+
+type Of<'a, T> = &'a dyn Fn(&str) -> Result<T, crate::catalog::CatalogError>;
+type OfBinary<'a, T> = &'a dyn Fn(&[u8]) -> Result<T, crate::catalog::CatalogError>;
+
+/// One key value, through its casts and its parameter's format, handed to `text` (Postgres's
+/// text form) or `binary` (the key type's binary form).
+fn resolve<T>(
+	catalog: &Catalog,
+	keyspace: &str,
+	v: &KeyValue,
+	params: Params,
+	text: Of<T>,
+	binary: OfBinary<T>,
+) -> Result<Option<T>, Route> {
 	let bad = |e: String| {
 		refuse(
 			"22P02",
@@ -463,6 +663,24 @@ fn owner(
 	};
 	let Some(key) = catalog.keyspaces.get(keyspace).map(|k| k.key_type) else {
 		return Err(bad(format!("no keyspace {keyspace}")));
+	};
+	resolve_as(key, v, params, text, binary)
+}
+
+/// `resolve` for a value of key type `key`.
+fn resolve_as<T>(
+	key: crate::hash::KeyType,
+	v: &KeyValue,
+	params: Params,
+	text: Of<T>,
+	binary: OfBinary<T>,
+) -> Result<Option<T>, Route> {
+	let bad = |e: String| {
+		refuse(
+			"22P02",
+			e,
+			"Pass the distribution key in its type's standard form.",
+		)
 	};
 	// The types a value passes through on its way to the comparison: each must hash as the key.
 	let mut types: Vec<u32> = Vec::new();
@@ -477,6 +695,7 @@ fn owner(
 	match v {
 		KeyValue::Null => Ok(None),
 		KeyValue::Cast(..) => unreachable!("unwrapped above"),
+		KeyValue::Pair(..) => Err(bad("a pair of keys inside a cast".into())),
 		KeyValue::Const(s) => {
 			let mut to_numeric = false;
 			for t in &types {
@@ -491,7 +710,7 @@ fn owner(
 				return Err(bad(format!("{s} is not an integer")));
 			}
 			let _ = to_numeric;
-			catalog.owner(keyspace, s).map(Some).map_err(|e| bad(e.0))
+			text(s).map(Some).map_err(|e| bad(e.0))
 		}
 		KeyValue::Param(n) => {
 			let Some(p) = params.get(n.wrapping_sub(1)) else {
@@ -516,7 +735,7 @@ fn owner(
 			let bytes_type = declared.or_else(|| types.last().copied());
 			match p {
 				ParamValue::Null => Ok(None),
-				ParamValue::Text(s) => catalog.owner(keyspace, s).map(Some).map_err(|e| bad(e.0)),
+				ParamValue::Text(s) => text(s).map(Some).map_err(|e| bad(e.0)),
 				ParamValue::Binary(b) if to_numeric && matches!(bytes_type, Some(20 | 21 | 23)) => {
 					let int = match b.len() {
 						2 => i16::from_be_bytes([b[0], b[1]]) as i64,
@@ -524,15 +743,9 @@ fn owner(
 						8 => i64::from_be_bytes(b[..].try_into().expect("8 bytes")),
 						_ => return Err(bad("not a binary integer".into())),
 					};
-					catalog
-						.owner(keyspace, &int.to_string())
-						.map(Some)
-						.map_err(|e| bad(e.0))
+					text(&int.to_string()).map(Some).map_err(|e| bad(e.0))
 				}
-				ParamValue::Binary(b) => catalog
-					.owner_binary(keyspace, b)
-					.map(Some)
-					.map_err(|e| bad(e.0)),
+				ParamValue::Binary(b) => binary(b).map(Some).map_err(|e| bad(e.0)),
 				ParamValue::Declared(..) => Err(bad("a parameter declared twice".into())),
 			}
 		}
@@ -793,8 +1006,12 @@ pub mod copy {
 	pub enum Piece {
 		/// Every node gets it: a header line, or binary COPY's signature and header.
 		Everyone(Vec<u8>),
-		/// One row, with its key.
-		Row { key: Key, bytes: Vec<u8> },
+		/// One row, with its key (and its second key).
+		Row {
+			key: Key,
+			second: Option<Key>,
+			bytes: Vec<u8>,
+		},
 		/// Binary COPY's trailer, or text's `\.` line: the end of the data.
 		End(Vec<u8>),
 	}
@@ -805,6 +1022,7 @@ pub mod copy {
 	pub struct Splitter {
 		o: Options,
 		key_col: usize,
+		second_col: Option<usize>,
 		buf: Vec<u8>,
 		header_pending: bool,
 		ended: bool,
@@ -817,10 +1035,17 @@ pub mod copy {
 			Splitter {
 				o: options,
 				key_col,
+				second_col: None,
 				buf: Vec::new(),
 				header_pending,
 				ended: false,
 			}
+		}
+
+		/// A second key's position too (Phase 5): each row's `second`.
+		pub fn with_second(mut self, col: Option<usize>) -> Splitter {
+			self.second_col = col;
+			self
 		}
 
 		/// The complete pieces `data` finishes; what is left waits for the next call.
@@ -940,22 +1165,29 @@ pub mod copy {
 				self.header_pending = false;
 				return Ok(Some((Piece::Everyone(bytes), end)));
 			}
-			let key = if csv {
-				self.csv_key(content)?
-			} else {
-				self.text_key(content)?
+			let at = |col: usize| {
+				if csv {
+					self.csv_key(content, col)
+				} else {
+					self.text_key(content, col)
+				}
 			};
-			Ok(Some((Piece::Row { key, bytes }, end)))
+			let key = at(self.key_col)?;
+			let second = match self.second_col {
+				Some(c) => Some(at(c)?),
+				None => None,
+			};
+			Ok(Some((Piece::Row { key, second, bytes }, end)))
 		}
 
-		fn text_key(&self, row: &[u8]) -> Result<Key, String> {
+		fn text_key(&self, row: &[u8], col: usize) -> Result<Key, String> {
 			let mut field = 0;
 			let mut start = 0;
 			let mut i = 0;
 			let mut raw: Option<&[u8]> = None;
 			while i <= row.len() {
 				if i == row.len() || row[i] == self.o.delimiter {
-					if field == self.key_col {
+					if field == col {
 						raw = Some(&row[start..i]);
 						break;
 					}
@@ -1028,7 +1260,7 @@ pub mod copy {
 				.map_err(|_| "a distribution key in the COPY data is not valid UTF-8".into())
 		}
 
-		fn csv_key(&self, row: &[u8]) -> Result<Key, String> {
+		fn csv_key(&self, row: &[u8], col: usize) -> Result<Key, String> {
 			let (q, e, d) = (self.o.quote, self.o.escape, self.o.delimiter);
 			let mut field = 0;
 			let mut i = 0;
@@ -1073,7 +1305,7 @@ pub mod copy {
 					value.push(c);
 					i += 1;
 				}
-				if field == self.key_col {
+				if field == col {
 					if !was_quoted && value == self.o.null {
 						return Ok(Key::Null);
 					}
@@ -1123,6 +1355,7 @@ pub mod copy {
 			}
 			let mut i = 2;
 			let mut key = None;
+			let mut second = None;
 			for f in 0..fields as usize {
 				if b.len() < i + 4 {
 					return Ok(None);
@@ -1143,6 +1376,9 @@ pub mod copy {
 					i += len;
 					v
 				};
+				if Some(f) == self.second_col {
+					second = Some(value.clone());
+				}
 				if f == self.key_col {
 					key = Some(value);
 				}
@@ -1150,9 +1386,13 @@ pub mod copy {
 			let Some(key) = key else {
 				return Err("a row has fewer columns than the COPY names".into());
 			};
+			if self.second_col.is_some() && second.is_none() {
+				return Err("a row has fewer columns than the COPY names".into());
+			}
 			Ok(Some((
 				Piece::Row {
 					key,
+					second,
 					bytes: b[..i].to_vec(),
 				},
 				at + i,
@@ -1350,6 +1590,8 @@ mod tests {
 				seed: 1,
 				ranges: Keyspace::even_ranges(n as usize * 8, &ids),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c.keyspaces.insert(
@@ -1361,6 +1603,8 @@ mod tests {
 				seed: 2,
 				ranges: Keyspace::even_ranges(n as usize * 8, &ids),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		let sharded = |k: &str, c: &str| RelationKind::Sharded {
@@ -1385,6 +1629,8 @@ mod tests {
 				seed: 3,
 				ranges: Keyspace::even_ranges(n as usize * 8, &ids),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c.relations

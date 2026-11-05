@@ -167,6 +167,39 @@ struct Summary {
 	key_target: Option<usize>,
 }
 
+/// Postgres's lookup of a table name as the analyzer does it: a qualified name is itself; an
+/// unqualified one is the first schema of the search path whose table the catalog knows, else
+/// the first schema of the path.
+pub fn resolve_name(
+	catalog: &Catalog,
+	search_path: &[String],
+	schema: &str,
+	table: &str,
+) -> RelationName {
+	if !schema.is_empty() {
+		return RelationName {
+			schema: schema.to_string(),
+			table: table.to_string(),
+		};
+	}
+	for s in search_path {
+		let name = RelationName {
+			schema: s.clone(),
+			table: table.to_string(),
+		};
+		if catalog.relations.contains_key(&name) {
+			return name;
+		}
+	}
+	RelationName {
+		schema: search_path
+			.first()
+			.cloned()
+			.unwrap_or_else(|| "public".to_string()),
+		table: table.to_string(),
+	}
+}
+
 /// A column reference that denotes a sharded table's key.
 #[derive(Clone, Copy)]
 struct Binding {
@@ -456,7 +489,7 @@ impl Analyzer<'_> {
 			return Ok(());
 		};
 		let target = self.add_table(rel, true);
-		let key = self.key_of(target);
+		let key = self.placed_by(target);
 		if key.is_some() && s.cols.is_empty() {
 			return Err(AnalyzeError::Unsupported(
 				"name the columns of an INSERT into a distributed table, so Lepis can find the distribution key"
@@ -480,18 +513,29 @@ impl Analyzer<'_> {
 			None => None,
 		};
 		let mut keys = None;
-		if let (Some(key), Some(rows)) = (&key, rows) {
-			let Some(pos) = s.cols.iter().position(|c| {
-				matches!(&c.node, Some(NodeEnum::ResTarget(r)) if &r.name == key && r.indirection.is_empty())
-			}) else {
-				return Err(AnalyzeError::Unsupported(format!(
-					"an INSERT into a distributed table must give its distribution key column {key} a value, so Lepis can find each row's node"
-				)));
-			};
+		if let (Some(placed), Some(rows)) = (&key, rows) {
+			let mut at = Vec::new();
+			for key in placed {
+				let Some(pos) = s.cols.iter().position(|c| {
+					matches!(&c.node, Some(NodeEnum::ResTarget(r)) if &r.name == key && r.indirection.is_empty())
+				}) else {
+					return Err(AnalyzeError::Unsupported(format!(
+						"an INSERT into a distributed table must give its distribution key column {key} a value, so Lepis can find each row's node"
+					)));
+				};
+				at.push(pos);
+			}
 			let mut out = Vec::with_capacity(rows.len());
 			for row in rows {
-				let value = match &row.node {
+				let value = |pos: usize| match &row.node {
 					Some(NodeEnum::List(l)) => l.items.get(pos).and_then(key_value),
+					_ => None,
+				};
+				let value = match at.as_slice() {
+					[k] => value(*k),
+					[k, s] => value(*k)
+						.zip(value(*s))
+						.map(|(a, b)| KeyValue::Pair(Box::new(a), Box::new(b))),
 					_ => None,
 				};
 				out.push(value.ok_or_else(|| {
@@ -606,10 +650,10 @@ impl Analyzer<'_> {
 
 	/// A SET list (UPDATE, ON CONFLICT DO UPDATE): assigning the target's key would move the row.
 	fn assignments(&mut self, targets: &[Node], target: usize) -> Result {
-		let key = self.key_of(target);
+		let key = self.placed_by(target).unwrap_or_default();
 		for t in targets {
 			if let Some(NodeEnum::ResTarget(rt)) = &t.node
-				&& key.as_deref() == Some(rt.name.as_str())
+				&& key.contains(&rt.name)
 			{
 				self.assigns_key = true;
 			}
@@ -1570,29 +1614,7 @@ impl Analyzer<'_> {
 	/// the search path holding it. A table the catalog does not know is unknown to Lepis too,
 	/// and route() treats it as global (home).
 	fn resolve(&self, schema: &str, table: &str) -> RelationName {
-		if !schema.is_empty() {
-			return RelationName {
-				schema: schema.to_string(),
-				table: table.to_string(),
-			};
-		}
-		for s in self.search_path {
-			let name = RelationName {
-				schema: s.clone(),
-				table: table.to_string(),
-			};
-			if self.catalog.relations.contains_key(&name) {
-				return name;
-			}
-		}
-		RelationName {
-			schema: self
-				.search_path
-				.first()
-				.cloned()
-				.unwrap_or_else(|| "public".to_string()),
-			table: table.to_string(),
-		}
+		resolve_name(self.catalog, self.search_path, schema, table)
 	}
 
 	fn add_table(&mut self, rv: &RangeVar, written: bool) -> usize {
@@ -1612,9 +1634,29 @@ impl Analyzer<'_> {
 		)
 	}
 
+	/// The column a WHERE or a join can pin a table's rows by. None for a table with a second
+	/// key: one value of its key is on every node, so neither an
+	/// equality on it nor a join on it says where its rows are.
 	fn key_of(&self, table: usize) -> Option<String> {
-		match self.catalog.relations.get(&self.tables[table].name) {
+		let name = &self.tables[table].name;
+		if self.catalog.second_keys.contains_key(name) {
+			return None;
+		}
+		match self.catalog.relations.get(name) {
 			Some(RelationKind::Sharded { key_column, .. }) => Some(key_column.clone()),
+			_ => None,
+		}
+	}
+
+	/// The columns an INSERT must give each row, in order: the key, and a second key.
+	fn placed_by(&self, table: usize) -> Option<Vec<String>> {
+		let name = &self.tables[table].name;
+		match self.catalog.relations.get(name) {
+			Some(RelationKind::Sharded { key_column, .. }) => {
+				let mut v = vec![key_column.clone()];
+				v.extend(self.catalog.second_keys.get(name).cloned());
+				Some(v)
+			}
 			_ => None,
 		}
 	}
@@ -2128,6 +2170,8 @@ mod tests {
 					seed,
 					ranges: Keyspace::even_ranges(32, &ids),
 					pins: HashMap::new(),
+					chunks: Vec::new(),
+					second: None,
 				},
 			);
 		}
@@ -3020,5 +3064,55 @@ mod tests {
 				"{sql}: {r:?}"
 			);
 		}
+	}
+
+	#[test]
+	fn a_second_key_pins_nothing_but_an_insert_names_both() {
+		let mut c = cat();
+		let mut ks = c.keyspaces["tenant"].clone();
+		ks.name = "visits".into();
+		ks.second = Some(KeyType::Int8);
+		c.keyspaces.insert("visits".into(), ks);
+		c.relations.insert(
+			rel("app", "visits"),
+			RelationKind::Sharded {
+				keyspace: "visits".into(),
+				key_column: "tenant_id".into(),
+			},
+		);
+		c.second_keys.insert(rel("app", "visits"), "seq".into());
+		let one = |sql: &str| {
+			analyze(sql, &c, &path())
+				.unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+				.remove(0)
+				.facts
+		};
+		// The tenant alone is on every node: no pin, and no join on it is colocated.
+		let f = one("select * from visits where tenant_id = 1 and seq = 2");
+		assert_eq!(f.tables[0].key_values, None);
+		let f = one("select * from visits v join orders o on o.tenant_id = v.tenant_id");
+		assert!(f.key_joins.is_empty());
+		let f = one("insert into visits (seq, note, tenant_id) values (2, 'x', 1), ($1, 'y', $2)");
+		assert_eq!(
+			f.insert_keys,
+			Some(vec![
+				KeyValue::Pair(
+					Box::new(KeyValue::Const("1".into())),
+					Box::new(KeyValue::Const("2".into()))
+				),
+				KeyValue::Pair(Box::new(KeyValue::Param(2)), Box::new(KeyValue::Param(1))),
+			])
+		);
+		let e = analyze(
+			"insert into visits (tenant_id, note) values (1, 'x')",
+			&c,
+			&path(),
+		);
+		assert!(
+			matches!(&e, Err(AnalyzeError::Unsupported(m)) if m.contains("seq")),
+			"{e:?}"
+		);
+		let f = one("update visits set seq = 3 where tenant_id = 1");
+		assert!(f.assigns_key);
 	}
 }

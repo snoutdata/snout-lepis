@@ -2,9 +2,10 @@
 //! decides where a row lives reads a snapshot, never the database, so a routing decision is a
 //! pure function a test can drive.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+pub use crate::chunk::Chunk;
 use crate::config::SslMode;
 use crate::hash::KeyType;
 
@@ -64,6 +65,13 @@ pub struct Keyspace {
 	pub ranges: Vec<Range>,
 	/// Key values given their own node (L12), by the value's text form.
 	pub pins: HashMap<String, NodeId>,
+	/// Chunks, sorted by `lo`, covering the space; empty when no table of the
+	/// keyspace is chunked yet. Every range is a set of whole chunks.
+	pub chunks: Vec<Chunk>,
+	/// The type of a second key: rows are placed by
+	/// `hash₂(second, seed = hash₁(key, seed))`, so the rows of one key value spread over every
+	/// node. None: one key.
+	pub second: Option<KeyType>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +112,54 @@ pub struct Catalog {
 	pub nodes: BTreeMap<NodeId, Node>,
 	pub keyspaces: HashMap<String, Keyspace>,
 	pub relations: HashMap<RelationName, RelationKind>,
+	/// Sharded relations stored as a shell and chunk tables (chunk.rs).
+	pub chunked: BTreeSet<RelationName>,
+	/// The second key column of each relation of a keyspace with a second key.
+	pub second_keys: BTreeMap<RelationName, String>,
+}
+
+/// A relation's key as SQL: its key column, and in a keyspace with a second key its second
+/// column (each an expression, already quoted). A plain column name converts to one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeySql {
+	pub key: String,
+	pub second: Option<String>,
+}
+
+impl From<&str> for KeySql {
+	fn from(key: &str) -> KeySql {
+		KeySql {
+			key: key.to_string(),
+			second: None,
+		}
+	}
+}
+
+impl From<&String> for KeySql {
+	fn from(key: &String) -> KeySql {
+		KeySql::from(key.as_str())
+	}
+}
+
+impl From<String> for KeySql {
+	fn from(key: String) -> KeySql {
+		KeySql { key, second: None }
+	}
+}
+
+impl KeySql {
+	/// `rel`'s key columns, quoted, each as `<prefix>.<column>` when a prefix (an alias, already
+	/// quoted) is given.
+	pub fn of(c: &Catalog, rel: &RelationName, key_column: &str, prefix: Option<&str>) -> KeySql {
+		let q = |col: &str| match prefix {
+			Some(p) => format!("{p}.{}", quote_ident(col)),
+			None => quote_ident(col),
+		};
+		KeySql {
+			key: q(key_column),
+			second: c.second_keys.get(rel).map(|s| q(s)),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,12 +286,63 @@ impl Catalog {
 			for n in ks.pins.values() {
 				self.usable_node(*n, &ks.name)?;
 			}
+			if !ks.chunks.is_empty() {
+				crate::chunk::validate(&ks.chunks, ks).map_err(CatalogError)?;
+				if !ks.pins.is_empty() {
+					return bad(format!(
+						"keyspace {}: a chunked keyspace cannot have pins (a hot key is its own chunk's range)",
+						ks.name
+					));
+				}
+			}
+		}
+		for name in &self.chunked {
+			match self.relations.get(name) {
+				Some(RelationKind::Sharded { keyspace, .. })
+					if self
+						.keyspaces
+						.get(keyspace)
+						.is_some_and(|k| !k.chunks.is_empty()) => {}
+				_ => {
+					return bad(format!(
+						"{name} is chunked but is not a table of a keyspace with chunks"
+					));
+				}
+			}
 		}
 		for (name, kind) in &self.relations {
 			if let RelationKind::Sharded { keyspace, .. } = kind
 				&& !self.keyspaces.contains_key(keyspace)
 			{
 				return bad(format!("{name} names an unknown keyspace {keyspace}"));
+			}
+			// A keyspace with a second key: every table names one, and only those do.
+			let two = match kind {
+				RelationKind::Sharded { keyspace, .. } => self
+					.keyspaces
+					.get(keyspace)
+					.is_some_and(|k| k.second.is_some()),
+				_ => false,
+			};
+			if two != self.second_keys.contains_key(name) {
+				return bad(if two {
+					format!("{name} is in a keyspace with a second key but names no second column")
+				} else {
+					format!("{name} names a second key column but its keyspace has no second key")
+				});
+			}
+			if two && !self.chunked.contains(name) {
+				return bad(format!(
+					"{name} has a second key but is not chunked: a second key needs chunks"
+				));
+			}
+		}
+		for ks in self.keyspaces.values() {
+			if ks.second.is_some() && !ks.pins.is_empty() {
+				return bad(format!(
+					"keyspace {}: a keyspace with a second key cannot have pins",
+					ks.name
+				));
 			}
 		}
 		Ok(())
@@ -269,6 +376,43 @@ impl Catalog {
 		out
 	}
 
+	/// The chunks of `rel` when it is stored chunked (chunk.rs), else None.
+	pub fn chunks_of(&self, rel: &RelationName) -> Option<&[Chunk]> {
+		if !self.chunked.contains(rel) {
+			return None;
+		}
+		match self.relations.get(rel) {
+			Some(RelationKind::Sharded { keyspace, .. }) => self
+				.keyspaces
+				.get(keyspace)
+				.map(|k| k.chunks.as_slice())
+				.filter(|c| !c.is_empty()),
+			_ => None,
+		}
+	}
+
+	/// The L5 hash of `value` (text form) in `keyspace`.
+	pub fn hash_text(&self, keyspace: &str, value: &str) -> Result<i64, CatalogError> {
+		let ks = self
+			.keyspaces
+			.get(keyspace)
+			.ok_or_else(|| CatalogError(format!("no keyspace {keyspace}")))?;
+		ks.key_type
+			.hash_text_value(value, ks.seed)
+			.map_err(|e| CatalogError(e.to_string()))
+	}
+
+	/// The L5 hash of `value` given in binary format.
+	pub fn hash_binary(&self, keyspace: &str, value: &[u8]) -> Result<i64, CatalogError> {
+		let ks = self
+			.keyspaces
+			.get(keyspace)
+			.ok_or_else(|| CatalogError(format!("no keyspace {keyspace}")))?;
+		ks.key_type
+			.hash_binary_value(value, ks.seed)
+			.map_err(|e| CatalogError(e.to_string()))
+	}
+
 	/// Builds a catalog from the text rows of the five `LOAD_*` queries.
 	pub fn from_rows(
 		epoch: i64,
@@ -277,6 +421,7 @@ impl Catalog {
 		ranges: &[Vec<Option<String>>],
 		pins: &[Vec<Option<String>>],
 		relations: &[Vec<Option<String>>],
+		chunks: &[Vec<Option<String>>],
 	) -> Result<Catalog, CatalogError> {
 		let col = |r: &[Option<String>], i: usize| -> Result<String, CatalogError> {
 			r.get(i)
@@ -340,6 +485,16 @@ impl Catalog {
 					seed: num(col(r, 3)?)? as u64,
 					ranges: Vec::new(),
 					pins: HashMap::new(),
+					chunks: Vec::new(),
+					second: match r.get(4).cloned().flatten() {
+						Some(t) => Some(KeyType::from_sql_name(&t).ok_or_else(|| {
+							CatalogError(format!(
+								"keyspace {}: unsupported second key type",
+								col(r, 0).unwrap_or_default()
+							))
+						})?),
+						None => None,
+					},
 				},
 			);
 		}
@@ -381,7 +536,30 @@ impl Catalog {
 				"reference" => RelationKind::Reference,
 				_ => RelationKind::Global,
 			};
+			if r.get(5).cloned().flatten().as_deref() == Some("t") {
+				c.chunked.insert(name.clone());
+			}
+			if let Some(second) = r.get(6).cloned().flatten() {
+				c.second_keys.insert(name.clone(), second);
+			}
 			c.relations.insert(name, kind);
+		}
+		for r in chunks {
+			let ks = col(r, 0)?;
+			let chunk = Chunk {
+				number: u32::try_from(num(col(r, 1)?)?)
+					.map_err(|_| CatalogError("bad chunk number".into()))?,
+				lo: num(col(r, 2)?)?,
+				hi: num(col(r, 3)?)?,
+			};
+			c.keyspaces
+				.get_mut(&ks)
+				.ok_or_else(|| CatalogError(format!("chunk for unknown keyspace {ks}")))?
+				.chunks
+				.push(chunk);
+		}
+		for ks in c.keyspaces.values_mut() {
+			ks.chunks.sort_by_key(|c| c.lo);
 		}
 		c.validate()?;
 		Ok(c)
@@ -391,13 +569,52 @@ impl Catalog {
 pub const LOAD_EPOCH: &str = "select epoch from lepis.cluster where id = 1";
 pub const LOAD_NODES: &str =
 	"select id, name, host, port, dbname, sslmode, kind, state, server_version_num from lepis.node";
-pub const LOAD_KEYSPACES: &str = "select name, strategy, key_type, seed from lepis.keyspace";
+pub const LOAD_KEYSPACES: &str =
+	"select name, strategy, key_type, seed, second_key_type from lepis.keyspace";
 pub const LOAD_RANGES: &str = "select keyspace, lo, hi, node_id from lepis.range";
 pub const LOAD_PINS: &str = "select keyspace, value, node_id from lepis.pin";
-pub const LOAD_RELATIONS: &str =
-	"select schema_name, table_name, kind, keyspace, key_column from lepis.relation";
+pub const LOAD_RELATIONS: &str = "select schema_name, table_name, kind, keyspace, key_column, chunked, second_column from lepis.relation";
+pub const LOAD_CHUNKS: &str = "select keyspace, number, lo, hi from lepis.chunk";
 
 impl Keyspace {
+	/// The hash a row is placed by, as SQL over its key (L5), the second key's seeded by the
+	/// first's (Phase 5).
+	pub fn hash_sql(&self, key: &KeySql, server_version_num: u32) -> Result<String, CatalogError> {
+		let e = |e: &str| CatalogError(e.to_string());
+		let first = self
+			.key_type
+			.sql_expression(&key.key, self.seed, server_version_num)
+			.map_err(e)?;
+		match (self.second, &key.second) {
+			(None, _) => Ok(first),
+			(Some(t), Some(second)) => t
+				.sql_expression_seeded(second, &first, server_version_num)
+				.map_err(e),
+			(Some(_), None) => Err(CatalogError(format!(
+				"keyspace {} places rows by two columns, and only one was named",
+				self.name
+			))),
+		}
+	}
+
+	/// The hash of a row whose key and second key have these text forms (Phase 5).
+	pub fn hash_pair(&self, key: &str, second: &str) -> Result<i64, CatalogError> {
+		let t = self
+			.second
+			.ok_or_else(|| CatalogError(format!("keyspace {} has no second key", self.name)))?;
+		let first = self
+			.key_type
+			.hash_text_value(key, self.seed)
+			.map_err(|e| CatalogError(e.to_string()))?;
+		t.hash_text_value(second, first as u64)
+			.map_err(|e| CatalogError(e.to_string()))
+	}
+
+	/// The chunk holding hash `h`, when the keyspace has chunks.
+	pub fn chunk_of_hash(&self, h: i64) -> Option<Chunk> {
+		(!self.chunks.is_empty()).then(|| crate::chunk::chunk_of(&self.chunks, h))
+	}
+
 	pub fn owner_of_hash(&self, h: i64) -> NodeId {
 		// Ranges are sorted and, once validated, cover the space; the last range whose lo <= h.
 		let i = self.ranges.partition_point(|r| r.lo <= h);
@@ -444,7 +661,7 @@ pub fn fence_sql(
 	node: NodeId,
 	server_version_num: u32,
 ) -> Result<String, CatalogError> {
-	let check = owns_check(&quote_ident(key_column), ks, node, server_version_num)?;
+	let check = owns_check(quote_ident(key_column), ks, node, server_version_num)?;
 	let table = format!(
 		"{}.{}",
 		quote_ident(&relation.schema),
@@ -461,15 +678,14 @@ pub fn fence_sql(
 /// already quoted, such as `"tenant_id"`. Pins are listed in value
 /// order, so the same catalog always gives the same text.
 pub fn owns_check(
-	column: &str,
+	column: impl Into<KeySql>,
 	ks: &Keyspace,
 	node: NodeId,
 	server_version_num: u32,
 ) -> Result<String, CatalogError> {
-	let expr = ks
-		.key_type
-		.sql_expression(column, ks.seed, server_version_num)
-		.map_err(|e| CatalogError(e.to_string()))?;
+	let key: KeySql = column.into();
+	let expr = ks.hash_sql(&key, server_version_num)?;
+	let column = key.key.as_str();
 	let owned = ks.ranges_of(node);
 	let mut terms: Vec<String> = owned
 		.iter()
@@ -544,6 +760,8 @@ mod tests {
 				seed: 0x5eed,
 				ranges: Keyspace::even_ranges(n * 4, &ids),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c
@@ -663,5 +881,46 @@ mod tests {
 		);
 		assert!(sql.contains("hashint8extended(\"tenant_id\", 24301)"));
 		assert!(sql.ends_with("not valid"));
+	}
+
+	#[test]
+	fn a_second_key_is_hashed_with_the_first_as_its_seed() {
+		let mut ks = Keyspace {
+			name: "v".into(),
+			strategy: Strategy::Hash,
+			key_type: KeyType::Int8,
+			seed: 7,
+			ranges: Keyspace::even_ranges(4, &[NodeId(1), NodeId(2)]),
+			pins: HashMap::new(),
+			chunks: Vec::new(),
+			second: Some(KeyType::Text),
+		};
+		let both = KeySql {
+			key: "\"t\"".into(),
+			second: Some("\"s\"".into()),
+		};
+		assert_eq!(
+			ks.hash_sql(&both, 180_000).unwrap(),
+			"hashtextextended(\"s\", hashint8extended(\"t\", 7))"
+		);
+		assert!(ks.hash_sql(&KeySql::from("\"t\""), 180_000).is_err());
+		let first = KeyType::Int8.hash_text_value("42", 7).unwrap();
+		assert_eq!(
+			ks.hash_pair("42", "abc").unwrap(),
+			KeyType::Text.hash_text_value("abc", first as u64).unwrap()
+		);
+		// One first key, many second keys: many places.
+		let mut owners = std::collections::BTreeSet::new();
+		for s in 0..64 {
+			owners.insert(ks.owner_of_hash(ks.hash_pair("42", &s.to_string()).unwrap()));
+		}
+		assert_eq!(owners.len(), 2);
+		assert!(
+			owns_check(both, &ks, NodeId(1), 180_000)
+				.unwrap()
+				.starts_with("hashtextextended(\"s\", hashint8extended(\"t\", 7)) between")
+		);
+		ks.second = None;
+		assert!(ks.hash_pair("1", "2").is_err());
 	}
 }

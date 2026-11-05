@@ -32,9 +32,9 @@ use serde_json::json;
 use super::Kind;
 use super::attach::target_of;
 use super::physical::STANDBY_LABEL;
-use super::spec::{NodeSpec, sslmode_name};
+use super::spec::{ADDRESS_LABELS, NodeSpec, sslmode_name};
 use super::steps::{StepCtx, connect_node, in_recovery};
-use super::{OpError, Pg, load_catalog};
+use super::{OpError, Pg, Target, load_catalog};
 use crate::catalog::{Catalog, NodeId, NodeState, quote_literal};
 use crate::server::App;
 
@@ -82,15 +82,37 @@ pub async fn precheck(
 			),
 		));
 	}
+	let mut h = Pg::connect(app, &Target::home(app)).await?;
+	let hosts = node_hosts(&mut h, node, &n.host).await?;
+	h.close().await;
 	let mut r = Pg::connect(app, &target_of(app, spec)).await?;
-	replica_report(&mut r, &n.host, spec).await
+	replica_report(&mut r, &hosts, spec).await
 }
 
-/// The replica is a standby of `node_host`, or a refusal naming what it is instead. Read on the
-/// replica alone, so it holds with the node gone.
+/// Every host a standby of the node may stream from: the router's view (`host`), and the hosts the
+/// other nodes reach it by (`peer_host`, `site_host`), since a replica on another machine than
+/// the router streams from the node the way another node reaches it.
+async fn node_hosts(h: &mut Pg, node: NodeId, host: &str) -> Result<Vec<String>, OpError> {
+	let rows = h
+		.simple(&format!(
+			"select coalesce(labels->>'peer_host', ''), coalesce(labels->>'site_host', '') from lepis.node where id = {}",
+			node.0
+		))
+		.await?;
+	let mut hosts = vec![host.to_string()];
+	for v in rows.first().into_iter().flatten().flatten() {
+		if !v.is_empty() && !hosts.contains(v) {
+			hosts.push(v.clone());
+		}
+	}
+	Ok(hosts)
+}
+
+/// The replica is a standby of one of `node_hosts` (the node's), or a refusal naming what it is
+/// instead. Read on the replica alone, so it holds with the node gone.
 async fn replica_report(
 	r: &mut Pg,
-	node_host: &str,
+	node_hosts: &[String],
 	spec: &NodeSpec,
 ) -> Result<serde_json::Value, OpError> {
 	if !in_recovery(r).await? {
@@ -106,16 +128,17 @@ async fn replica_report(
 		.value("select current_setting('primary_conninfo')", &[])
 		.await?
 		.unwrap_or_default();
-	if !streams_from(&conninfo, node_host) {
+	let Some(node_host) = node_hosts.iter().find(|h| streams_from(&conninfo, h)) else {
 		return Err(OpError::refused(
 			Kind::NodeUnsuitable,
 			format!(
-				"{} is not a replica of {node_host} (it streams from: {})",
+				"{} is not a replica of {} (it streams from: {})",
 				spec.name,
+				node_hosts.join(" or "),
 				conninfo_host(&conninfo).unwrap_or("nowhere")
 			),
 		));
-	}
+	};
 	let replayed = r
 		.value(
 			"select coalesce(pg_last_wal_replay_lsn()::text, '0/0')",
@@ -187,7 +210,8 @@ async fn check(
 			)
 			.await;
 	}
-	let mut report = replica_report(&mut r, &n.host, spec).await?;
+	let hosts = node_hosts(h, node, &n.host).await?;
+	let mut report = replica_report(&mut r, &hosts, spec).await?;
 	let reached = tokio::time::timeout(REACH_NODE, connect_node(&cx.app, &c, node)).await;
 	match reached {
 		Ok(Ok(mut old)) => {
@@ -304,14 +328,16 @@ async fn cut(cx: &mut StepCtx, h: &mut Pg, node: NodeId, spec: &NodeSpec) -> Res
 		.as_str()
 		.unwrap_or_default()
 		.to_string();
-	let mut labels = json!({ "failed_over_from": failed });
-	if let Some(p) = &spec.peer_host {
-		labels["peer_host"] = json!(p);
-	}
+	let mut labels = spec.address_labels();
+	labels["failed_over_from"] = json!(failed);
+	let drop = ADDRESS_LABELS
+		.iter()
+		.map(|k| format!(" - '{k}'"))
+		.collect::<String>();
 	let rows = h
 		.simple(&format!(
 			"begin; update lepis.node set name = {}, host = {}, port = {}, dbname = {}, sslmode = '{}', \
-			labels = (labels - '{STANDBY_LABEL}' - 'peer_host') || {}::jsonb where id = {}; \
+			labels = (labels - '{STANDBY_LABEL}'{drop}) || {}::jsonb where id = {}; \
 			select lepis.bump(); {} commit",
 			quote_literal(&spec.name),
 			quote_literal(&spec.host),

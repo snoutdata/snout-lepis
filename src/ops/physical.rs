@@ -410,6 +410,12 @@ async fn try_cutover(
 			source_fences.push_str(";\n");
 		}
 	}
+	// Chunked tables: the source retires what it gives away inside its
+	// lock, the promoted copy what it does not own before anything routes to it.
+	source_fences.push_str(&crate::chunk::retire_unowned_sql(
+		&after, &t.tables, t.source,
+	));
+	let target_retires = crate::chunk::retire_unowned_sql(&after, &t.tables, target);
 	let tables: Vec<String> = t.tables.iter().map(qualified).collect();
 	let lock_pid = lock.pid();
 	let canceller = lock.canceller();
@@ -511,6 +517,10 @@ async fn try_cutover(
 	.await?;
 	for f in &target_fences {
 		alter_briefly(&mut dst, f).await?;
+	}
+	if !target_retires.is_empty() {
+		dst.simple(&format!("begin; {target_retires} commit"))
+			.await?;
 	}
 	snap_target
 		.simple("begin isolation level repeatable read; select 1")
@@ -634,7 +644,7 @@ async fn fallback(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), 
 	let mut dst = connect_node(&cx.app, &c, target).await?;
 	let mut stale = Vec::new();
 	for rel in &t.tables {
-		if super::schema::exists(&mut dst, rel).await? {
+		if !c.chunked.contains(rel) && super::schema::exists(&mut dst, rel).await? {
 			stale.push((rel.clone(), "true".to_string()));
 		}
 	}
@@ -653,6 +663,18 @@ async fn fallback(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), 
 	)
 	.await?;
 	cx.detail = restart;
+	let mut after = c.clone();
+	t.change.apply(&mut after)?;
+	if super::chunkmove::applies(&after, t) {
+		// The copy holds every chunk its source had: the ones it will not own leave its shell
+		// first, and the chunk move copies the moving ones again.
+		let mut dst = connect_node(&cx.app, &c, target).await?;
+		let retire = crate::chunk::retire_unowned_sql(&after, &t.tables, target);
+		if !retire.is_empty() {
+			dst.simple(&format!("begin; {retire} commit")).await?;
+		}
+		return super::chunkmove::run(cx, h, t).await;
+	}
 	super::transfer::run(cx, h, t).await
 }
 
@@ -674,6 +696,7 @@ async fn seal_source(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(
 			seal.push_str(";\n");
 		}
 	}
+	seal.push_str(&crate::chunk::retire_unowned_sql(&c, &t.tables, t.source));
 	seal.push_str("commit");
 	if let Err(e) = lock.simple(&seal).await {
 		let _ = lock.simple("rollback").await;
@@ -800,7 +823,29 @@ async fn cleanup(
 	let mut src = connect_node(&cx.app, &c, t.source).await?;
 	let sv = version(&mut src).await?;
 	let mut items = Vec::new();
+	// Chunked tables give rows away as retired chunk tables, on both sides: dropped.
+	let chunked: Vec<RelationName> = c.chunked.iter().cloned().collect();
+	if !chunked.is_empty() {
+		let mut dst = connect_node(&cx.app, &c, target).await?;
+		let sql = crate::chunk::drop_retired_sql(&chunked);
+		let count = |r: super::Rows| {
+			r.last()
+				.and_then(|x| x.first().cloned().flatten())
+				.unwrap_or_default()
+		};
+		deleted.insert(
+			"source:retired chunk tables".into(),
+			json!(count(src.simple(&sql).await?)),
+		);
+		deleted.insert(
+			"target:retired chunk tables".into(),
+			json!(count(dst.simple(&sql).await?)),
+		);
+	}
 	for rel in &t.tables {
+		if c.chunked.contains(rel) {
+			continue;
+		}
 		if matches!(c.relations.get(rel), Some(RelationKind::Sharded { .. })) {
 			let owns = owns_expr(&c, rel, t.source, sv, &|col| quote_ident(col))?;
 			items.push((rel.clone(), format!("not ({owns})")));
@@ -819,7 +864,10 @@ async fn cleanup(
 	let mut names: Vec<(&RelationName, &RelationKind)> = c.relations.iter().collect();
 	names.sort_by(|a, b| a.0.cmp(b.0));
 	for (rel, kind) in names {
-		if matches!(kind, RelationKind::Reference) || !super::schema::exists(&mut dst, rel).await? {
+		if matches!(kind, RelationKind::Reference)
+			|| c.chunked.contains(rel)
+			|| !super::schema::exists(&mut dst, rel).await?
+		{
 			continue;
 		}
 		// Sharded: what it does not own. Global (registered): all of it, off the home node.

@@ -43,7 +43,7 @@ use super::steps::{
 use super::{OpError, Pg, load_catalog, qualified, same, schema, write_catalog};
 use crate::catalog::{Catalog, NodeId, RelationKind, RelationName, quote_ident, quote_literal};
 
-const MARK_SQL: &str = "create schema if not exists lepis_move; \
+pub(super) const MARK_SQL: &str = "create schema if not exists lepis_move; \
 	create table if not exists lepis_move.mark (job_id bigint not null, target int not null, \
 	token text not null, at timestamptz not null default now(), primary key (job_id, target, token))";
 
@@ -65,7 +65,7 @@ struct Plan {
 	managed: bool,
 }
 
-fn names(cx: &StepCtx, target: NodeId) -> String {
+pub(super) fn names(cx: &StepCtx, target: NodeId) -> String {
 	format!("lepis_j{}_s{}_n{}", cx.job, cx.n, target.0)
 }
 
@@ -245,19 +245,21 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 	)
 	.await?;
 
-	// The source as the targets reach it (a node label when it differs from the router's view).
-	let peer = h
-		.value(
-			"select coalesce(labels->>'peer_host', host) from lepis.node where id = $1",
-			&[&t.source.0.to_string()],
-		)
-		.await?
-		.unwrap_or_default();
+	// The source as each target reaches it (`spec::reach`: the labels say when that differs from
+	// the router's view, by machine when the nodes are on more than one).
+	let labels = node_labels(h).await?;
 	let source_node = before
 		.nodes
 		.get(&t.source)
 		.ok_or_else(|| OpError::new("no source node"))?;
+	let none = json!({});
 	for (&n, pg) in targets.iter_mut() {
+		let (peer, peer_port) = super::spec::reach(
+			&source_node.host,
+			source_node.port,
+			labels.get(&t.source).unwrap_or(&none),
+			labels.get(&n).unwrap_or(&none),
+		);
 		let name = names(cx, n);
 		let exists =
 			src.value(
@@ -295,7 +297,7 @@ async fn prepare(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), O
 			.await?
 			.as_deref() != Some("0");
 		if !has_sub {
-			let info = super::pg::conninfo(&cx.app, &peer, source_node);
+			let info = super::pg::conninfo(&cx.app, &peer, peer_port, source_node);
 			pg.simple(&format!(
 				"create subscription {n} connection {} publication {n} \
 				with (slot_name = {s}, create_slot = true, copy_data = true, enabled = true)",
@@ -409,7 +411,7 @@ async fn sync(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpEr
 /// Writes a marker row on the source (in its own transaction) and waits until every target has
 /// applied it. Logical replication applies commits in commit order, so a target holding the
 /// marker holds every write the source committed before it.
-async fn mark_round_trip(
+pub(super) async fn mark_round_trip(
 	cx: &StepCtx,
 	src: &mut Pg,
 	targets: &mut [(NodeId, Pg)],
@@ -953,7 +955,7 @@ async fn cleanup_source(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Resul
 }
 
 /// How long a table may sit unsynced with no worker copying it before the move starts over.
-const COPY_STALL: Duration = Duration::from_secs(60);
+pub(super) const COPY_STALL: Duration = Duration::from_secs(60);
 
 /// How many times a move starts over on its own before it fails for a person to look at.
 const RESTARTS: u64 = 3;
@@ -1005,4 +1007,27 @@ async fn undo(cx: &mut StepCtx, h: &mut Pg, t: &TransferSpec) -> Result<(), OpEr
 		delete_ordered(&mut pg, items).await?;
 	}
 	Ok(())
+}
+/// Every node's `lepis.node.labels`, by id.
+pub async fn node_labels(h: &mut Pg) -> Result<BTreeMap<NodeId, Value>, OpError> {
+	let rows = h
+		.simple("select id::text, coalesce(labels, '{}')::text from lepis.node")
+		.await?;
+	let mut out = BTreeMap::new();
+	for r in rows {
+		let id = r
+			.first()
+			.cloned()
+			.flatten()
+			.and_then(|v| v.parse::<i32>().ok());
+		let labels = r
+			.get(1)
+			.cloned()
+			.flatten()
+			.and_then(|v| serde_json::from_str::<Value>(&v).ok());
+		if let (Some(id), Some(labels)) = (id, labels) {
+			out.insert(NodeId(id), labels);
+		}
+	}
+	Ok(out)
 }

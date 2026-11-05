@@ -119,12 +119,12 @@ pub fn plan(
 	if let Some(change) = roles::change_of(sql) {
 		return DdlPlan::Role(change);
 	}
-	let p = Planner {
+	let d = Planner {
 		tables,
 		catalog,
 		index_owners,
-	};
-	let d = p.statement(node);
+	}
+	.statement(node);
 	if catalog.nodes.len() <= 1 {
 		// One node: nothing to fan out, and nothing a refusal protects.
 		return match d {
@@ -137,6 +137,37 @@ pub fn plan(
 		};
 	}
 	d
+}
+
+/// `plan` as if the cluster had several nodes, also when it has one: for a chunked table, whose
+/// chunk tables need its DDL wherever they are.
+pub fn plan_uncollapsed(
+	sql: &str,
+	tables: &[RelationName],
+	catalog: &Catalog,
+	index_owners: &HashMap<RelationName, RelationName>,
+) -> DdlPlan {
+	let Ok(parsed) = pg_query::parse(sql) else {
+		return DdlPlan::NotDdl;
+	};
+	let Some(node) = parsed
+		.protobuf
+		.stmts
+		.first()
+		.and_then(|r| r.stmt.as_deref())
+		.and_then(|n| n.node.as_ref())
+	else {
+		return DdlPlan::NotDdl;
+	};
+	if let Some(change) = roles::change_of(sql) {
+		return DdlPlan::Role(change);
+	}
+	Planner {
+		tables,
+		catalog,
+		index_owners,
+	}
+	.statement(node)
 }
 
 struct Planner<'a> {
@@ -188,6 +219,13 @@ impl Planner<'_> {
 			Some(RelationKind::Sharded { key_column, .. }) => Some(key_column),
 			_ => None,
 		}
+	}
+
+	/// The key columns of `r`: its key, and its second key.
+	fn keys_of<'b>(&'b self, r: &RelationName) -> Vec<&'b str> {
+		let mut v: Vec<&str> = self.key_of(r).into_iter().collect();
+		v.extend(self.catalog.second_keys.get(r).map(String::as_str));
+		v
 	}
 
 	/// For index-named statements: the tables the indexes are on, or the names to look up.
@@ -291,13 +329,12 @@ impl Planner<'_> {
 			N::IndexStmt(i) => {
 				let target = self.by_tables();
 				if let Some(t) = i.relation.as_ref().and_then(|r| self.resolve(r))
-					&& let Some(key) = self.key_of(t)
 					&& (i.unique || i.primary)
-					&& !i
-						.index_params
-						.iter()
-						.any(|p| matches!(&p.node, Some(N::IndexElem(e)) if e.name == key))
-				{
+					&& let Some(key) = self.keys_of(t).into_iter().find(|key| {
+						!i.index_params
+							.iter()
+							.any(|p| matches!(&p.node, Some(N::IndexElem(e)) if e.name == *key))
+					}) {
 					return refuse(
 						format!(
 							"a unique index on the distributed table {t} must include its key {key}"
@@ -328,7 +365,7 @@ impl Planner<'_> {
 				let Some(t) = a.relation.as_ref().and_then(|r| self.resolve(r)) else {
 					return tx(self.by_tables());
 				};
-				if let Some(key) = self.key_of(t) {
+				for key in self.keys_of(t) {
 					for c in &a.cmds {
 						if let Some(N::AlterTableCmd(cmd)) = &c.node
 							&& let Some(r) = self.alter_cmd_refusal(t, key, cmd)
@@ -361,7 +398,7 @@ impl Planner<'_> {
 							);
 						}
 						Some(ObjectType::ObjectColumn)
-							if self.key_of(t) == Some(r.subname.as_str()) =>
+							if self.keys_of(t).contains(&r.subname.as_str()) =>
 						{
 							return refuse(
 								format!(
@@ -995,6 +1032,8 @@ mod tests {
 					&c.nodes.keys().copied().collect::<Vec<_>>(),
 				),
 				pins: Default::default(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c.relations.insert(

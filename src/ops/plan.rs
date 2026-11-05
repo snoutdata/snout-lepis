@@ -17,6 +17,7 @@ use super::spec::{NodeSpec, Op, Step, TransferSpec};
 use super::steps::{check_node, connect_node, tables_of};
 use super::{Change, OpError, Pg, Settings, Target, load_catalog, qualified, schema};
 use crate::catalog::{Catalog, Keyspace, NodeId, NodeState, Range, RelationKind, RelationName};
+use crate::chunk;
 use crate::hash::KeyType;
 use crate::server::App;
 
@@ -90,6 +91,20 @@ fn ks<'a>(c: &'a Catalog, name: &str) -> Result<&'a Keyspace, OpError> {
 /// Moves that even out a keyspace's share of the hash space over `members`, splitting a range
 /// when none fits. Ranges on nodes that are not members (being drained) all move. Returns the
 /// splits, in order, as (lo, at), and the final layout.
+/// Where a range `[lo, hi]` of `ks` may be cut nearest `at` (the upper half starting there):
+/// `at` itself in a keyspace without chunks, else the chunk boundary inside the range nearest it
+/// (a range is a set of whole chunks). None when no boundary is inside.
+pub fn snap_to_chunk(ks: &Keyspace, lo: i64, hi: i64, at: i64) -> Option<i64> {
+	if ks.chunks.is_empty() {
+		return (at > lo && at <= hi).then_some(at);
+	}
+	ks.chunks
+		.iter()
+		.map(|c| c.lo)
+		.filter(|b| *b > lo && *b <= hi)
+		.min_by_key(|b| (i128::from(*b) - i128::from(at)).unsigned_abs())
+}
+
 pub fn rebalance(ks: &Keyspace, members: &[NodeId]) -> (Vec<(i64, i64)>, Vec<Range>) {
 	rebalance_from(ks, members, &BTreeMap::new())
 }
@@ -176,7 +191,11 @@ pub fn rebalance_from(
 			let split = ranges
 				.iter()
 				.enumerate()
-				.filter(|(_, r)| movable(r, a, b) && width(r) > want)
+				.filter(|(_, r)| {
+					movable(r, a, b)
+						&& width(r) > want && snap_to_chunk(ks, r.lo, r.hi, r.lo.saturating_add(1))
+						.is_some()
+				})
 				.min_by_key(|(_, r)| width(r))
 				.map(|(i, _)| i);
 			if pick.is_some() || split.is_some() {
@@ -192,6 +211,9 @@ pub fn rebalance_from(
 			(None, Some(i)) => {
 				let r = ranges[i];
 				let at = (r.lo as i128 + want as i128) as i64;
+				let Some(at) = snap_to_chunk(ks, r.lo, r.hi, at) else {
+					break;
+				};
 				splits.push((r.lo, at));
 				ranges[i].hi = at - 1;
 				ranges[i].node = b;
@@ -347,7 +369,20 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 			seed,
 			ranges,
 			nodes,
+			second_key_type,
 		} => {
+			let second = match second_key_type {
+				None => None,
+				Some(t) => Some(KeyType::from_sql_name(t).ok_or_else(|| {
+					OpError::refused(
+						Kind::BadKeyType,
+						format!(
+							"second key type {t}: one of {}",
+							KeyType::ALL.map(|k| k.sql_name()).join(", ")
+						),
+					)
+				})?),
+			};
 			let kt = KeyType::from_sql_name(key_type).ok_or_else(|| {
 				OpError::refused(
 					Kind::BadKeyType,
@@ -377,12 +412,17 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				key_type: kt,
 				seed: seed.unwrap_or_else(random_seed),
 				ranges: Keyspace::even_ranges(n, &owners),
+				second,
 			})]
 		}
 		Op::TableDistribute {
 			table,
 			column,
 			keyspace,
+			heap,
+			chunks,
+			expected_bytes,
+			second,
 		} => {
 			if matches!(
 				c.relations.get(table),
@@ -394,8 +434,39 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				));
 			}
 			let k = ks(c, keyspace)?;
+			// A second key (Phase 5): only in a keyspace that has one, always with one there,
+			// and only in chunk tables (a heap's fence, move filter and cleanup name one column).
+			match (k.second, second) {
+				(None, Some(s)) => {
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						format!(
+							"keyspace {keyspace} has one key; distribute {table} by {column} alone, or into a keyspace made with second_key_type to spread it by {s} too"
+						),
+					));
+				}
+				(Some(t), None) => {
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						format!(
+							"keyspace {keyspace} places rows by two columns: name the second, a {} column of {table} (\"by\": [\"{column}\", \"<column>\"])",
+							t.sql_name()
+						),
+					));
+				}
+				(Some(_), Some(_)) if *heap => {
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						"a table with a second key is stored as chunk tables: distribute it without heap",
+					));
+				}
+				_ => {}
+			}
 			let mut h = connect_node(app, c, home).await?;
 			schema::check_movable(&mut h, table, Some((column, k)), c).await?;
+			if let (Some(t), Some(s)) = (k.second, second) {
+				schema::check_second_key(&mut h, table, column, s, t).await?;
+			}
 			let change = Change::Relation {
 				name: table.clone(),
 				kind: RelationKind::Sharded {
@@ -408,6 +479,52 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				.into_iter()
 				.filter(|n| *n != home)
 				.collect();
+			// Chunk tables: the keyspace's chunks first, if it has none; then
+			// the heap on the home node is chunked online and the other nodes' chunks go to them.
+			if !*heap {
+				let mut steps = Vec::new();
+				let have = !k.chunks.is_empty();
+				let layout = if have {
+					k.chunks.clone()
+				} else {
+					let count = chunks.unwrap_or_else(|| chunk::chunk_count_for(*expected_bytes));
+					chunk::chunks_for(count, k).map_err(|e| OpError::refused(Kind::BadBound, e))?
+				};
+				if let Some(m) = chunk::name_refusal(&table.table, &layout) {
+					return Err(OpError::refused(Kind::BadRequest, m));
+				}
+				if !k.pins.is_empty() {
+					return Err(OpError::refused(
+						Kind::BadRequest,
+						format!(
+							"keyspace {keyspace} has pinned values, and a chunked keyspace cannot: distribute with heap = true, or unpin them"
+						),
+					));
+				}
+				if !have {
+					steps.push(Step::Catalog(Change::Chunks {
+						keyspace: keyspace.clone(),
+						chunks: layout,
+					}));
+				}
+				steps.push(Step::Transfer(TransferSpec {
+					source: home,
+					targets,
+					tables: vec![table.clone()],
+					change: Change::Many(vec![
+						change,
+						Change::Chunked {
+							name: table.clone(),
+							chunked: true,
+						},
+						Change::SecondKey {
+							name: table.clone(),
+							column: second.clone(),
+						},
+					]),
+				}));
+				return Ok(steps);
+			}
 			if targets.is_empty() {
 				vec![
 					Step::Catalog(change),
@@ -459,6 +576,64 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 		}
 		Op::TableGlobal { table } => table_global(c, table, home)?,
 		Op::TableAuto { .. } => super::auto::plan(app, c, home, op).await?.steps,
+		Op::ChunkSplit {
+			keyspace,
+			chunk: number,
+		} => {
+			let k = ks(c, keyspace)?;
+			let Some(old) = k.chunks.iter().find(|x| x.number == *number).copied() else {
+				return Err(OpError::refused(
+					Kind::NoSuchRange,
+					format!("keyspace {keyspace} has no chunk {number}"),
+				));
+			};
+			let next = k.chunks.iter().map(|x| x.number).max().unwrap_or(0) + 1;
+			let Some((lo, hi)) = chunk::split(old, next) else {
+				return Err(OpError::refused(
+					Kind::BadBound,
+					format!("chunk {number} of {keyspace} is one hash value and cannot split"),
+				));
+			};
+			let halves = [
+				crate::catalog::Chunk { number: next, ..lo },
+				crate::catalog::Chunk {
+					number: next + 1,
+					..hi
+				},
+			];
+			let mut layout: Vec<crate::catalog::Chunk> = k
+				.chunks
+				.iter()
+				.filter(|x| x.number != *number)
+				.copied()
+				.collect();
+			layout.extend(halves);
+			layout.sort_by_key(|x| x.lo);
+			let tables: Vec<RelationName> = tables_of(c, keyspace)
+				.into_iter()
+				.filter(|t| c.chunked.contains(t))
+				.collect();
+			if tables.is_empty() {
+				return Err(OpError::refused(
+					Kind::NoSuchTable,
+					format!("keyspace {keyspace} has no chunked table"),
+				));
+			}
+			for t in &tables {
+				if let Some(m) = chunk::name_refusal(&t.table, &layout) {
+					return Err(OpError::refused(Kind::BadRequest, m));
+				}
+			}
+			vec![Step::Transfer(TransferSpec {
+				source: k.owner_of_hash(old.lo),
+				targets: Vec::new(),
+				tables,
+				change: Change::Chunks {
+					keyspace: keyspace.clone(),
+					chunks: layout,
+				},
+			})]
+		}
 		Op::RangeSplit {
 			keyspace,
 			range,
@@ -479,6 +654,20 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				));
 			}
 			let at = at.unwrap_or((r.lo as i128 + (r.hi as i128 - r.lo as i128) / 2 + 1) as i64);
+			// A chunked keyspace is cut between chunks only.
+			let at = if k.chunks.is_empty() || at <= r.lo || at > r.hi {
+				at
+			} else {
+				snap_to_chunk(k, r.lo, r.hi, at).ok_or_else(|| {
+					OpError::refused(
+						Kind::BadBound,
+						format!(
+							"the range [{}, {}] is one chunk; a chunk splits in place, not by a range split",
+							r.lo, r.hi
+						),
+					)
+				})?
+			};
 			if at <= r.lo || at > r.hi {
 				return Err(OpError::refused(
 					Kind::BadBound,
@@ -666,6 +855,14 @@ pub async fn expand(app: &Arc<App>, c: &Catalog, op: &Op) -> Result<Vec<Step>, O
 				node,
 				spec: spec.clone(),
 				fenced: *fenced,
+			}]
+		}
+		Op::NodeReaddress { node, spec } => {
+			let node = node.resolve(c)?;
+			super::readdress::precheck(app, c, node, spec).await?;
+			vec![Step::NodeReaddress {
+				node,
+				spec: spec.clone(),
 			}]
 		}
 		Op::RestorePoint { name } => {
@@ -899,7 +1096,14 @@ fn table_global(c: &Catalog, table: &RelationName, home: NodeId) -> Result<Vec<S
 					},
 				}));
 			}
-			steps.push(change);
+			// A chunked table's chunks are all home now: one heap again, and global.
+			if c.chunked.contains(table) {
+				steps.push(Step::Dechunk {
+					table: table.clone(),
+				});
+			} else {
+				steps.push(change);
+			}
 			Ok(steps)
 		}
 		_ => Err(OpError::refused(
@@ -1028,7 +1232,56 @@ pub async fn summarize(
 				t.change.apply(&mut after)?;
 				let mut rows = 0f64;
 				let mut bytes = 0f64;
+				let mut chunks_moving = 0usize;
 				for rel in &t.tables {
+					// A chunked table moves whole chunk tables: their own sizes, exactly.
+					if let (Some(chunks), Some(RelationKind::Sharded { keyspace, .. })) =
+						(layout.chunks_of(rel), layout.relations.get(rel))
+					{
+						let (kb, ka) = (&layout.keyspaces[keyspace], &after.keyspaces[keyspace]);
+						let moving: Vec<String> = chunks
+							.iter()
+							.filter(|c| {
+								kb.owner_of_hash(c.lo) == t.source
+									&& t.targets.contains(&ka.owner_of_hash(c.lo))
+							})
+							.map(|c| qualified(&chunk::chunk_relation(rel, c.number)))
+							.collect();
+						chunks_moving += moving.len();
+						if moving.is_empty() {
+							continue;
+						}
+						let mut pg = connect_node(app, &layout, t.source).await?;
+						let r = pg
+							.query(
+								"select coalesce(sum(pg_total_relation_size(k.oid)), 0), \
+								coalesce(sum(greatest(k.reltuples, 0)), 0) \
+								from unnest($1::text[]) x(name) join pg_class k on k.oid = to_regclass(x.name)",
+								&[&format!(
+									"{{{}}}",
+									moving
+										.iter()
+										.map(|m| format!(
+											"\"{}\"",
+											m.replace('\\', "\\\\").replace('"', "\\\"")
+										))
+										.collect::<Vec<_>>()
+										.join(",")
+								)],
+							)
+							.await?;
+						let row = r.first().cloned().unwrap_or_default();
+						let num = |i: usize| {
+							row.get(i)
+								.cloned()
+								.flatten()
+								.and_then(|v| v.parse::<f64>().ok())
+								.unwrap_or(0.0)
+						};
+						bytes += num(0);
+						rows += num(1);
+						continue;
+					}
 					let key = (t.source, rel.clone());
 					if !sizes.contains_key(&key) {
 						let mut pg = connect_node(app, &layout, t.source).await?;
@@ -1094,6 +1347,7 @@ pub async fn summarize(
 					"change": t.change.to_json(),
 					"estimated_rows": rows.round() as u64,
 					"estimated_bytes": bytes.round() as u64,
+					"chunks_moving": chunks_moving,
 					"estimated_copy_seconds": (seconds * 10.0).round() / 10.0,
 					"expected_pause_ms": expected_pause_ms(t.tables.len()),
 				}));
@@ -1185,6 +1439,14 @@ pub async fn plan(
 	let mut summary = summarize(app, &c, op, &steps, settings).await?;
 	if let Some(choices) = choices {
 		summary["choices"] = choices.iter().map(|c| c.to_json()).collect();
+	}
+	// The design check (L24) of the tables the operation changes, before it changes them. It
+	// warns and never refuses: what must refuse already has (check_movable). A check that cannot
+	// read the home node says so instead of failing the plan.
+	match super::check::for_plan(app, &c, op).await {
+		Ok(Some(check)) => summary["check"] = check,
+		Ok(None) => {}
+		Err(e) => summary["check"] = json!({"error": e.message}),
 	}
 	Ok(Planned { steps, summary })
 }

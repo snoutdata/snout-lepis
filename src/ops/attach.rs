@@ -76,10 +76,8 @@ pub async fn run(
 		let version = report["settings"]["server_version_num"]
 			.as_u64()
 			.unwrap_or(0);
-		let mut labels = json!({ STANDBY_LABEL: standby_of.0 });
-		if let Some(p) = &spec.peer_host {
-			labels["peer_host"] = json!(p);
-		}
+		let mut labels = spec.address_labels();
+		labels[STANDBY_LABEL] = json!(standby_of.0);
 		h.simple(&format!(
 			"begin; insert into lepis.node (id, name, host, port, dbname, sslmode, kind, state, server_version_num, labels) \
 			values ({}, {}, {}, {}, {}, '{}', 'data', 'joining', {version}, {}::jsonb) on conflict (id) do nothing; \

@@ -107,7 +107,7 @@ async fn a_range_holding_most_of_the_rows_gets_a_split() {
 		.op(json!({"op": "keyspace.create", "name": "advk", "key_type": "bigint", "seed": SEED, "ranges": 3, "nodes": [1, 2, 3]}))
 		.await;
 	admin
-		.op(json!({"op": "table.distribute", "table": "advx.t", "column": "k", "keyspace": "advk"}))
+		.op(json!({"op": "table.distribute", "table": "advx.t", "column": "k", "keyspace": "advk", "heap": true}))
 		.await;
 
 	// The skew: 400,000 candidate keys, and only the third of them that hash into node 2's range

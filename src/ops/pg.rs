@@ -206,14 +206,14 @@ impl Pg {
 
 /// The service login's credential for a connection string a node uses to reach another node (a
 /// subscription). Only ever written into the node's own catalog, never logged.
-pub fn conninfo(app: &Arc<App>, peer_host: &str, n: &Node) -> String {
+pub fn conninfo(app: &Arc<App>, peer_host: &str, peer_port: u16, n: &Node) -> String {
 	let q = |v: &str| format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'"));
 	// A node's mode is the catalog's (disable, require or verify-full), never verify-ca.
 	let sslmode = n.sslmode.as_str();
 	format!(
 		"host={} port={} dbname={} user={} password={} sslmode={sslmode} application_name={}",
 		q(peer_host),
-		n.port,
+		peer_port,
 		q(&n.dbname),
 		q(&app.config.service.user),
 		q(&app.config.service.password),

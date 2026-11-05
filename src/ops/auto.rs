@@ -93,7 +93,7 @@ impl Chosen {
 /// The tenant: the table whose one-column primary key, of the keyspace's type, the most other
 /// tables reference by one column (ties to the first by name), with the name most of them use for
 /// that column. None when no table is referenced so.
-fn tenant(
+pub(crate) fn tenant(
 	tables: &[TableFacts],
 	fks: &[ForeignKey],
 	key_type: KeyType,
@@ -142,7 +142,7 @@ fn column<'a>(t: &'a TableFacts, name: &str) -> Option<&'a Column> {
 }
 
 /// What L15 refuses for `t` sharded by `key`, in the words `check_movable` uses.
-fn shard_refusal(t: &TableFacts, key: &str) -> Option<String> {
+pub(crate) fn shard_refusal(t: &TableFacts, key: &str) -> Option<String> {
 	if !t.replayable {
 		return Some(
 			"it has no primary key, so a move cannot replay its updates and deletes".into(),
@@ -168,7 +168,7 @@ fn shard_refusal(t: &TableFacts, key: &str) -> Option<String> {
 
 /// What keeps `t` from being a reference table: a reference table's copies are written separately
 /// and must compute the same row, which a sequence would not.
-fn reference_refusal(t: &TableFacts) -> Option<String> {
+pub(crate) fn reference_refusal(t: &TableFacts) -> Option<String> {
 	if !t.replayable {
 		return Some(
 			"it has no primary key, so a copy cannot replay its updates and deletes".into(),

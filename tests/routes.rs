@@ -56,6 +56,8 @@ fn catalog() -> Catalog {
 				seed,
 				ranges: Keyspace::even_ranges(24, &ids),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 	}

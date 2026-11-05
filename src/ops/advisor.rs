@@ -70,10 +70,21 @@ pub struct AdviceSettings {
 	pub disk_pct: u64,
 	/// Every node over this percent of `max_connections` needs a node.
 	pub conn_pct: u64,
+	/// A node over this percent of an even share of a keyspace's reads (rows read, by sequential
+	/// and index scans) is hot.
+	pub read_pct: u64,
+	/// A keyspace reading fewer rows per second than this gets no read advice.
+	pub min_reads_per_s: u64,
+	/// A move must take at least this many percent of an even share off the hottest node...
+	pub min_gain_pct: u64,
+	/// ... plus this many percent for every GB it copies: the gain must beat the move's cost.
+	pub cost_pct_per_gb: u64,
+	/// A range moved or split within this many seconds is not moved again (no move back).
+	pub hold_s: u64,
 }
 
 /// The settings' names, as `POST /v1/settings` takes them.
-pub const SETTING_NAMES: [&str; 10] = [
+pub const SETTING_NAMES: [&str; 15] = [
 	"advice_sample_ms",
 	"advice_min_bytes",
 	"advice_split_bytes",
@@ -84,6 +95,11 @@ pub const SETTING_NAMES: [&str; 10] = [
 	"advice_node_disk_bytes",
 	"advice_disk_pct",
 	"advice_conn_pct",
+	"advice_read_pct",
+	"advice_min_reads_per_s",
+	"advice_min_gain_pct",
+	"advice_cost_pct_per_gb",
+	"advice_hold_s",
 ];
 
 impl Default for AdviceSettings {
@@ -100,6 +116,12 @@ impl Default for AdviceSettings {
 			node_disk_bytes: 0,
 			disk_pct: 80,
 			conn_pct: 80,
+			// Initial guesses, measured with bench/chunks.sh.
+			read_pct: 200,
+			min_reads_per_s: 1_000,
+			min_gain_pct: 10,
+			cost_pct_per_gb: 1,
+			hold_s: 1_800,
 		}
 	}
 }
@@ -119,6 +141,11 @@ impl AdviceSettings {
 			node_disk_bytes: get("advice_node_disk_bytes", d.node_disk_bytes),
 			disk_pct: get("advice_disk_pct", d.disk_pct).clamp(1, 100),
 			conn_pct: get("advice_conn_pct", d.conn_pct).clamp(1, 100),
+			read_pct: get("advice_read_pct", d.read_pct).max(101),
+			min_reads_per_s: get("advice_min_reads_per_s", d.min_reads_per_s),
+			min_gain_pct: get("advice_min_gain_pct", d.min_gain_pct),
+			cost_pct_per_gb: get("advice_cost_pct_per_gb", d.cost_pct_per_gb),
+			hold_s: get("advice_hold_s", d.hold_s),
 		}
 	}
 
@@ -134,6 +161,11 @@ impl AdviceSettings {
 			"advice_node_disk_bytes": self.node_disk_bytes,
 			"advice_disk_pct": self.disk_pct,
 			"advice_conn_pct": self.conn_pct,
+			"advice_read_pct": self.read_pct,
+			"advice_min_reads_per_s": self.min_reads_per_s,
+			"advice_min_gain_pct": self.min_gain_pct,
+			"advice_cost_pct_per_gb": self.cost_pct_per_gb,
+			"advice_hold_s": self.hold_s,
 		})
 	}
 }
@@ -149,6 +181,11 @@ pub struct NodeFacts {
 	pub connections: u64,
 	pub max_connections: u64,
 	pub writes_per_s: f64,
+	/// Rows read per second (sequential and index scans), as Postgres counts them.
+	pub reads_per_s: f64,
+	/// This router's view of the node (timing.rs): p99 in ms and busy share, when it has one.
+	pub p99_ms: Option<f64>,
+	pub busy_pct: Option<f64>,
 	/// Why the node could not be read, when it could not.
 	pub error: Option<String>,
 }
@@ -161,6 +198,7 @@ pub struct Sample {
 	pub key: String,
 	pub bytes: f64,
 	pub writes: f64,
+	pub reads: f64,
 }
 
 /// One range, as measured on its owner.
@@ -173,8 +211,24 @@ pub struct RangeFacts {
 	pub rows: f64,
 	pub bytes: f64,
 	pub writes_per_s: f64,
-	/// The sampled rows that fell in it, sorted by hash.
+	pub reads_per_s: f64,
+	/// The sampled rows that fell in it, sorted by hash; for a chunked keyspace, one per chunk
+	/// at the chunk's first hash, weighted by the chunk's own figures.
 	pub samples: Vec<Sample>,
+	/// The range's chunks, measured exactly (each is a table): empty for a heap keyspace.
+	pub chunks: Vec<ChunkFacts>,
+}
+
+/// One chunk, from its own table's statistics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkFacts {
+	pub number: u32,
+	pub lo: i64,
+	pub hi: i64,
+	pub rows: f64,
+	pub bytes: f64,
+	pub writes_per_s: f64,
+	pub reads_per_s: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +240,8 @@ pub struct Facts {
 	/// The id the next node would get, for the name a node.add suggests.
 	pub next_node: i32,
 	pub sampled_ms: u64,
+	/// (keyspace, range lo) moved or split within `hold_s`: not moved again yet.
+	pub recent: HashSet<(String, i64)>,
 }
 
 /// One recommendation: a body the admin API takes, and why.
@@ -204,6 +260,7 @@ pub struct Advice {
 enum Metric {
 	Bytes,
 	Writes,
+	Reads,
 }
 
 impl Metric {
@@ -211,6 +268,15 @@ impl Metric {
 		match self {
 			Metric::Bytes => r.bytes,
 			Metric::Writes => r.writes_per_s,
+			Metric::Reads => r.reads_per_s,
+		}
+	}
+
+	fn of_chunk(self, c: &ChunkFacts) -> f64 {
+		match self {
+			Metric::Bytes => c.bytes,
+			Metric::Writes => c.writes_per_s,
+			Metric::Reads => c.reads_per_s,
 		}
 	}
 
@@ -218,6 +284,7 @@ impl Metric {
 		match self {
 			Metric::Bytes => s.bytes,
 			Metric::Writes => s.writes,
+			Metric::Reads => s.reads,
 		}
 	}
 
@@ -225,6 +292,7 @@ impl Metric {
 		match self {
 			Metric::Bytes => "size",
 			Metric::Writes => "writes",
+			Metric::Reads => "reads",
 		}
 	}
 
@@ -232,6 +300,7 @@ impl Metric {
 		match self {
 			Metric::Bytes => s.min_bytes as f64,
 			Metric::Writes => s.min_writes_per_s as f64,
+			Metric::Reads => s.min_reads_per_s as f64,
 		}
 	}
 
@@ -239,6 +308,7 @@ impl Metric {
 		match self {
 			Metric::Bytes => s.skew_pct,
 			Metric::Writes => s.hot_pct,
+			Metric::Reads => s.read_pct,
 		}
 	}
 
@@ -246,6 +316,7 @@ impl Metric {
 		match self {
 			Metric::Bytes => bytes(v),
 			Metric::Writes => format!("{v:.1} writes/s"),
+			Metric::Reads => format!("{v:.0} rows read/s"),
 		}
 	}
 }
@@ -283,7 +354,7 @@ pub fn decide(f: &Facts, s: &AdviceSettings) -> Vec<Advice> {
 	names.dedup();
 	for k in names {
 		let rs: Vec<&RangeFacts> = f.ranges.iter().filter(|r| r.keyspace == k).collect();
-		for m in [Metric::Bytes, Metric::Writes] {
+		for m in [Metric::Bytes, Metric::Writes, Metric::Reads] {
 			if let Some((lo, a)) = balance(f, s, k, &rs, &members, m)
 				&& touched.insert((k.to_string(), lo))
 			{
@@ -451,11 +522,35 @@ fn balance(
 		m.pct(s),
 		m.show(lb)
 	);
-	let on_a: Vec<&RangeFacts> = rs.iter().copied().filter(|r| r.node == a).collect();
+	// Whether moving `amount` of `m` (copying `copied` bytes) off `a` onto `b` is worth it: the
+	// hottest node's load must drop by more than the minimum gain plus the copy's cost,
+	// so a move that buys little is never made.
+	let worth = |amount: f64, copied: f64| {
+		let after = load
+			.iter()
+			.map(|(n, l)| {
+				if *n == a {
+					l - amount
+				} else if *n == b {
+					l + amount
+				} else {
+					*l
+				}
+			})
+			.fold(f64::MIN, f64::max);
+		let gain_pct = (la - after) / fair * 100.0;
+		let cost_pct = copied / 1e9 * s.cost_pct_per_gb as f64;
+		gain_pct >= s.min_gain_pct as f64 + cost_pct
+	};
+	let on_a: Vec<&RangeFacts> = rs
+		.iter()
+		.copied()
+		.filter(|r| r.node == a && !f.recent.contains(&(k.to_string(), r.lo)))
+		.collect();
 	// A whole range that narrows the gap without overshooting it.
 	if let Some(r) = on_a
 		.iter()
-		.filter(|r| m.of(r) > 0.0 && m.of(r) < gap)
+		.filter(|r| m.of(r) > 0.0 && m.of(r) < gap && worth(m.of(r), r.bytes))
 		.min_by(|x, y| (m.of(x) - want).abs().total_cmp(&(m.of(y) - want).abs()))
 	{
 		return Some((
@@ -477,6 +572,10 @@ fn balance(
 	if m.of(r) <= 0.0 {
 		return None;
 	}
+	let share = want.min(m.of(r)) / m.of(r);
+	if !worth(want.min(m.of(r)), r.bytes * share) {
+		return None;
+	}
 	Some((r.lo, split_or_pin(f, s, r, want, b, m, &why)))
 }
 
@@ -492,7 +591,23 @@ fn split_or_pin(
 	why: &str,
 ) -> Advice {
 	let k = &r.keyspace;
-	if let Some((key, share)) = dominant(r, m)
+	// A chunked keyspace has no pins: its unit is the chunk. A range that is one chunk splits
+	// the chunk in place, so a range split can follow at the new boundary.
+	if !r.chunks.is_empty() {
+		if let [only] = r.chunks.as_slice() {
+			return Advice {
+				request: json!({"op": "chunk.split", "keyspace": k, "chunk": only.number}),
+				reason: format!(
+					"{why}: range {k}:{} is one chunk ({}), which no range split can cut; splitting chunk {} in place lets a range split send half to {to} next",
+					r.lo,
+					m.show(m.of_chunk(only)),
+					only.number
+				),
+				metric: m.name(),
+				needs: vec![],
+			};
+		}
+	} else if let Some((key, share)) = dominant(r, m)
 		&& share * 100.0 >= s.pin_pct as f64
 		&& !f.pins.contains(&(k.clone(), key.clone()))
 	{
@@ -511,6 +626,7 @@ fn split_or_pin(
 	}
 	let (at, sampled) = match split_bound(r, m, want) {
 		Some(at) => (at, true),
+		None if !r.chunks.is_empty() => (r.chunks[r.chunks.len() / 2].lo, false),
 		None => (midpoint(r), false),
 	};
 	Advice {
@@ -680,23 +796,40 @@ struct TableRead {
 	size: f64,
 	tuples: f64,
 	writes_per_s: f64,
+	reads_per_s: f64,
 	/// (hash, key) of every sampled row, owned or not.
 	sample: Vec<(i64, String)>,
 }
 
-async fn write_counters(pg: &mut Pg) -> Result<HashMap<String, f64>, OpError> {
+/// One chunk table on its node, as read for the facts (a chunked table needs no sampling).
+struct ChunkRead {
+	node: NodeId,
+	keyspace: String,
+	/// `schema.table` of the chunk table, the name its counters are under.
+	name: String,
+	chunk: crate::catalog::Chunk,
+	size: f64,
+	tuples: f64,
+	writes_per_s: f64,
+	reads_per_s: f64,
+}
+
+/// Each table's (writes, rows read) so far, by `schema.table`.
+async fn counters(pg: &mut Pg) -> Result<HashMap<String, (f64, f64)>, OpError> {
 	let _ = pg.simple("select pg_stat_clear_snapshot()").await;
 	let rows = pg
 		.simple(
-			"select schemaname || '.' || relname, n_tup_ins + n_tup_upd + n_tup_del from pg_stat_user_tables",
+			"select schemaname || '.' || relname, n_tup_ins + n_tup_upd + n_tup_del, \
+			seq_tup_read + coalesce(idx_tup_fetch, 0) from pg_stat_user_tables",
 		)
 		.await?;
 	Ok(rows
 		.into_iter()
 		.filter_map(|r| {
 			let name = r.first().cloned().flatten()?;
-			let n = r.get(1).cloned().flatten()?.parse().ok()?;
-			Some((name, n))
+			let w = r.get(1).cloned().flatten()?.parse().ok()?;
+			let rd = r.get(2).cloned().flatten()?.parse().ok()?;
+			Some((name, (w, rd)))
 		})
 		.collect())
 }
@@ -709,14 +842,22 @@ fn num(row: &[Option<String>], i: usize) -> f64 {
 		.unwrap_or(0.0)
 }
 
-/// Reads the facts: every node's size, connections and write rate, and every range's share of
-/// its node's tables. `sample_ms` apart, the two readings of the write counters.
-pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts, OpError> {
+/// Reads the facts: every node's size, connections, write and read rates and this router's view
+/// of it; every range's share of its node's tables (sampled for a heap table, each chunk's own
+/// figures for a chunked one). `sample_ms` apart, the two readings of the counters. `recent` is
+/// what moved within the hold window.
+pub async fn gather(
+	app: &Arc<App>,
+	c: &Catalog,
+	sample_ms: u64,
+	recent: HashSet<(String, i64)>,
+) -> Result<Facts, OpError> {
 	let t0 = Instant::now();
 	let mut nodes: Vec<NodeFacts> = Vec::new();
 	let mut conns: BTreeMap<NodeId, (Pg, u32)> = BTreeMap::new();
-	let mut before: HashMap<NodeId, HashMap<String, f64>> = HashMap::new();
+	let mut before: HashMap<NodeId, HashMap<String, (f64, f64)>> = HashMap::new();
 	for n in c.nodes.values().filter(|n| n.state != NodeState::Removed) {
+		let seen = crate::timing::read(n.id);
 		let mut facts = NodeFacts {
 			id: n.id,
 			name: n.name.clone(),
@@ -725,11 +866,14 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 			connections: 0,
 			max_connections: 0,
 			writes_per_s: 0.0,
+			reads_per_s: 0.0,
+			p99_ms: seen.map(|r| r.p99_ms),
+			busy_pct: seen.map(|r| r.busy_pct),
 			error: None,
 		};
 		let read = async {
 			let mut pg = connect_node(app, c, n.id).await?;
-			let counters = write_counters(&mut pg).await?;
+			let counted = counters(&mut pg).await?;
 			let row = pg
 				.simple(
 					"select pg_database_size(current_database()), \
@@ -740,14 +884,14 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 				.into_iter()
 				.next()
 				.unwrap_or_default();
-			Ok::<_, OpError>((pg, counters, row))
+			Ok::<_, OpError>((pg, counted, row))
 		};
 		match read.await {
-			Ok((pg, counters, row)) => {
+			Ok((pg, counted, row)) => {
 				facts.db_bytes = num(&row, 0) as u64;
 				facts.connections = num(&row, 1) as u64;
 				facts.max_connections = num(&row, 2) as u64;
-				before.insert(n.id, counters);
+				before.insert(n.id, counted);
 				conns.insert(n.id, (pg, num(&row, 3) as u32));
 			}
 			Err(e) => facts.error = Some(e.message),
@@ -756,6 +900,7 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 	}
 
 	let mut reads: BTreeMap<(NodeId, RelationName), TableRead> = BTreeMap::new();
+	let mut chunk_reads: Vec<ChunkRead> = Vec::new();
 	let mut names: Vec<&String> = c.keyspaces.keys().collect();
 	names.sort();
 	for name in names {
@@ -766,6 +911,61 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 			else {
 				continue;
 			};
+			// A chunked table: every owned chunk table's own size and rows.
+			if let Some(chunks) = c.chunks_of(&rel) {
+				for (id, (pg, _)) in conns.iter_mut() {
+					let owned: Vec<crate::catalog::Chunk> = chunks
+						.iter()
+						.filter(|ch| ks.owner_of_hash(ch.lo) == *id)
+						.copied()
+						.collect();
+					if owned.is_empty() {
+						continue;
+					}
+					let names: Vec<String> = owned
+						.iter()
+						.map(|ch| qualified(&crate::chunk::chunk_relation(&rel, ch.number)))
+						.collect();
+					let array = format!(
+						"{{{}}}",
+						names
+							.iter()
+							.map(|m| format!(
+								"\"{}\"",
+								m.replace('\\', "\\\\").replace('"', "\\\"")
+							))
+							.collect::<Vec<_>>()
+							.join(",")
+					);
+					let rows = pg
+						.query(
+							"select x.name, coalesce(pg_total_relation_size(k.oid), 0), \
+							coalesce(greatest(k.reltuples, 0), 0), n.nspname || '.' || k.relname \
+							from unnest($1::text[]) with ordinality x(name, i) \
+							join pg_class k on k.oid = to_regclass(x.name) \
+							join pg_namespace n on n.oid = k.relnamespace order by x.i",
+							&[&array],
+						)
+						.await?;
+					for r in rows {
+						let q = r.first().cloned().flatten().unwrap_or_default();
+						let Some(i) = names.iter().position(|n| *n == q) else {
+							continue;
+						};
+						chunk_reads.push(ChunkRead {
+							node: *id,
+							keyspace: name.clone(),
+							name: r.get(3).cloned().flatten().unwrap_or_default(),
+							chunk: owned[i],
+							size: num(&r, 1),
+							tuples: num(&r, 2),
+							writes_per_s: 0.0,
+							reads_per_s: 0.0,
+						});
+					}
+				}
+				continue;
+			}
 			for (id, (pg, version)) in conns.iter_mut() {
 				if !ks.ranges.iter().any(|r| r.node == *id) {
 					continue;
@@ -830,6 +1030,7 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 						size,
 						tuples: tuples.max(0.0),
 						writes_per_s: 0.0,
+						reads_per_s: 0.0,
 						sample,
 					},
 				);
@@ -837,7 +1038,7 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 		}
 	}
 
-	// The second reading of the write counters, `sample_ms` after the first.
+	// The second reading of the counters, `sample_ms` after the first.
 	let mut sampled_ms = 0;
 	if sample_ms > 0 {
 		let wait = Duration::from_millis(sample_ms.min(MAX_SAMPLE_MS)).saturating_sub(t0.elapsed());
@@ -845,19 +1046,29 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 		let seconds = t0.elapsed().as_secs_f64().max(0.001);
 		sampled_ms = (seconds * 1000.0) as u64;
 		for (id, (pg, _)) in conns.iter_mut() {
-			let after = write_counters(pg).await?;
+			let after = counters(pg).await?;
 			let was = before.get(id).cloned().unwrap_or_default();
 			let rate = |name: &str| {
-				(after.get(name).copied().unwrap_or(0.0) - was.get(name).copied().unwrap_or(0.0))
-					.max(0.0) / seconds
+				let (a, b) = (
+					after.get(name).copied().unwrap_or((0.0, 0.0)),
+					was.get(name).copied().unwrap_or((0.0, 0.0)),
+				);
+				(
+					(a.0 - b.0).max(0.0) / seconds,
+					(a.1 - b.1).max(0.0) / seconds,
+				)
 			};
 			if let Some(n) = nodes.iter_mut().find(|n| n.id == *id) {
-				n.writes_per_s = after.keys().map(|k| rate(k)).sum();
+				n.writes_per_s = after.keys().map(|k| rate(k).0).sum();
+				n.reads_per_s = after.keys().map(|k| rate(k).1).sum();
 			}
 			for ((node, rel), t) in reads.iter_mut() {
 				if node == id {
-					t.writes_per_s = rate(&rel.to_string());
+					(t.writes_per_s, t.reads_per_s) = rate(&rel.to_string());
 				}
+			}
+			for ch in chunk_reads.iter_mut().filter(|ch| ch.node == *id) {
+				(ch.writes_per_s, ch.reads_per_s) = rate(&ch.name);
 			}
 		}
 	}
@@ -875,7 +1086,8 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 			pins.insert((name.clone(), v.clone()));
 		}
 		let tables: Vec<&TableRead> = reads.values().filter(|t| &t.keyspace == name).collect();
-		ranges.extend(attribute(name, &ks.ranges, &tables));
+		let chunks: Vec<&ChunkRead> = chunk_reads.iter().filter(|t| &t.keyspace == name).collect();
+		ranges.extend(attribute(name, &ks.ranges, &tables, &chunks));
 	}
 	Ok(Facts {
 		nodes,
@@ -883,6 +1095,7 @@ pub async fn gather(app: &Arc<App>, c: &Catalog, sample_ms: u64) -> Result<Facts
 		pins,
 		next_node: c.nodes.keys().map(|n| n.0).max().unwrap_or(0) + 1,
 		sampled_ms,
+		recent,
 	})
 }
 
@@ -891,8 +1104,14 @@ fn width(r: &Range) -> f64 {
 }
 
 /// Divides each node's tables among the ranges it owns, by where their sampled rows' hashes fall
-/// (by width when nothing was sampled).
-fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<RangeFacts> {
+/// (by width when nothing was sampled); a chunked table's chunks go whole to the range holding
+/// them, each also a sample at its first hash, so a split bound falls between chunks.
+fn attribute(
+	keyspace: &str,
+	ranges: &[Range],
+	tables: &[&TableRead],
+	chunks: &[&ChunkRead],
+) -> Vec<RangeFacts> {
 	let mut out: Vec<RangeFacts> = ranges
 		.iter()
 		.map(|r| RangeFacts {
@@ -903,7 +1122,9 @@ fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<Ran
 			rows: 0.0,
 			bytes: 0.0,
 			writes_per_s: 0.0,
+			reads_per_s: 0.0,
 			samples: Vec::new(),
+			chunks: Vec::new(),
 		})
 		.collect();
 	for t in tables {
@@ -921,6 +1142,7 @@ fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<Ran
 				out[i].rows += t.tuples * share;
 				out[i].bytes += t.size * share;
 				out[i].writes_per_s += t.writes_per_s * share;
+				out[i].reads_per_s += t.reads_per_s * share;
 			}
 			continue;
 		}
@@ -934,15 +1156,56 @@ fn attribute(keyspace: &str, ranges: &[Range], tables: &[&TableRead]) -> Vec<Ran
 			out[i].rows += t.tuples / n;
 			out[i].bytes += t.size / n;
 			out[i].writes_per_s += t.writes_per_s / n;
+			out[i].reads_per_s += t.reads_per_s / n;
 			out[i].samples.push(Sample {
 				hash: *h,
 				key: key.clone(),
 				bytes: t.size / n,
 				writes: t.writes_per_s / n,
+				reads: t.reads_per_s / n,
 			});
 		}
 	}
+	for ch in chunks {
+		let Some(i) = (0..ranges.len())
+			.find(|i| ranges[*i].lo <= ch.chunk.lo && ch.chunk.lo <= ranges[*i].hi)
+		else {
+			continue;
+		};
+		let r = &mut out[i];
+		r.rows += ch.tuples;
+		r.bytes += ch.size;
+		r.writes_per_s += ch.writes_per_s;
+		r.reads_per_s += ch.reads_per_s;
+		match r.chunks.iter_mut().find(|c| c.number == ch.chunk.number) {
+			Some(c) => {
+				c.rows += ch.tuples;
+				c.bytes += ch.size;
+				c.writes_per_s += ch.writes_per_s;
+				c.reads_per_s += ch.reads_per_s;
+			}
+			None => r.chunks.push(ChunkFacts {
+				number: ch.chunk.number,
+				lo: ch.chunk.lo,
+				hi: ch.chunk.hi,
+				rows: ch.tuples,
+				bytes: ch.size,
+				writes_per_s: ch.writes_per_s,
+				reads_per_s: ch.reads_per_s,
+			}),
+		}
+	}
 	for r in &mut out {
+		r.chunks.sort_by_key(|c| c.lo);
+		for c in &r.chunks {
+			r.samples.push(Sample {
+				hash: c.lo,
+				key: format!("chunk {}", c.number),
+				bytes: c.bytes,
+				writes: c.writes_per_s,
+				reads: c.reads_per_s,
+			});
+		}
 		r.samples.sort_by_key(|s| s.hash);
 	}
 	out
@@ -954,13 +1217,17 @@ fn facts_json(f: &Facts) -> Value {
 		"nodes": f.nodes.iter().map(|n| json!({
 			"id": n.id.0, "name": n.name, "active": n.active, "db_bytes": n.db_bytes,
 			"connections": n.connections, "max_connections": n.max_connections,
-			"writes_per_s": (n.writes_per_s * 10.0).round() / 10.0, "error": n.error,
+			"writes_per_s": (n.writes_per_s * 10.0).round() / 10.0,
+			"reads_per_s": n.reads_per_s.round(), "router_p99_ms": n.p99_ms, "router_busy_pct": n.busy_pct,
+			"error": n.error,
 		})).collect::<Vec<_>>(),
 		"ranges": f.ranges.iter().map(|r| json!({
 			"keyspace": r.keyspace, "lo": r.lo.to_string(), "hi": r.hi.to_string(), "node": r.node.0,
 			"rows": r.rows.round() as u64, "bytes": r.bytes.round() as u64,
-			"writes_per_s": (r.writes_per_s * 10.0).round() / 10.0, "sampled_rows": r.samples.len(),
+			"writes_per_s": (r.writes_per_s * 10.0).round() / 10.0, "reads_per_s": r.reads_per_s.round(),
+			"sampled_rows": r.samples.len(), "chunks": r.chunks.len(),
 		})).collect::<Vec<_>>(),
+		"held": f.recent.iter().map(|(k, lo)| format!("{k}:{lo}")).collect::<Vec<_>>(),
 	})
 }
 
@@ -980,7 +1247,40 @@ pub async fn advise(app: &Arc<App>, h: &mut Pg, sample_ms: Option<u64>) -> Resul
 	let s = AdviceSettings::from_json(&cluster);
 	let op_settings = Settings::from_json(&cluster, &Value::Null);
 	let c = load_catalog(h).await?;
-	let f = gather(app, &c, sample_ms.unwrap_or(s.sample_ms).min(MAX_SAMPLE_MS)).await?;
+	// What moved within the hold window is not moved again (no move back).
+	let mut recent = HashSet::new();
+	for r in h
+		.query(
+			"select args::text from lepis.job where op in ('range.move', 'range.split', 'chunk.split') \
+			and state <> 'cancelled' and coalesce(finished_at, now()) > now() - $1::int * interval '1 second'",
+			&[&s.hold_s.min(i32::MAX as u64).to_string()],
+		)
+		.await?
+	{
+		let Some(args) = r
+			.first()
+			.cloned()
+			.flatten()
+			.and_then(|v| serde_json::from_str::<Value>(&v).ok())
+		else {
+			continue;
+		};
+		let Some(k) = args.get("keyspace").and_then(Value::as_str) else {
+			continue;
+		};
+		for key in ["range", "at"] {
+			if let Some(v) = args.get(key).and_then(super::i64_of) {
+				recent.insert((k.to_string(), v));
+			}
+		}
+	}
+	let f = gather(
+		app,
+		&c,
+		sample_ms.unwrap_or(s.sample_ms).min(MAX_SAMPLE_MS),
+		recent,
+	)
+	.await?;
 	let decided = decide(&f, &s);
 	let mut advice = Vec::new();
 	for a in decided {
@@ -1045,6 +1345,9 @@ mod tests {
 			connections: 5,
 			max_connections: 100,
 			writes_per_s: 0.0,
+			reads_per_s: 0.0,
+			p99_ms: None,
+			busy_pct: None,
 			error: None,
 		}
 	}
@@ -1064,6 +1367,7 @@ mod tests {
 						key: format!("{i}-{j}"),
 						bytes: bytes[i] / 100.0,
 						writes: 0.0,
+						reads: 0.0,
 					})
 					.collect();
 				RangeFacts {
@@ -1074,7 +1378,9 @@ mod tests {
 					rows: bytes[i] / 100.0,
 					bytes: bytes[i],
 					writes_per_s: 0.0,
+					reads_per_s: 0.0,
 					samples,
+					chunks: Vec::new(),
 				}
 			})
 			.collect()
@@ -1087,7 +1393,150 @@ mod tests {
 			pins: HashSet::new(),
 			next_node: nodes.iter().max().unwrap() + 1,
 			sampled_ms: 0,
+			recent: HashSet::new(),
 		}
+	}
+
+	/// A chunked keyspace: `per_node` ranges of `chunks_per_range` chunks each, round-robin over
+	/// `nodes`; chunk j of range i holds `bytes[i] / chunks_per_range`, and `reads[i]` likewise.
+	fn chunked(
+		nodes: &[i32],
+		per_node: usize,
+		chunks_per_range: usize,
+		bytes: &[f64],
+		reads: &[f64],
+	) -> Vec<RangeFacts> {
+		let ids: Vec<NodeId> = nodes.iter().map(|n| NodeId(*n)).collect();
+		let n = nodes.len() * per_node;
+		let all = crate::chunk::even_chunks((n * chunks_per_range) as u32).unwrap();
+		let mut ks = crate::catalog::Keyspace {
+			name: "k".into(),
+			strategy: crate::catalog::Strategy::Hash,
+			key_type: crate::hash::KeyType::Int8,
+			seed: 0,
+			ranges: crate::catalog::Keyspace::even_ranges(n, &ids),
+			pins: Default::default(),
+			chunks: Vec::new(),
+			second: None,
+		};
+		ks.chunks = crate::chunk::chunks_for(all.len() as u32, &ks).unwrap();
+		ks.ranges
+			.iter()
+			.enumerate()
+			.map(|(i, r)| {
+				let cs: Vec<ChunkFacts> = crate::chunk::chunks_in(&ks.chunks, r.lo, r.hi)
+					.into_iter()
+					.map(|c| ChunkFacts {
+						number: c.number,
+						lo: c.lo,
+						hi: c.hi,
+						rows: 0.0,
+						bytes: bytes[i] / chunks_per_range as f64,
+						writes_per_s: 0.0,
+						reads_per_s: reads[i] / chunks_per_range as f64,
+					})
+					.collect();
+				RangeFacts {
+					keyspace: "k".into(),
+					lo: r.lo,
+					hi: r.hi,
+					node: r.node,
+					rows: 0.0,
+					bytes: bytes[i],
+					writes_per_s: 0.0,
+					reads_per_s: reads[i],
+					samples: cs
+						.iter()
+						.map(|c| Sample {
+							hash: c.lo,
+							key: format!("chunk {}", c.number),
+							bytes: c.bytes,
+							writes: 0.0,
+							reads: c.reads_per_s,
+						})
+						.collect(),
+					chunks: cs,
+				}
+			})
+			.collect()
+	}
+
+	#[test]
+	fn hot_reads_on_a_chunked_keyspace_move_a_range_once_and_the_hold_stops_a_move_back() {
+		// Even in size; node 1's range reads 8x the others.
+		let rs = chunked(
+			&[1, 2, 3, 4],
+			2,
+			4,
+			&[GB; 8],
+			&[
+				80_000.0, 10_000.0, 10_000.0, 10_000.0, 80_000.0, 10_000.0, 10_000.0, 10_000.0,
+			],
+		);
+		let f = facts(&[1, 2, 3, 4], rs.clone());
+		let a = decide(&f, &AdviceSettings::default());
+		let reads: Vec<&Advice> = a.iter().filter(|x| x.metric == "reads").collect();
+		assert_eq!(reads.len(), 1, "{a:#?}");
+		let r = &reads[0].request;
+		assert!(
+			matches!(r["op"].as_str(), Some("range.move" | "range.split")),
+			"{r}"
+		);
+		// A split lands on a chunk boundary.
+		if r["op"] == "range.split" {
+			let at: i64 = r["at"].as_str().unwrap().parse().unwrap();
+			assert!(rs.iter().flat_map(|x| &x.chunks).any(|c| c.lo == at), "{r}");
+		}
+		// Held: the hot ranges moved a moment ago are not moved again.
+		let mut f2 = facts(&[1, 2, 3, 4], rs.clone());
+		for x in &rs {
+			f2.recent.insert(("k".into(), x.lo));
+		}
+		assert!(
+			decide(&f2, &AdviceSettings::default())
+				.iter()
+				.all(|x| x.metric != "reads")
+		);
+	}
+
+	#[test]
+	fn a_move_that_buys_less_than_it_costs_is_not_made() {
+		// Node 1 just over the threshold, by a range so big that copying it costs more than it buys.
+		let rs = chunked(&[1, 2], 1, 2, &[400.0 * GB, 250.0 * GB], &[0.0, 0.0]);
+		let f = facts(&[1, 2], rs);
+		let s = AdviceSettings {
+			skew_pct: 120,
+			split_bytes: u64::MAX,
+			cost_pct_per_gb: 5,
+			..AdviceSettings::default()
+		};
+		assert!(
+			decide(&f, &s).iter().all(|x| x.metric != "size"),
+			"{:#?}",
+			decide(&f, &s)
+		);
+		// Cheap copies: the same imbalance is worth a move.
+		let s = AdviceSettings {
+			cost_pct_per_gb: 0,
+			..s
+		};
+		assert!(decide(&f, &s).iter().any(|x| x.metric == "size"));
+	}
+
+	#[test]
+	fn a_range_that_is_one_hot_chunk_splits_the_chunk_in_place() {
+		// Two nodes: one holding all of something is 200% of an even share, so the bar is lower.
+		let rs = chunked(&[1, 2], 1, 1, &[GB, GB], &[100_000.0, 100.0]);
+		let f = facts(&[1, 2], rs);
+		let a = decide(
+			&f,
+			&AdviceSettings {
+				read_pct: 150,
+				..AdviceSettings::default()
+			},
+		);
+		let r = a.iter().find(|x| x.metric == "reads").expect("read advice");
+		assert_eq!(r.request["op"], "chunk.split", "{r:#?}");
 	}
 
 	const GB: f64 = 1e9;
@@ -1272,6 +1721,7 @@ mod tests {
 	#[test]
 	fn the_bound_is_always_inside_the_range() {
 		let s = |h: i64| Sample {
+			reads: 0.0,
 			hash: h,
 			key: h.to_string(),
 			bytes: 1.0,
@@ -1333,6 +1783,7 @@ mod tests {
 			size: 1000.0,
 			tuples: 100.0,
 			writes_per_s: 10.0,
+			reads_per_s: 0.0,
 			sample: vec![
 				(-5, "a".into()),
 				(5, "b".into()),
@@ -1340,7 +1791,7 @@ mod tests {
 				(7, "d".into()),
 			],
 		};
-		let out = attribute("k", &r, &[&t]);
+		let out = attribute("k", &r, &[&t], &[]);
 		assert_eq!(out[0].bytes, 250.0);
 		assert_eq!(out[1].bytes, 750.0);
 		assert_eq!(out[1].rows, 75.0);
@@ -1350,7 +1801,7 @@ mod tests {
 			sample: vec![],
 			..t
 		};
-		let out = attribute("k", &r, &[&t]);
+		let out = attribute("k", &r, &[&t], &[]);
 		assert!((out[0].bytes - 500.0).abs() < 1e-6);
 	}
 }

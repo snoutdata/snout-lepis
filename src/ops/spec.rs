@@ -20,6 +20,51 @@ pub struct NodeSpec {
 	/// The host OTHER nodes reach this one by, when it differs from the router's view (a
 	/// subscription connects node to node). Kept in `lepis.node.labels`.
 	pub peer_host: Option<String>,
+	/// The port with `peer_host`, when it is not `port`. Kept in `lepis.node.labels`.
+	pub peer_port: Option<u16>,
+	/// Where the node runs, for a cluster whose nodes are on more than one machine: a node of
+	/// the same site reaches this one at `site_host`:`site_port`, a node of another site at
+	/// `peer_host`:`peer_port` (`reach`). Kept in `lepis.node.labels`.
+	pub site: Option<String>,
+	pub site_host: Option<String>,
+	pub site_port: Option<u16>,
+}
+
+/// The labels that say how other nodes reach a node (`NodeSpec`'s addressing). A node's row
+/// keeps the ones its spec names; a re-address or a failover replaces all of them at once.
+pub const ADDRESS_LABELS: [&str; 5] = ["peer_host", "peer_port", "site", "site_host", "site_port"];
+
+fn opt_port(v: &Value, k: &str) -> Result<Option<u16>, OpError> {
+	match v.get(k) {
+		None | Some(Value::Null) => Ok(None),
+		Some(p) => p
+			.as_u64()
+			.and_then(|p| u16::try_from(p).ok())
+			.filter(|p| *p > 0)
+			.map(Some)
+			.ok_or_else(|| OpError::refused(Kind::BadRequest, format!("{k}: not a port"))),
+	}
+}
+
+/// How a node reaches `source` for a subscription: the same site's address when both name the
+/// same site, else the source's `peer_host` (with `peer_port`), else the catalog's own host and
+/// port. `labels` are each node's `lepis.node.labels`.
+pub fn reach(host: &str, port: u16, source: &Value, target: &Value) -> (String, u16) {
+	let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+	let num = |v: &Value, k: &str| {
+		v.get(k)
+			.and_then(Value::as_u64)
+			.and_then(|p| u16::try_from(p).ok())
+	};
+	let same_site =
+		matches!((text(source, "site"), text(target, "site")), (Some(a), Some(b)) if a == b);
+	if same_site && let Some(h) = text(source, "site_host") {
+		return (h, num(source, "site_port").unwrap_or(port));
+	}
+	match text(source, "peer_host") {
+		Some(h) => (h, num(source, "peer_port").unwrap_or(port)),
+		None => (host.to_string(), port),
+	}
 }
 
 impl NodeSpec {
@@ -54,14 +99,51 @@ impl NodeSpec {
 				.get("peer_host")
 				.and_then(Value::as_str)
 				.map(str::to_string),
+			peer_port: opt_port(v, "peer_port")?,
+			site: opt_str(v, "site"),
+			site_host: opt_str(v, "site_host"),
+			site_port: opt_port(v, "site_port")?,
 		})
 	}
 
 	pub fn to_json(&self) -> Value {
-		json!({
+		let mut v = json!({
 			"name": self.name, "host": self.host, "port": self.port, "dbname": self.dbname,
 			"sslmode": sslmode_name(self.sslmode), "peer_host": self.peer_host,
-		})
+		});
+		// Only when set, so a spec stored before these existed reads back the same.
+		for (k, x) in [
+			("peer_port", self.peer_port.map(|p| json!(p))),
+			("site", self.site.as_ref().map(|s| json!(s))),
+			("site_host", self.site_host.as_ref().map(|s| json!(s))),
+			("site_port", self.site_port.map(|p| json!(p))),
+		] {
+			if let Some(x) = x {
+				v[k] = x;
+			}
+		}
+		v
+	}
+
+	/// The addressing labels this spec names (`ADDRESS_LABELS`), as a JSON object.
+	pub fn address_labels(&self) -> Value {
+		let mut v = json!({});
+		if let Some(p) = &self.peer_host {
+			v["peer_host"] = json!(p);
+		}
+		if let Some(p) = self.peer_port {
+			v["peer_port"] = json!(p);
+		}
+		if let Some(s) = &self.site {
+			v["site"] = json!(s);
+		}
+		if let Some(s) = &self.site_host {
+			v["site_host"] = json!(s);
+		}
+		if let Some(p) = self.site_port {
+			v["site_port"] = json!(p);
+		}
+		v
 	}
 }
 
@@ -115,11 +197,22 @@ pub enum Op {
 		seed: Option<u64>,
 		ranges: Option<usize>,
 		nodes: Vec<NodeRef>,
+		/// A second key's type: its tables are distributed by two
+		/// columns, so one value of the first spreads over every node.
+		second_key_type: Option<String>,
 	},
 	TableDistribute {
 		table: RelationName,
 		column: String,
 		keyspace: String,
+		/// One heap per node, as before chunked storage; else chunk tables.
+		heap: bool,
+		/// The keyspace's chunk count when this is its first chunked table (else it has one).
+		chunks: Option<u32>,
+		/// The size the table is expected to reach, for the chunk count when none is given.
+		expected_bytes: Option<u64>,
+		/// The second key column, in a keyspace with a second key (Phase 5).
+		second: Option<String>,
 	},
 	TableReference {
 		table: RelationName,
@@ -132,6 +225,12 @@ pub enum Op {
 		keyspace: String,
 		schemas: Vec<String>,
 		min_bytes: u64,
+	},
+	/// One chunk of a chunked keyspace split in two in place, on its node, online.
+	/// The halves get new numbers, every table of the keyspace splits it.
+	ChunkSplit {
+		keyspace: String,
+		chunk: u32,
 	},
 	RangeSplit {
 		keyspace: String,
@@ -178,6 +277,12 @@ pub enum Op {
 		spec: NodeSpec,
 		fenced: bool,
 	},
+	/// A node is reached somewhere else now (`readdress.rs`): its host, port and addressing labels.
+	/// The spec's name, dbname and sslmode are not used.
+	NodeReaddress {
+		node: NodeRef,
+		spec: NodeSpec,
+	},
 	/// One named marker in every node's WAL with no two-phase decision in between (`restore_point.rs`).
 	RestorePoint {
 		name: Option<String>,
@@ -193,7 +298,7 @@ pub enum Op {
 }
 
 /// Every operation's name, for the API's own description of itself.
-pub const OPS: [&str; 21] = [
+pub const OPS: [&str; 23] = [
 	"node.add",
 	"node.drain",
 	"node.remove",
@@ -203,6 +308,7 @@ pub const OPS: [&str; 21] = [
 	"table.global",
 	"table.auto",
 	"range.split",
+	"chunk.split",
 	"range.merge",
 	"range.move",
 	"tenant.pin",
@@ -212,6 +318,7 @@ pub const OPS: [&str; 21] = [
 	"cleanup",
 	"node.attach",
 	"node.failover",
+	"node.readdress",
 	"restore_point",
 	"keyspace.drop",
 	"dissolve",
@@ -237,6 +344,21 @@ fn node_list(v: &Value, k: &str) -> Vec<NodeRef> {
 		.unwrap_or_default()
 }
 
+/// `node.readdress`'s address: a `NodeSpec` read from the body with no name of its own (the node
+/// keeps its name, database and TLS mode, so only host, port and the addressing labels are used).
+fn readdress_spec(v: &Value) -> Result<NodeSpec, OpError> {
+	let mut w = v.clone();
+	if w.get("port").is_none() {
+		return Err(OpError::refused(
+			Kind::BadRequest,
+			"port is required (a number)",
+		));
+	}
+	w["name"] = json!("");
+	w["sslmode"] = json!("disable");
+	NodeSpec::from_json(&w)
+}
+
 fn opt_str(v: &Value, k: &str) -> Option<String> {
 	v.get(k).and_then(Value::as_str).map(str::to_string)
 }
@@ -259,11 +381,38 @@ impl Op {
 				seed: super::u64_of(v.get("seed")),
 				ranges: v.get("ranges").and_then(Value::as_u64).map(|n| n as usize),
 				nodes: node_list(v, "nodes"),
+				second_key_type: v
+					.get("second_key_type")
+					.and_then(Value::as_str)
+					.map(str::to_string),
 			},
 			"table.distribute" => Op::TableDistribute {
 				table: relation_name(&s(v, "table")?)?,
-				column: s(v, "column")?,
+				// `"by": ["tenant_id", "seq"]` names both keys at once (Phase 5).
+				column: match v.get("by").and_then(Value::as_array) {
+					Some(by) => by
+						.first()
+						.and_then(Value::as_str)
+						.map(str::to_string)
+						.ok_or_else(|| OpError::new("by: the key columns, as strings"))?,
+					None => s(v, "column")?,
+				},
+				second: match v.get("by").and_then(Value::as_array) {
+					Some(by) if by.len() > 2 => {
+						return Err(OpError::new(
+							"by: at most two columns, the key and a second key",
+						));
+					}
+					Some(by) => by.get(1).and_then(Value::as_str).map(str::to_string),
+					None => v.get("second").and_then(Value::as_str).map(str::to_string),
+				},
 				keyspace: s(v, "keyspace")?,
+				heap: v.get("heap").and_then(Value::as_bool).unwrap_or(false),
+				chunks: v
+					.get("chunks")
+					.and_then(Value::as_u64)
+					.and_then(|n| u32::try_from(n).ok()),
+				expected_bytes: super::u64_of(v.get("expected_bytes")),
 			},
 			"table.reference" => Op::TableReference {
 				table: relation_name(&s(v, "table")?)?,
@@ -316,6 +465,11 @@ impl Op {
 				at: v.get("at").and_then(|_| i(v, "at").ok()),
 				to: opt_node(v, "to"),
 			},
+			"chunk.split" => Op::ChunkSplit {
+				keyspace: s(v, "keyspace")?,
+				chunk: u32::try_from(i(v, "chunk")?)
+					.map_err(|_| OpError::refused(Kind::BadRequest, "chunk is a chunk number"))?,
+			},
 			"range.merge" => Op::RangeMerge {
 				keyspace: s(v, "keyspace")?,
 				a: i(v, "a")?,
@@ -364,6 +518,10 @@ impl Op {
 				spec: NodeSpec::from_json(v)?,
 				fenced: v.get("fenced").and_then(Value::as_bool).unwrap_or(false),
 			},
+			"node.readdress" => Op::NodeReaddress {
+				node: node_ref(v, "node")?,
+				spec: readdress_spec(v)?,
+			},
 			"restore_point" => Op::RestorePoint {
 				name: opt_str(v, "name"),
 			},
@@ -391,6 +549,7 @@ impl Op {
 			Op::TableGlobal { .. } => "table.global",
 			Op::TableAuto { .. } => "table.auto",
 			Op::RangeSplit { .. } => "range.split",
+			Op::ChunkSplit { .. } => "chunk.split",
 			Op::RangeMerge { .. } => "range.merge",
 			Op::RangeMove { .. } => "range.move",
 			Op::TenantPin { .. } => "tenant.pin",
@@ -400,6 +559,7 @@ impl Op {
 			Op::Cleanup { .. } => "cleanup",
 			Op::NodeAttach { .. } => "node.attach",
 			Op::NodeFailover { .. } => "node.failover",
+			Op::NodeReaddress { .. } => "node.readdress",
 			Op::RestorePoint { .. } => "restore_point",
 			Op::KeyspaceDrop { .. } => "keyspace.drop",
 			Op::Dissolve => "dissolve",
@@ -463,11 +623,21 @@ pub enum Step {
 		spec: NodeSpec,
 		fenced: bool,
 	},
+	/// A node's catalog row given its new address (`readdress.rs`).
+	NodeReaddress {
+		node: NodeId,
+		spec: NodeSpec,
+	},
 	RestorePoint {
 		name: String,
 	},
 	/// Fences off and the catalog's shape forgotten, on a cluster of the home alone (`Op::Dissolve`).
 	Dissolve,
+	/// A chunked table whose chunks are all on the home node becomes one heap there again, and
+	/// global, in one home transaction (`table.global`, `dissolve`).
+	Dechunk {
+		table: RelationName,
+	},
 }
 
 fn tables_json(t: &[RelationName]) -> Value {
@@ -489,8 +659,10 @@ impl Step {
 			Step::Cleanup { .. } => "cleanup",
 			Step::NodeAttach { .. } => "node.attach",
 			Step::NodeFailover { .. } => "node.failover",
+			Step::NodeReaddress { .. } => "node.readdress",
 			Step::RestorePoint { .. } => "restore_point",
 			Step::Dissolve => "dissolve",
+			Step::Dechunk { .. } => "dechunk",
 		}
 	}
 
@@ -522,8 +694,12 @@ impl Step {
 			Step::NodeFailover { node, spec, fenced } => {
 				json!({"node": node.0, "spec": spec.to_json(), "fenced": fenced})
 			}
+			Step::NodeReaddress { node, spec } => {
+				json!({"node": node.0, "spec": spec.to_json()})
+			}
 			Step::RestorePoint { name } => json!({"name": name}),
 			Step::Dissolve => json!({}),
+			Step::Dechunk { table } => json!({"table": table.to_string()}),
 		}
 	}
 
@@ -593,10 +769,17 @@ impl Step {
 				spec: NodeSpec::from_json(a.get("spec").unwrap_or(&Value::Null))?,
 				fenced: a.get("fenced").and_then(Value::as_bool).unwrap_or(false),
 			},
+			"node.readdress" => Step::NodeReaddress {
+				node: node("node")?,
+				spec: NodeSpec::from_json(a.get("spec").unwrap_or(&Value::Null))?,
+			},
 			"restore_point" => Step::RestorePoint {
 				name: s(a, "name")?,
 			},
 			"dissolve" => Step::Dissolve,
+			"dechunk" => Step::Dechunk {
+				table: relation_name(&s(a, "table")?)?,
+			},
 			other => return Err(OpError::new(format!("unknown step {other}"))),
 		})
 	}
@@ -605,6 +788,91 @@ impl Step {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn reach_picks_the_address_by_site() {
+		let none = json!({});
+		// No labels: the catalog's own address, as before.
+		assert_eq!(reach("h2", 5432, &none, &none), ("h2".into(), 5432));
+		// The home's peer_host alone (a router beside it on loopback): that host, the catalog port.
+		assert_eq!(
+			reach("127.0.0.1", 5432, &json!({"peer_host": "pod-a"}), &none),
+			("pod-a".into(), 5432)
+		);
+		let a = json!({"site": "10.0.0.5", "site_host": "pod-a", "site_port": 5432, "peer_host": "10.0.0.5", "peer_port": 15433});
+		// The same site: by the pod's name there.
+		assert_eq!(
+			reach("pod-a", 5432, &a, &json!({"site": "10.0.0.5"})),
+			("pod-a".into(), 5432)
+		);
+		// Another site, or a target that names none: by the machine's address and the published port.
+		assert_eq!(
+			reach("pod-a", 5432, &a, &json!({"site": "10.0.0.6"})),
+			("10.0.0.5".into(), 15433)
+		);
+		assert_eq!(reach("pod-a", 5432, &a, &none), ("10.0.0.5".into(), 15433));
+		// A site with no site_host: its peer address.
+		assert_eq!(
+			reach(
+				"x",
+				7,
+				&json!({"site": "s", "peer_host": "p"}),
+				&json!({"site": "s"})
+			),
+			("p".into(), 7)
+		);
+	}
+
+	#[test]
+	fn addressing_round_trips_and_is_left_out_when_unset() {
+		let plain = NodeSpec::from_json(&json!({"name": "n2", "host": "h2", "sslmode": "disable"}))
+			.unwrap();
+		assert_eq!(plain.address_labels(), json!({}));
+		assert!(plain.to_json().get("site").is_none());
+		let full = NodeSpec::from_json(&json!({
+			"name": "n2", "host": "10.0.0.6", "port": 15434, "sslmode": "disable",
+			"peer_host": "10.0.0.6", "peer_port": 15434, "site": "10.0.0.6", "site_host": "pod-b", "site_port": 5432,
+		}))
+		.unwrap();
+		assert_eq!(NodeSpec::from_json(&full.to_json()).unwrap(), full);
+		assert_eq!(
+			full.address_labels(),
+			json!({"peer_host": "10.0.0.6", "peer_port": 15434, "site": "10.0.0.6", "site_host": "pod-b", "site_port": 5432})
+		);
+		assert!(NodeSpec::from_json(&json!({"name": "n", "host": "h", "peer_port": 0})).is_err());
+		assert!(
+			NodeSpec::from_json(&json!({"name": "n", "host": "h", "site_port": 70000})).is_err()
+		);
+	}
+
+	#[test]
+	fn readdress_reads_its_body() {
+		let op = Op::from_json(&json!({"op": "node.readdress", "node": "n2", "host": "10.0.0.6", "port": 15434, "site": "10.0.0.6"})).unwrap();
+		match &op {
+			Op::NodeReaddress { node, spec } => {
+				assert_eq!(node, &NodeRef::Name("n2".into()));
+				assert_eq!(
+					(spec.host.as_str(), spec.port, spec.site.as_deref()),
+					("10.0.0.6", 15434, Some("10.0.0.6"))
+				);
+			}
+			other => panic!("{other:?}"),
+		}
+		assert_eq!(op.name(), "node.readdress");
+		assert!(OPS.contains(&"node.readdress"));
+		assert!(Op::from_json(&json!({"op": "node.readdress", "node": 2, "host": "h"})).is_err());
+		assert!(
+			Op::from_json(&json!({"op": "node.readdress", "host": "h", "port": 5432})).is_err()
+		);
+		let st = Step::NodeReaddress {
+			node: NodeId(2),
+			spec: NodeSpec::from_json(
+				&json!({"name": "", "host": "h", "port": 15434, "sslmode": "disable", "site": "s"}),
+			)
+			.unwrap(),
+		};
+		assert_eq!(Step::from_json(st.kind(), &st.args()).unwrap(), st);
+	}
 
 	#[test]
 	fn steps_round_trip() {
@@ -622,6 +890,12 @@ mod tests {
 			}),
 			Step::Cleanup { node: None },
 			Step::Dissolve,
+			Step::Dechunk {
+				table: RelationName {
+					schema: "public".into(),
+					table: "t".into(),
+				},
+			},
 			Step::Verify {
 				keyspace: Some("k".into()),
 			},

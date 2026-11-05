@@ -160,6 +160,10 @@ pub fn fence_for(
 	node: NodeId,
 	version: u32,
 ) -> Result<Option<String>, OpError> {
+	// A chunked table's fences are its chunks' own, fixed for each chunk's life (chunk.rs).
+	if c.chunked.contains(rel) {
+		return Ok(None);
+	}
 	match c.relations.get(rel) {
 		Some(RelationKind::Sharded {
 			keyspace,
@@ -196,7 +200,11 @@ pub fn owns_expr(
 				.keyspaces
 				.get(keyspace)
 				.ok_or_else(|| OpError::new(format!("no keyspace {keyspace}")))?;
-			owns_check(&column(key_column), ks, node, version)
+			let key = catalog::KeySql {
+				key: column(key_column),
+				second: c.second_keys.get(rel).map(|s| column(s)),
+			};
+			owns_check(key, ks, node, version)
 				.map_err(|e| OpError::refused(Kind::NodeUnsuitable, e.0))
 		}
 		Some(RelationKind::Reference) => Ok("true".into()),
@@ -222,8 +230,13 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, step: &Step) -> Result<(), OpErro
 		Step::TableCreate { node, table } => table_create(cx, h, *node, table).await,
 		// L8: physical when the one target is a standby of the source (`physical.rs`), else logical.
 		Step::Transfer(t) => {
+			// Chunked tables move as whole chunk tables.
+			let mut after = load_catalog(h).await?;
+			t.change.apply(&mut after)?;
 			if super::physical::select(cx, h, t).await? {
 				super::physical::run(cx, h, t).await
+			} else if super::chunkmove::applies(&after, t) {
+				super::chunkmove::run(cx, h, t).await
 			} else {
 				transfer::run(cx, h, t).await
 			}
@@ -250,8 +263,35 @@ pub async fn run(cx: &mut StepCtx, h: &mut Pg, step: &Step) -> Result<(), OpErro
 		Step::NodeFailover { node, spec, fenced } => {
 			super::failover::run(cx, h, *node, spec, *fenced).await
 		}
+		Step::NodeReaddress { node, spec } => super::readdress::run(cx, h, *node, spec).await,
 		Step::RestorePoint { name } => super::restore_point::run(cx, h, name).await,
 		Step::Dissolve => dissolve(cx, h).await,
+		Step::Dechunk { table } => {
+			let c = load_catalog(h).await?;
+			if !c.chunked.contains(table) {
+				return Ok(());
+			}
+			let change = Change::Many(vec![
+				Change::Chunked {
+					name: table.clone(),
+					chunked: false,
+				},
+				Change::Relation {
+					name: table.clone(),
+					kind: RelationKind::Global,
+				},
+			]);
+			let epoch = change_catalog(
+				h,
+				&change,
+				&format!(
+					"{};",
+					crate::chunk::dechunk_sql(std::slice::from_ref(table))
+				),
+			)
+			.await?;
+			cx.save(h, json!({"epoch": epoch})).await
+		}
 	}
 }
 
@@ -330,10 +370,19 @@ async fn dissolve(cx: &mut StepCtx, h: &mut Pg) -> Result<(), OpError> {
 	for k in &keyspaces {
 		forgot.push(Change::DropKeyspace { name: k.clone() });
 	}
-	let epoch = change_catalog(h, &Change::Many(forgot), "").await?;
+	// Chunked tables become one heap again, in the transaction that forgets them.
+	let mut chunked: Vec<&RelationName> = c.chunked.iter().collect();
+	chunked.sort();
+	let owned: Vec<RelationName> = chunked.iter().map(|r| (*r).clone()).collect();
+	let extra = if owned.is_empty() {
+		String::new()
+	} else {
+		format!("{};\n", crate::chunk::dechunk_sql(&owned))
+	};
+	let epoch = change_catalog(h, &Change::Many(forgot), &extra).await?;
 	cx.save(
 		h,
-		json!({"epoch": epoch, "unfenced": unfenced, "forgot": {"tables": tables, "keyspaces": keyspaces}}),
+		json!({"epoch": epoch, "unfenced": unfenced, "dechunked": chunked.iter().map(|r| r.to_string()).collect::<Vec<_>>(), "forgot": {"tables": tables, "keyspaces": keyspaces}}),
 	)
 	.await
 }
@@ -439,10 +488,7 @@ async fn node_insert(
 	if let Some(m) = crate::catalog::version_refusal(&pg.label, v) {
 		return Err(OpError::refused(Kind::NodeUnsuitable, m));
 	}
-	let labels = match &spec.peer_host {
-		Some(p) => json!({"peer_host": p}),
-		None => json!({}),
-	};
+	let labels = spec.address_labels();
 	h.simple(&format!(
 		"begin; insert into lepis.node (id, name, host, port, dbname, sslmode, kind, state, server_version_num, labels) \
 		values ({}, {}, {}, {}, {}, '{}', 'data', 'joining', {v}, {}::jsonb) on conflict (id) do nothing; \
@@ -580,9 +626,65 @@ async fn verify(cx: &mut StepCtx, h: &mut Pg, keyspace: Option<&str>) -> Result<
 			let r = rows.first().cloned().unwrap_or_default();
 			let get = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
 			let sharded = matches!(kind, RelationKind::Sharded { .. });
-			let fenced = get(3) != "0";
+			// A chunked table is fenced when its shell refuses rows and every chunk it reads
+			// carries its own fence.
+			let fenced = if c.chunked.contains(*rel) {
+				pg.query(
+					"select (select count(*) from pg_constraint where conrelid = $1::regclass and conname = $2) = 1 					and not exists (select from pg_inherits i where i.inhparent = $1::regclass 					and not exists (select from pg_constraint k where k.conrelid = i.inhrelid and k.conname = 'lepis_owns'))",
+					&[&qualified(rel), crate::chunk::SHELL_CONSTRAINT],
+				)
+				.await?
+				.first()
+				.and_then(|r| r.first().cloned().flatten())
+				.as_deref()
+					== Some("t")
+			} else {
+				get(3) != "0"
+			};
 			if sharded && !fenced {
 				ok = false;
+			}
+			// A chunked table: each chunk it reads, its rows and checksum, and whether the node
+			// owns it.
+			let mut chunks = Vec::new();
+			if let (Some(all), RelationKind::Sharded { keyspace: k, .. }) = (c.chunks_of(rel), kind)
+			{
+				let ks = &c.keyspaces[k];
+				let attached = pg
+					.query(
+						"select k.relname::text from pg_inherits i join pg_class k on k.oid = i.inhrelid \
+						where i.inhparent = $1::regclass order by 1",
+						&[&qualified(rel)],
+					)
+					.await?;
+				for a in attached {
+					let name = a.first().cloned().flatten().unwrap_or_default();
+					let number = name
+						.strip_prefix(&format!("{}_c", rel.table))
+						.and_then(|d| d.parse::<u32>().ok());
+					let owned = number
+						.and_then(|n| all.iter().find(|x| x.number == n))
+						.is_some_and(|x| ks.owner_of_hash(x.lo) == n.id);
+					if !owned {
+						ok = false;
+					}
+					let r = pg
+						.simple(&format!(
+							"select count(*), coalesce(sum(hashtextextended(lepis_row::text, 0)::numeric), 0) \
+							from {}.{} lepis_row",
+							quote_ident(&rel.schema),
+							quote_ident(&name)
+						))
+						.await?;
+					let cell = |i: usize| {
+						r.first()
+							.and_then(|x| x.get(i).cloned().flatten())
+							.unwrap_or_default()
+					};
+					chunks.push(
+						json!({"chunk": number, "table": name, "owned": owned, "rows": cell(0), "checksum": cell(1)}),
+					);
+				}
 			}
 			if matches!(kind, RelationKind::Reference) {
 				match reference.iter_mut().find(|(r, _)| r == *rel) {
@@ -593,6 +695,7 @@ async fn verify(cx: &mut StepCtx, h: &mut Pg, keyspace: Option<&str>) -> Result<
 			report.push(json!({
 				"node": n.id.0, "table": rel.to_string(), "kind": if sharded { "sharded" } else { "reference" },
 				"owned_rows": get(0), "foreign_rows": get(1), "checksum": get(2), "fenced": fenced,
+				"chunks": chunks,
 			}));
 		}
 	}
@@ -661,11 +764,24 @@ async fn cleanup(cx: &mut StepCtx, h: &mut Pg, node: Option<NodeId>) -> Result<(
 			.collect();
 		sharded.sort();
 		let mut items = Vec::new();
+		let mut chunked = Vec::new();
 		for rel in sharded {
-			if schema::exists(&mut pg, rel).await? {
+			if c.chunked.contains(rel) {
+				chunked.push(rel.clone());
+			} else if schema::exists(&mut pg, rel).await? {
 				let owns = owns_expr(&c, rel, n.id, v, &|col| quote_ident(col))?;
 				items.push((rel.clone(), format!("not ({owns})")));
 			}
+		}
+		// A chunked table gives rows away as whole retired chunk tables: dropped, no DELETE.
+		if !chunked.is_empty() {
+			let gone = pg
+				.simple(&crate::chunk::drop_retired_sql(&chunked))
+				.await?
+				.first()
+				.and_then(|r| r.first().cloned().flatten())
+				.unwrap_or_default();
+			deleted.insert(format!("{}:retired chunk tables", n.name), json!(gone));
 		}
 		for (rel, count) in delete_ordered(&mut pg, items).await? {
 			if count > 0 {

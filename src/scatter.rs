@@ -399,12 +399,23 @@ fn per_node_workers(
 		let mut w = worker.clone();
 		let mut failed = None;
 		filter_select(&mut w, &mut |rv| {
-			let (key, keyspace) = sharded_table(ctx, &ctes, rv)?;
+			let (key, keyspace, second) = sharded_table(ctx, &ctes, rv)?;
 			let refname = rv
 				.alias
 				.as_ref()
 				.map(|a| a.aliasname.clone())
 				.unwrap_or_else(|| rv.relname.clone());
+			let column = |c: &str| {
+				format!(
+					"{}.{}",
+					crate::catalog::quote_ident(&refname),
+					crate::catalog::quote_ident(c)
+				)
+			};
+			let key = crate::catalog::KeySql {
+				key: column(&key),
+				second: second.as_deref().map(column),
+			};
 			match owned_rows(ctx.catalog, rv, &refname, &key, &keyspace, *id, server) {
 				Ok(n) => Some(n),
 				Err(e) => {
@@ -429,21 +440,26 @@ fn sharded_table(
 	ctx: &Context,
 	ctes: &BTreeSet<String>,
 	rv: &RangeVar,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Option<String>)> {
 	if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
 		// A CTE of that name shadows the table; the CTE's own query is filtered where it reads it.
 		return None;
 	}
-	match ctx.catalog.relations.get(&resolve_name(
-		ctx.catalog,
-		ctx.search_path,
-		&rv.schemaname,
-		&rv.relname,
-	)) {
+	let name = resolve_name(ctx.catalog, ctx.search_path, &rv.schemaname, &rv.relname);
+	if crate::join::is_staging(&name) {
+		// A join's repartitioned copy (join.rs): each node holds exactly its share, and a row
+		// whose join column is NULL, which no fence would place, must still be read once.
+		return None;
+	}
+	match ctx.catalog.relations.get(&name) {
 		Some(RelationKind::Sharded {
 			keyspace,
 			key_column,
-		}) => Some((key_column.clone(), keyspace.clone())),
+		}) => Some((
+			key_column.clone(),
+			keyspace.clone(),
+			ctx.catalog.second_keys.get(&name).cloned(),
+		)),
 		_ => None,
 	}
 }
@@ -454,7 +470,7 @@ fn owned_rows(
 	c: &Catalog,
 	rv: &RangeVar,
 	refname: &str,
-	key: &str,
+	key: &crate::catalog::KeySql,
 	keyspace: &str,
 	on: crate::catalog::NodeId,
 	server: u32,
@@ -472,12 +488,7 @@ fn owned_rows(
 		.keyspaces
 		.get(keyspace)
 		.ok_or_else(|| cannot(format!("its keyspace {keyspace} is not in the catalog")))?;
-	let column = format!(
-		"{}.{}",
-		crate::catalog::quote_ident(refname),
-		crate::catalog::quote_ident(key)
-	);
-	let check = crate::catalog::owns_check(&column, ks, on, server).map_err(|e| cannot(e.0))?;
+	let check = crate::catalog::owns_check(key.clone(), ks, on, server).map_err(|e| cannot(e.0))?;
 	let parsed = pg_query::parse(&format!("select 1 where {check}"))
 		.map_err(|e| cannot(format!("its ownership expression does not parse: {e}")))?;
 	let filter = parsed
@@ -1303,8 +1314,14 @@ impl<'a> Builder<'a> {
 		resolve_name(self.ctx.catalog, self.ctx.search_path, schema, table)
 	}
 
+	/// The column grouping by which keeps each group on one node. None for a table with a
+	/// second key: one value of its key is on every node.
 	fn sharded_key(&self, schema: &str, table: &str) -> Option<String> {
-		match self.ctx.catalog.relations.get(&self.resolve(schema, table)) {
+		let name = self.resolve(schema, table);
+		if self.ctx.catalog.second_keys.contains_key(&name) {
+			return None;
+		}
+		match self.ctx.catalog.relations.get(&name) {
 			Some(RelationKind::Sharded { key_column, .. }) => Some(key_column.clone()),
 			_ => None,
 		}
@@ -1317,8 +1334,13 @@ impl<'a> Builder<'a> {
 		walk(&n, &mut |s| {
 			if let Seen::Expr(NodeEnum::RangeVar(rv)) = s
 				&& ((rv.schemaname.is_empty() && ctes.contains(&rv.relname))
-					|| self.sharded_key(&rv.schemaname, &rv.relname).is_some())
-			{
+					|| matches!(
+						self.ctx
+							.catalog
+							.relations
+							.get(&self.resolve(&rv.schemaname, &rv.relname)),
+						Some(RelationKind::Sharded { .. })
+					)) {
 				found = true;
 			}
 			!found
@@ -2223,6 +2245,8 @@ mod tests {
 				seed: 1,
 				ranges: Keyspace::even_ranges(12, &ids),
 				pins: Default::default(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		for t in ["orders", "items"] {

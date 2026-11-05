@@ -1,0 +1,2 @@
+\set r random(1, 1000000)
+select w(:r);

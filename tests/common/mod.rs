@@ -74,6 +74,8 @@ pub fn keyspace(name: &str, key_type: KeyType, seed: u64, nodes: &[NodeId]) -> K
 		seed,
 		ranges: Keyspace::even_ranges(nodes.len() * RANGES_PER_NODE, nodes),
 		pins: HashMap::new(),
+		chunks: Vec::new(),
+		second: None,
 	}
 }
 
@@ -95,10 +97,20 @@ pub async fn distribute(b: &Bed) {
 	}
 	let nodes = node_ids(b);
 	let ids: Vec<NodeId> = nodes.iter().map(|(i, _)| *i).collect();
-	let keyspaces = [
+	let mut keyspaces = [
 		keyspace("tenant", KeyType::Int8, TENANT_SEED, &ids),
 		keyspace("device", KeyType::Uuid, DEVICE_SEED, &ids),
 	];
+	// LEPIS_IT_CHUNKS=<n>: the sharded tables as shells and chunk tables, n
+	// chunks per keyspace, so the same corpus runs through chunked storage.
+	let chunks: Option<u32> = std::env::var("LEPIS_IT_CHUNKS")
+		.ok()
+		.and_then(|v| v.parse().ok());
+	if let Some(n) = chunks {
+		for k in keyspaces.iter_mut() {
+			k.chunks = lepis::chunk::chunks_for(n, k).expect("chunks");
+		}
+	}
 
 	// The application role, with ONE verifier copied everywhere (L11; role sync is Phase 3).
 	let home_admin = connect(&b.home, "postgres", "x").await;
@@ -159,6 +171,89 @@ pub async fn distribute(b: &Bed) {
 			.await
 			.unwrap()
 			.get(0);
+		if chunks.is_some() {
+			// Chunked: each owned chunk a table filled from the heap, then the heaps emptied
+			// together (their foreign keys), made shells, the chunks attached, synced.
+			let mut sql = String::from("begin;\n");
+			let mut rels = Vec::new();
+			for (table, ks, column) in SHARDED.iter().rev() {
+				let k = keyspaces.iter().find(|k| k.name == *ks).unwrap();
+				let rel = RelationName {
+					schema: "oracle".into(),
+					table: table.to_string(),
+				};
+				for c in &k.chunks {
+					if k.owner_of_hash(c.lo) != *id {
+						continue;
+					}
+					sql.push_str(
+						&lepis::chunk::create_sql(
+							&rel,
+							&lepis::catalog::KeySql::from(lepis::catalog::quote_ident(column)),
+							k,
+							*c,
+							version as u32,
+						)
+						.unwrap(),
+					);
+					sql.push_str(";\n");
+				}
+				rels.push(rel);
+			}
+			for rel in &rels {
+				sql.push_str(&lepis::chunk::sync_sql(rel));
+				sql.push_str(";\n");
+			}
+			for (table, ks, column) in SHARDED.iter().rev() {
+				let k = keyspaces.iter().find(|k| k.name == *ks).unwrap();
+				for c in &k.chunks {
+					if k.owner_of_hash(c.lo) != *id {
+						continue;
+					}
+					let fence = lepis::chunk::chunk_fence(
+						&lepis::catalog::KeySql::from(lepis::catalog::quote_ident(column)),
+						k,
+						*c,
+						version as u32,
+					)
+					.unwrap();
+					sql.push_str(&format!(
+						"insert into oracle.{t} select * from only oracle.{table} where {fence};\n",
+						t = lepis::chunk::chunk_table(table, c.number)
+					));
+				}
+			}
+			sql.push_str(&format!(
+				"truncate only {};\n",
+				rels.iter()
+					.map(|r| format!("oracle.{}", r.table))
+					.collect::<Vec<_>>()
+					.join(", ")
+			));
+			for (table, ks, _) in SHARDED.iter().rev() {
+				let k = keyspaces.iter().find(|k| k.name == *ks).unwrap();
+				let rel = RelationName {
+					schema: "oracle".into(),
+					table: table.to_string(),
+				};
+				sql.push_str(&lepis::chunk::shell_sql(&rel));
+				sql.push_str(";\n");
+				for c in &k.chunks {
+					if k.owner_of_hash(c.lo) == *id {
+						sql.push_str(&lepis::chunk::attach_sql(&rel, c.number));
+						sql.push_str(";\n");
+					}
+				}
+			}
+			sql.push_str(
+				"grant select, insert, update, delete on all tables in schema oracle to lepis_app;\ncommit;",
+			);
+			admin
+				.batch_execute(&sql)
+				.await
+				.unwrap_or_else(|e| panic!("chunking on {address}: {e}"));
+			continue;
+		}
 		for (table, ks, column) in SHARDED {
 			let k = keyspaces.iter().find(|k| k.name == ks).unwrap();
 			let rel = RelationName {
@@ -211,10 +306,17 @@ pub async fn distribute(b: &Bed) {
 				k.name, r.lo, r.hi, r.node.0
 			));
 		}
+		for c in &k.chunks {
+			sql.push_str(&format!(
+				"insert into lepis.chunk values ('{}', {}, {}, {});\n",
+				k.name, c.number, c.lo, c.hi
+			));
+		}
 	}
 	for (table, ks, column) in SHARDED {
 		sql.push_str(&format!(
-			"insert into lepis.relation values ('oracle', '{table}', 'sharded', '{ks}', '{column}');\n"
+			"insert into lepis.relation values ('oracle', '{table}', 'sharded', '{ks}', '{column}', {});\n",
+			chunks.is_some()
 		));
 	}
 	sql.push_str(

@@ -92,8 +92,18 @@ impl KeyType {
 		seed: u64,
 		server_version_num: u32,
 	) -> Result<String, &'static str> {
+		self.sql_expression_seeded(column, &(seed as i64).to_string(), server_version_num)
+	}
+
+	/// `sql_expression` with the seed an SQL expression of its own (a second key's seed is the
+	/// first key's hash).
+	pub fn sql_expression_seeded(
+		self,
+		column: &str,
+		seed: &str,
+		server_version_num: u32,
+	) -> Result<String, &'static str> {
 		let pg18 = server_version_num >= 180_000;
-		let seed = seed as i64;
 		Ok(match self {
 			KeyType::Int2 => format!("hashint2extended({column}, {seed})"),
 			KeyType::Int4 => format!("hashint4extended({column}, {seed})"),

@@ -324,8 +324,15 @@ fn percentile(v: &mut [f64], p: f64) -> f64 {
 	v[((v.len() as f64 - 1.0) * p).round() as usize]
 }
 
+/// With LEPIS_IT_CHUNKS set (the run that lays the oracle out as chunks, common/mod.rs) the table
+/// is stored as chunks: every move is a chunk move, the split lands between
+/// chunks, and there is no pin (a chunked keyspace has none). Otherwise one heap a node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn operations_under_write_load_lose_nothing() {
+	ops_under_load(std::env::var("LEPIS_IT_CHUNKS").is_ok()).await;
+}
+
+async fn ops_under_load(chunked: bool) {
 	let b = need_bed!();
 	let nodes = node_ids(&b);
 	let home = connect(&b.home, "postgres", "x").await;
@@ -489,7 +496,7 @@ async fn operations_under_write_load_lose_nothing() {
 	jobs.push(
 		admin
 			.op(
-				json!({"op": "table.distribute", "table": "opsx.ledger", "column": "acct", "keyspace": "acct"}),
+				json!({"op": "table.distribute", "table": "opsx.ledger", "column": "acct", "keyspace": "acct", "heap": !chunked}),
 			)
 			.await,
 	);
@@ -535,20 +542,22 @@ async fn operations_under_write_load_lose_nothing() {
 		ranges(&st, "acct")
 	);
 
-	// A tenant on a node of its own.
-	jobs.push(
-		admin
-			.op(json!({"op": "tenant.pin", "keyspace": "acct", "value": "7", "node": 3}))
-			.await,
-	);
-	let st = admin.status().await;
-	let pins = &st["keyspaces"]
-		.as_array()
-		.unwrap()
-		.iter()
-		.find(|k| k["name"] == "acct")
-		.unwrap()["pins"];
-	assert_eq!(pins, &json!([{"value": "7", "node": 3}]));
+	// A tenant on a node of its own (a heap keyspace; a chunked one has no pins).
+	if !chunked {
+		jobs.push(
+			admin
+				.op(json!({"op": "tenant.pin", "keyspace": "acct", "value": "7", "node": 3}))
+				.await,
+		);
+		let st = admin.status().await;
+		let pins = &st["keyspaces"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|k| k["name"] == "acct")
+			.unwrap()["pins"];
+		assert_eq!(pins, &json!([{"value": "7", "node": 3}]));
+	}
 
 	// Node 3 gives everything back (every keyspace, the pin included) and leaves.
 	jobs.push(admin.op(json!({"op": "node.drain", "node": 3})).await);

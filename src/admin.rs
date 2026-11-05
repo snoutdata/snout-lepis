@@ -331,6 +331,11 @@ async fn handle(req: Request, app: &Arc<App>, token: &str, kick: &Arc<Notify>) -
 				"ops": OPS,
 				"settings": Settings::default().to_json(),
 				"advice_settings": AdviceSettings::default().to_json(),
+				// The design check (GET /v1/check), with its chosen thresholds.
+				"check": {
+					"big_bytes": crate::ops::check::BIG_BYTES,
+					"reference_bytes": crate::ops::check::REFERENCE_BYTES,
+				},
 				// A router with the autopilot says so here, with its defaults: off unless set.
 				"autopilot_settings": {
 					"autopilot": crate::ops::autopilot::Mode::Off.name(),
@@ -356,6 +361,14 @@ async fn handle(req: Request, app: &Arc<App>, token: &str, kick: &Arc<Notify>) -
 				.map(|v| (200, v)),
 			Err(e) => Err(e),
 		},
+		("GET", ["v1", "check"]) => crate::ops::check::run(
+			app,
+			&mut h,
+			&crate::ops::check::query_list(&req.path, "schemas"),
+			&crate::ops::check::query_list(&req.path, "exclude"),
+		)
+		.await
+		.map(|v| (200, v)),
 		("POST", ["v1", "settings"]) => match settings_problem(&body) {
 			None => set_settings(&mut h, &body)
 				.await
@@ -501,13 +514,24 @@ pub async fn status(h: &mut Pg) -> Result<Value, OpError> {
 		.and_then(|r| r.first().cloned().flatten())
 		.and_then(|t| serde_json::from_str(&t).ok())
 		.unwrap_or(json!([]));
+	// Each node with its labels, which say how the other nodes reach it (`spec::reach`), so whoever
+	// runs the nodes can tell whether a node's addressing is what it should be.
+	let labels = crate::ops::transfer::node_labels(h).await?;
+	let mut nodes = node_json(&c);
+	for n in nodes.iter_mut() {
+		let id = n["id"].as_i64().unwrap_or_default() as i32;
+		n["labels"] = labels
+			.get(&crate::catalog::NodeId(id))
+			.cloned()
+			.unwrap_or_else(|| json!({}));
+	}
 	Ok(json!({
 		"catalog": true,
 		"epoch": c.epoch,
 		"settings": Settings::from_json(&settings, &Value::Null).to_json(),
 		"advice_settings": AdviceSettings::from_json(&settings).to_json(),
 		"router_settings": router_settings_json(&settings),
-		"nodes": node_json(&c),
+		"nodes": nodes,
 		"keyspaces": keyspaces,
 		"tables": tables,
 		"routers": routers,
@@ -705,6 +729,7 @@ mod tests {
 				key_type: crate::hash::KeyType::Int8,
 				seed: u64::MAX / 3,
 				ranges: crate::catalog::Keyspace::even_ranges(3, &[crate::catalog::NodeId(1)]),
+				second: None,
 			},
 		];
 		for ch in changes {

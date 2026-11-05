@@ -24,11 +24,14 @@ pub mod advisor;
 pub mod attach;
 pub mod auto;
 pub mod autopilot;
+pub mod check;
+pub mod chunkmove;
 pub mod engine;
 pub mod failover;
 pub mod pg;
 pub mod physical;
 pub mod plan;
+pub mod readdress;
 pub mod restore_point;
 pub mod schema;
 pub mod spec;
@@ -40,7 +43,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::catalog::{
-	self, Catalog, Keyspace, NodeId, NodeState, Range, RelationKind, RelationName, Strategy,
+	self, Catalog, Chunk, Keyspace, NodeId, NodeState, Range, RelationKind, RelationName, Strategy,
 	quote_ident, quote_literal,
 };
 use crate::hash::KeyType;
@@ -145,6 +148,8 @@ pub enum Change {
 		key_type: KeyType,
 		seed: u64,
 		ranges: Vec<Range>,
+		/// A second key's type.
+		second: Option<KeyType>,
 	},
 	NodeState {
 		node: NodeId,
@@ -158,6 +163,22 @@ pub enum Change {
 	/// A keyspace no relation uses, with its ranges and pins (`keyspace.drop`, `dissolve`).
 	DropKeyspace {
 		name: String,
+	},
+	/// A keyspace's chunks: set when its first table is chunked, replaced when
+	/// a chunk splits in place. Every range must stay a set of whole chunks (validated on write).
+	Chunks {
+		keyspace: String,
+		chunks: Vec<Chunk>,
+	},
+	/// Whether a sharded relation is stored as a shell and chunk tables.
+	Chunked {
+		name: RelationName,
+		chunked: bool,
+	},
+	/// A relation's second key column, in a keyspace with a second key (Phase 5).
+	SecondKey {
+		name: RelationName,
+		column: Option<String>,
 	},
 	/// Several changes applied together (one cutover moving several ranges).
 	Many(Vec<Change>),
@@ -279,6 +300,10 @@ impl Change {
 				ks.ranges.remove(ib);
 			}
 			Change::Relation { name, kind } => {
+				if !matches!(kind, RelationKind::Sharded { .. }) {
+					c.chunked.remove(name);
+					c.second_keys.remove(name);
+				}
 				c.relations.insert(name.clone(), kind.clone());
 			}
 			Change::Keyspace {
@@ -286,12 +311,13 @@ impl Change {
 				key_type,
 				seed,
 				ranges,
+				second,
 			} => match c.keyspaces.get(name) {
-				Some(k) if k.key_type == *key_type && k.seed == *seed => {}
+				Some(k) if k.key_type == *key_type && k.seed == *seed && k.second == *second => {}
 				Some(_) => {
 					return Err(OpError::refused(
 						Kind::KeyspaceExists,
-						format!("keyspace {name} exists with another key type or seed"),
+						format!("keyspace {name} exists with another key type, seed or second key"),
 					));
 				}
 				None => {
@@ -304,6 +330,8 @@ impl Change {
 							seed: *seed,
 							ranges: ranges.clone(),
 							pins: Default::default(),
+							chunks: Vec::new(),
+							second: *second,
 						},
 					);
 				}
@@ -318,6 +346,8 @@ impl Change {
 			}
 			Change::DropRelation { name } => {
 				c.relations.remove(name);
+				c.chunked.remove(name);
+				c.second_keys.remove(name);
 			}
 			Change::DropKeyspace { name } => {
 				let mut users: Vec<String> = c
@@ -341,6 +371,27 @@ impl Change {
 				}
 				c.keyspaces.remove(name);
 			}
+			Change::Chunks { keyspace, chunks } => {
+				let ks = ks_mut(c, keyspace)?;
+				let mut sorted = chunks.clone();
+				sorted.sort_by_key(|x| x.lo);
+				ks.chunks = sorted;
+			}
+			Change::Chunked { name, chunked } => {
+				if *chunked {
+					c.chunked.insert(name.clone());
+				} else {
+					c.chunked.remove(name);
+				}
+			}
+			Change::SecondKey { name, column } => match column {
+				Some(col) => {
+					c.second_keys.insert(name.clone(), col.clone());
+				}
+				None => {
+					c.second_keys.remove(name);
+				}
+			},
 			Change::Many(all) => {
 				for ch in all {
 					ch.apply(c)?;
@@ -386,8 +437,10 @@ impl Change {
 				key_type,
 				seed,
 				ranges,
+				second,
 			} => json!({"keyspace": {
 				"name": name, "key_type": key_type.sql_name(), "seed": seed.to_string(),
+				"second_key_type": second.map(|t| t.sql_name()),
 				"ranges": ranges.iter().map(|r| json!([r.lo.to_string(), r.hi.to_string(), r.node.0])).collect::<Vec<_>>(),
 			}}),
 			Change::NodeState { node, state } => {
@@ -395,6 +448,16 @@ impl Change {
 			}
 			Change::DropRelation { name } => json!({"drop_relation": {"table": name.to_string()}}),
 			Change::DropKeyspace { name } => json!({"drop_keyspace": {"name": name}}),
+			Change::Chunks { keyspace, chunks } => json!({"chunks": {
+				"keyspace": keyspace,
+				"chunks": chunks.iter().map(|c| json!([c.number, c.lo.to_string(), c.hi.to_string()])).collect::<Vec<_>>(),
+			}}),
+			Change::Chunked { name, chunked } => {
+				json!({"chunked": {"table": name.to_string(), "chunked": chunked}})
+			}
+			Change::SecondKey { name, column } => {
+				json!({"second_key": {"table": name.to_string(), "column": column}})
+			}
 			Change::Many(all) => {
 				json!({"many": all.iter().map(Change::to_json).collect::<Vec<_>>()})
 			}
@@ -465,6 +528,13 @@ impl Change {
 							.collect()
 					})
 					.unwrap_or_default(),
+				second: match a.get("second_key_type").and_then(Value::as_str) {
+					Some(t) => Some(
+						KeyType::from_sql_name(t)
+							.ok_or_else(|| OpError::new("unknown second key type"))?,
+					),
+					None => None,
+				},
 			},
 			"node_state" => Change::NodeState {
 				node: NodeId(i(a, "node")? as i32),
@@ -475,6 +545,32 @@ impl Change {
 			},
 			"drop_keyspace" => Change::DropKeyspace {
 				name: s(a, "name")?,
+			},
+			"chunks" => Change::Chunks {
+				keyspace: s(a, "keyspace")?,
+				chunks: a
+					.get("chunks")
+					.and_then(Value::as_array)
+					.map(|cs| {
+						cs.iter()
+							.filter_map(|c| {
+								Some(Chunk {
+									number: u32::try_from(c.get(0)?.as_u64()?).ok()?,
+									lo: i64_of(c.get(1)?)?,
+									hi: i64_of(c.get(2)?)?,
+								})
+							})
+							.collect()
+					})
+					.unwrap_or_default(),
+			},
+			"chunked" => Change::Chunked {
+				name: relation_name(&s(a, "table")?)?,
+				chunked: a.get("chunked").and_then(Value::as_bool).unwrap_or(false),
+			},
+			"second_key" => Change::SecondKey {
+				name: relation_name(&s(a, "table")?)?,
+				column: a.get("column").and_then(Value::as_str).map(str::to_string),
 			},
 			"many" => Change::Many(
 				a.as_array()
@@ -593,8 +689,11 @@ pub async fn load_catalog(h: &mut Pg) -> Result<Catalog, OpError> {
 		let ranges = h.simple(catalog::LOAD_RANGES).await?;
 		let pins = h.simple(catalog::LOAD_PINS).await?;
 		let relations = h.simple(catalog::LOAD_RELATIONS).await?;
-		Catalog::from_rows(epoch, &nodes, &keyspaces, &ranges, &pins, &relations)
-			.map_err(|e| OpError::new(format!("the catalog is not usable: {e}")))
+		let chunks = h.simple(catalog::LOAD_CHUNKS).await?;
+		Catalog::from_rows(
+			epoch, &nodes, &keyspaces, &ranges, &pins, &relations, &chunks,
+		)
+		.map_err(|e| OpError::new(format!("the catalog is not usable: {e}")))
 	}
 	.await;
 	let _ = h.simple("rollback").await;
@@ -657,7 +756,7 @@ pub async fn write_catalog(
 	for name in dropped {
 		let n = quote_literal(name);
 		sql.push_str(&format!(
-			"delete from lepis.pin where keyspace = {n};\ndelete from lepis.range where keyspace = {n};\ndelete from lepis.keyspace where name = {n};\n"
+			"delete from lepis.pin where keyspace = {n};\ndelete from lepis.range where keyspace = {n};\ndelete from lepis.chunk where keyspace = {n};\ndelete from lepis.keyspace where name = {n};\n"
 		));
 	}
 	let mut names: Vec<&String> = after.keyspaces.keys().collect();
@@ -668,9 +767,11 @@ pub async fn write_catalog(
 		let n = quote_literal(name);
 		if old.is_none() {
 			sql.push_str(&format!(
-				"insert into lepis.keyspace (name, strategy, key_type, seed) values ({n}, 'hash', {}, {});\n",
+				"insert into lepis.keyspace (name, strategy, key_type, seed, second_key_type) values ({n}, 'hash', {}, {}, {});\n",
 				quote_literal(k.key_type.sql_name()),
-				k.seed as i64
+				k.seed as i64,
+				k.second
+					.map_or("null".to_string(), |t| quote_literal(t.sql_name()))
 			));
 		}
 		if old.map(|o| &o.ranges) != Some(&k.ranges) {
@@ -679,6 +780,15 @@ pub async fn write_catalog(
 				sql.push_str(&format!(
 					"insert into lepis.range (keyspace, lo, hi, node_id) values ({n}, {}, {}, {});\n",
 					r.lo, r.hi, r.node.0
+				));
+			}
+		}
+		if old.map(|o| &o.chunks) != Some(&k.chunks) {
+			sql.push_str(&format!("delete from lepis.chunk where keyspace = {n};\n"));
+			for ch in &k.chunks {
+				sql.push_str(&format!(
+					"insert into lepis.chunk (keyspace, number, lo, hi) values ({n}, {}, {}, {});\n",
+					ch.number, ch.lo, ch.hi
 				));
 			}
 		}
@@ -696,17 +806,36 @@ pub async fn write_catalog(
 		}
 	}
 	for (name, kind) in &after.relations {
+		let chunked = after.chunked.contains(name);
+		let second = after.second_keys.get(name);
+		if before.relations.get(name) == Some(kind) && before.chunked.contains(name) != chunked {
+			sql.push_str(&format!(
+				"update lepis.relation set chunked = {chunked} where schema_name = {} and table_name = {};\n",
+				quote_literal(&name.schema),
+				quote_literal(&name.table)
+			));
+		}
+		let opt = |v: Option<String>| v.map_or("null".to_string(), |v| quote_literal(&v));
+		if before.relations.get(name) == Some(kind) && before.second_keys.get(name) != second {
+			sql.push_str(&format!(
+				"update lepis.relation set second_column = {} where schema_name = {} and table_name = {};\n",
+				opt(second.cloned()),
+				quote_literal(&name.schema),
+				quote_literal(&name.table)
+			));
+		}
 		if before.relations.get(name) != Some(kind) {
 			let (k, ks, col) = kind_parts(kind);
-			let opt = |v: Option<String>| v.map_or("null".to_string(), |v| quote_literal(&v));
 			sql.push_str(&format!(
-				"insert into lepis.relation (schema_name, table_name, kind, keyspace, key_column) \
-				values ({}, {}, '{k}', {}, {}) on conflict (schema_name, table_name) do update \
-				set kind = excluded.kind, keyspace = excluded.keyspace, key_column = excluded.key_column;\n",
+				"insert into lepis.relation (schema_name, table_name, kind, keyspace, key_column, chunked, second_column) \
+				values ({}, {}, '{k}', {}, {}, {chunked}, {}) on conflict (schema_name, table_name) do update \
+				set kind = excluded.kind, keyspace = excluded.keyspace, key_column = excluded.key_column, \
+				chunked = excluded.chunked, second_column = excluded.second_column;\n",
 				quote_literal(&name.schema),
 				quote_literal(&name.table),
 				opt(ks),
-				opt(col)
+				opt(col),
+				opt(second.cloned())
 			));
 		}
 	}
@@ -739,7 +868,11 @@ pub async fn change_catalog(h: &mut Pg, change: &Change, extra: &str) -> Result<
 
 /// Whether two catalogs say the same thing (the epoch aside).
 pub fn same(a: &Catalog, b: &Catalog) -> bool {
-	a.nodes == b.nodes && a.keyspaces == b.keyspaces && a.relations == b.relations
+	a.nodes == b.nodes
+		&& a.keyspaces == b.keyspaces
+		&& a.relations == b.relations
+		&& a.chunked == b.chunked
+		&& a.second_keys == b.second_keys
 }
 
 /// A random hex token.
@@ -786,6 +919,8 @@ mod tests {
 				seed: 1,
 				ranges: Keyspace::even_ranges(ranges, &ids),
 				pins: Default::default(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c

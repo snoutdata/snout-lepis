@@ -39,6 +39,7 @@ use tokio::io::AsyncWriteExt;
 use crate::analyze;
 use crate::backend::{self, Backend, BackendError, BoxStream};
 use crate::catalog::{Catalog, Node, NodeId};
+use crate::chunk;
 use crate::config::NodeAddress;
 use crate::ddl::{self, DdlPlan};
 use crate::frame::FrameReader;
@@ -51,6 +52,17 @@ use crate::scram::{ClientCredential, ClientSecret};
 use crate::server::App;
 use crate::twopc;
 use crate::wire::{self, Body, ErrorFields, Message, WireError};
+
+mod join_exec;
+
+/// `"schema"."table"`.
+fn qualified_name(r: &crate::catalog::RelationName) -> String {
+	format!(
+		"{}.{}",
+		crate::catalog::quote_ident(&r.schema),
+		crate::catalog::quote_ident(&r.table)
+	)
+}
 
 /// SQLSTATE `cannot_connect_now`: the router's catalog is too old to route by (`plan_once`).
 const CATALOG_STALE: &str = "57P03";
@@ -106,6 +118,8 @@ struct InFlight {
 	/// A read sent to a replica: its answers are held back until its ReadyForQuery, so one the
 	/// replica refuses as a write (25006) is run again on the primary unseen (replica.rs).
 	retry: Option<Retry>,
+	/// When it was sent, for the node's timings (timing.rs).
+	sent: std::time::Instant,
 }
 
 /// A replica read's way back to its node.
@@ -204,6 +218,15 @@ pub struct Router {
 	/// The session sent something that may write: its reads stay on the primaries from now on,
 	/// so it reads what it wrote (replica.rs).
 	wrote: bool,
+	/// The planned batch's messages that name chunk tables, with their new text (`plan_once`):
+	/// a Query's whole string, a Bind's statement. Taken by the next `forward`.
+	rewrites_due: Vec<(usize, String)>,
+	/// The batch being forwarded's Bind rewrites, by message index.
+	bind_rewrites: HashMap<usize, String>,
+	/// A prepared statement → the per-chunk statements made from it on the nodes (`forward`).
+	derived: HashMap<String, Vec<String>>,
+	/// A join (join.rs) is running its rewritten read: what it plans is not joined again.
+	in_join: bool,
 }
 
 impl Router {
@@ -287,6 +310,10 @@ impl Router {
 			parked_until: None,
 			claim: None,
 			wrote: false,
+			rewrites_due: Vec::new(),
+			bind_rewrites: HashMap::new(),
+			derived: HashMap::new(),
+			in_join: false,
 			settings_read: std::time::Instant::now()
 				.checked_sub(settings::FRESH * 2)
 				.unwrap_or_else(std::time::Instant::now),
@@ -475,6 +502,7 @@ impl Router {
 
 	async fn on_node(&mut self, n: NodeId, m: Message) -> Result<(), WireError> {
 		let m = fence_refusal_as_retry(m);
+		let m = self.shell_refusal_as_retry(m);
 		// The COMMIT that follows this notice would tell the client yes for a commit its standby
 		// may not have: the session ends before it is read (L21).
 		if wire::unconfirmed_commit(&m) {
@@ -511,6 +539,9 @@ impl Router {
 			b'G' => self.copy_in = Some(n),
 			b'Z' => {
 				let done = self.inflight.pop_front().expect("front exists");
+				if done.owner == Owner::Client {
+					crate::timing::record(done.node, done.sent.elapsed());
+				}
 				let status = m.body.first().copied().unwrap_or(b'I');
 				self.after_ready(done.node, status, done.rolls_back);
 				self.copy_in = None;
@@ -677,12 +708,27 @@ impl Router {
 					return Err(e);
 				}
 			};
+			let mut batch = batch;
+			let due = std::mem::take(&mut self.rewrites_due);
+			self.bind_rewrites.clear();
+			if matches!(plan, Plan::Node { .. }) {
+				for (i, text) in due {
+					match batch.get(i).map(|m| m.tag) {
+						Some(b'Q') => batch[i] = wire::query(&text),
+						Some(b'B') => {
+							self.bind_rewrites.insert(i, text);
+						}
+						_ => {}
+					}
+				}
+			}
 			let (plan, retry_on) = self.on_replica(plan, &batch).await;
 			let target = match &plan {
 				Plan::Node { node, .. } => Some(*node),
 				Plan::Local { .. }
 				| Plan::Refuse(_)
 				| Plan::Gather { .. }
+				| Plan::Join { .. }
 				| Plan::EndTx { .. }
 				| Plan::Fanout(_)
 				| Plan::Job(_)
@@ -893,7 +939,7 @@ impl Router {
 		stmts: &[Statement],
 		params: &[ParamValue],
 	) -> Option<route::Refusal> {
-		for s in stmts {
+		for (si, s) in stmts.iter().enumerate() {
 			if self.settings.transaction_pool
 				&& let Some(what) = s.session_bound
 			{
@@ -929,6 +975,28 @@ impl Router {
 			if matches!(s.facts.kind, route::Kind::Ddl | route::Kind::Other) {
 				let names: Vec<crate::catalog::RelationName> =
 					s.facts.tables.iter().map(|t| t.name.clone()).collect();
+				// A chunked table's schema change runs on its shell and is then copied onto its
+				// chunk tables, on every node, also with one node.
+				if let Some(chunked) = self.chunked_ddl(&names) {
+					match ddl::plan_uncollapsed(&s.sql, &names, &self.catalog, &self.index_owners) {
+						DdlPlan::Transactional(ddl::Target::Everywhere) => {
+							acc.data = true;
+							acc.fanouts.push(self.chunked_ddl_fanout(&s.sql, &chunked));
+							continue;
+						}
+						DdlPlan::PerNode(ddl::Target::Everywhere) => {
+							acc.data = true;
+							acc.jobs.push(s.sql.clone());
+							continue;
+						}
+						DdlPlan::NeedIndexOwners(names) => {
+							acc.index_owners.extend(names);
+							continue;
+						}
+						DdlPlan::Refuse(r) => return Some(r),
+						_ => {}
+					}
+				}
 				match ddl::plan(&s.sql, &names, &self.catalog, &self.index_owners) {
 					DdlPlan::NotDdl
 					| DdlPlan::Transactional(ddl::Target::Home)
@@ -944,6 +1012,8 @@ impl Router {
 							per_node: None,
 							rows: None,
 							ddl: true,
+							simple: false,
+							tag_at: 0,
 						});
 						continue;
 					}
@@ -997,6 +1067,19 @@ impl Router {
 							acc.off_home.push(s.sql.clone());
 						}
 					}
+					match self.chunk_step(s, params, None, n) {
+						ChunkStep::Plain => {}
+						ChunkStep::Rewrite(sql) => acc.rewrites.push((acc.msg, si, sql)),
+						ChunkStep::Split(f) => {
+							acc.fanouts.push(f);
+							continue;
+						}
+						ChunkStep::Copy(nodes) => {
+							acc.copies.push((nodes, s.sql.clone()));
+							continue;
+						}
+						ChunkStep::Refuse(r) => return Some(r),
+					}
 					acc.targets.push(n);
 				}
 				Route::Home => acc.targets.push(self.home()),
@@ -1020,9 +1103,23 @@ impl Router {
 						per_node: None,
 						rows: None,
 						ddl: false,
+						simple: false,
+						tag_at: 0,
 					});
 				}
 				Route::SplitInsert(groups) => {
+					let first = groups
+						.first()
+						.map(|(n, _)| *n)
+						.unwrap_or_else(|| self.home());
+					match self.chunk_step(s, params, Some(&groups), first) {
+						ChunkStep::Split(f) => {
+							acc.fanouts.push(f);
+							continue;
+						}
+						ChunkStep::Refuse(r) => return Some(r),
+						_ => {}
+					}
 					// Each node its own rows, in one two-phase commit.
 					let rows: Vec<Vec<usize>> = groups.iter().map(|(_, r)| r.clone()).collect();
 					let per_node = match scatter::split_insert(&s.sql, &rows) {
@@ -1038,11 +1135,206 @@ impl Router {
 						per_node: Some(per_node),
 						rows: Some(rows),
 						ddl: false,
+						simple: false,
+						tag_at: 0,
 					});
 				}
 			}
 		}
 		None
+	}
+
+	/// The chunked tables a schema change names, directly or through an index Lepis knows the
+	/// table of; Some(empty) when it names something the catalog does not know (an index whose
+	/// table is to be looked up), None when chunked storage has nothing to do with it.
+	fn chunked_ddl(
+		&self,
+		names: &[crate::catalog::RelationName],
+	) -> Option<Vec<crate::catalog::RelationName>> {
+		if self.catalog.chunked.is_empty() {
+			return None;
+		}
+		let mut out = Vec::new();
+		let mut unknown = false;
+		for n in names {
+			let t = self.index_owners.get(n).unwrap_or(n);
+			if self.catalog.chunked.contains(t) {
+				if !out.contains(t) {
+					out.push(t.clone());
+				}
+			} else if !self.catalog.relations.contains_key(t) {
+				unknown = true;
+			}
+		}
+		(unknown || !out.is_empty()).then_some(out)
+	}
+
+	/// A chunked table's schema change on every node: the statement on the shell, then each
+	/// table's chunks made to match it (`chunk::sync_sql`); a DROP TABLE drops the chunk tables
+	/// first, in its transaction.
+	fn chunked_ddl_fanout(&self, sql: &str, chunked: &[crate::catalog::RelationName]) -> Fanout {
+		let nodes = ddl::nodes(ddl::Target::Everywhere, &self.catalog);
+		let drop = pg_query::parse(sql).ok().and_then(|p| {
+			let n = p.protobuf.stmts.first()?.stmt.as_deref()?.node.clone()?;
+			match n {
+				pg_query::NodeEnum::DropStmt(d)
+					if d.remove_type == pg_query::protobuf::ObjectType::ObjectTable as i32 =>
+				{
+					Some(d.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32)
+				}
+				_ => None,
+			}
+		});
+		let (text, tag_at) = match drop {
+			Some(cascade) => (
+				format!("{};\n{sql}", chunk::drop_chunks_sql(chunked, cascade)),
+				1,
+			),
+			None => {
+				let mut t = sql.trim_end().trim_end_matches(';').to_string();
+				for c in chunked {
+					t.push_str(";\n");
+					t.push_str(&chunk::sync_sql(c));
+				}
+				(t, 0)
+			}
+		};
+		Fanout {
+			per_node: Some(vec![text; nodes.len()]),
+			nodes,
+			sql: sql.to_string(),
+			same_count: false,
+			insert: false,
+			written: Vec::new(),
+			rows: None,
+			ddl: true,
+			simple: true,
+			tag_at,
+		}
+	}
+
+	/// What chunked storage asks of one statement `route` sent to `node`, or split by row into
+	/// `groups`.
+	fn chunk_step(
+		&self,
+		s: &Statement,
+		params: &[ParamValue],
+		groups: Option<&[(NodeId, Vec<usize>)]>,
+		node: NodeId,
+	) -> ChunkStep {
+		let catalog = &self.catalog;
+		if catalog.chunked.is_empty()
+			|| !s
+				.facts
+				.tables
+				.iter()
+				.any(|t| catalog.chunked.contains(&t.name))
+		{
+			return ChunkStep::Plain;
+		}
+		let path = self.search_path.clone();
+		let resolve = move |sch: &str, t: &str| analyze::resolve_name(catalog, &path, sch, t);
+		let is_chunked = |r: &crate::catalog::RelationName| catalog.chunked.contains(r);
+		if let Some(m) = chunk::only_refusal(&s.sql, &is_chunked, &resolve) {
+			return ChunkStep::Refuse(route::Refusal {
+				code: route::NOT_ACROSS_NODES,
+				message: m,
+				hint: "Leave out ONLY.".into(),
+			});
+		}
+		match s.facts.kind {
+			route::Kind::CopyFrom => return ChunkStep::Copy(vec![node]),
+			route::Kind::CopyTo => {
+				return chunk::copy_to_sql(&s.sql, &is_chunked, &resolve)
+					.map_or(ChunkStep::Plain, ChunkStep::Rewrite);
+			}
+			_ => {}
+		}
+		let ch = match route::chunking(&s.facts, catalog, params) {
+			Ok(c) => c,
+			Err(Route::Refuse(r)) => return ChunkStep::Refuse(r),
+			Err(_) => return ChunkStep::Plain,
+		};
+		if let Some(t) = &ch.insert_unknown {
+			return ChunkStep::Refuse(route::Refusal {
+				code: route::NOT_ACROSS_NODES,
+				message: format!(
+					"{t} is stored in chunks, and Lepis can tell a row's chunk only from an INSERT … VALUES"
+				),
+				hint: "Insert the rows with INSERT … VALUES (or COPY), or read them first and insert the values.".into(),
+			});
+		}
+		let target = s
+			.facts
+			.tables
+			.iter()
+			.find(|t| t.written && catalog.chunked.contains(&t.name))
+			.map(|t| t.name.clone());
+		if let (Some(rows), Some(target)) = (&ch.insert_rows, &target)
+			&& (groups.is_some() || !ch.map.contains_key(target))
+		{
+			// Each (node, chunk) its own rows, in one two-phase commit.
+			let all: Vec<(NodeId, Vec<usize>)> = match groups {
+				Some(g) => g.to_vec(),
+				None => vec![(node, (0..rows.len()).collect())],
+			};
+			let mut parts: Vec<(NodeId, u32, Vec<usize>)> = Vec::new();
+			for (n, idx) in all {
+				for i in idx {
+					let c = rows[i];
+					match parts.iter_mut().find(|(pn, pc, _)| *pn == n && *pc == c) {
+						Some((_, _, v)) => v.push(i),
+						None => parts.push((n, c, vec![i])),
+					}
+				}
+			}
+			let lists: Vec<Vec<usize>> = parts.iter().map(|(_, _, r)| r.clone()).collect();
+			let pieces = match scatter::split_insert(&s.sql, &lists) {
+				Ok(p) => p,
+				Err(r) => return ChunkStep::Refuse(r),
+			};
+			let mut per = Vec::with_capacity(pieces.len());
+			for (piece, (_, c, _)) in pieces.iter().zip(&parts) {
+				let mut map = ch.map.clone();
+				map.insert(target.clone(), *c);
+				match chunk::rewrite(piece, &map, &resolve) {
+					Ok(sql) => per.push(sql),
+					Err(e) => {
+						return ChunkStep::Refuse(route::Refusal {
+							code: route::NOT_ACROSS_NODES,
+							message: e,
+							hint: "Insert the rows of each distribution key value in a statement of their own.".into(),
+						});
+					}
+				}
+			}
+			return ChunkStep::Split(Fanout {
+				nodes: parts.iter().map(|(n, _, _)| *n).collect(),
+				sql: s.sql.clone(),
+				same_count: false,
+				insert: true,
+				written: Vec::new(),
+				per_node: Some(per),
+				rows: Some(lists),
+				ddl: false,
+				simple: false,
+				tag_at: 0,
+			});
+		}
+		if ch.map.is_empty() {
+			return ChunkStep::Plain;
+		}
+		match chunk::rewrite(&s.sql, &ch.map, &resolve) {
+			Ok(sql) => ChunkStep::Rewrite(sql),
+			// The shell answers a read, UPDATE or DELETE correctly; an INSERT it would refuse.
+			Err(e) if s.facts.kind == route::Kind::Insert => ChunkStep::Refuse(route::Refusal {
+				code: route::NOT_ACROSS_NODES,
+				message: e,
+				hint: "Write the INSERT more plainly (a VALUES list, no nested WITH writes)."
+					.into(),
+			}),
+			Err(_) => ChunkStep::Plain,
+		}
 	}
 
 	/// Takes the router's newest catalog: between transactions at once, inside one noting that
@@ -1094,6 +1386,14 @@ impl Router {
 				p = self.plan_once(batch).await?;
 			}
 		}
+		if let Plan::Refuse(r) = &p
+			&& let Some(sql) = self.joinable(batch, r)
+		{
+			p = Plan::Join {
+				sql,
+				why: r.clone(),
+			};
+		}
 		if self.inflight.is_empty() || !self.depends_on_tx(&p, batch) {
 			return Ok(p);
 		}
@@ -1135,7 +1435,10 @@ impl Router {
 		let mut parsed_here: HashMap<String, (String, Vec<u8>)> = HashMap::new();
 		let mut bound_here: Vec<String> = Vec::new();
 
-		for m in batch {
+		// Messages whose statements name chunk tables: (message, its new text).
+		let mut due: Vec<(usize, String)> = Vec::new();
+		for (mi, m) in batch.iter().enumerate() {
+			acc.msg = mi;
 			let analysed: Option<(Arc<Analysed>, Vec<ParamValue>)> = match m.tag {
 				b'Q' => {
 					let sql = cstr(&m.body);
@@ -1205,6 +1508,19 @@ impl Router {
 					if let Some(r) = self.consider(&mut acc, stmts, &params) {
 						return Ok(Plan::Refuse(r));
 					}
+					if acc.rewrites.iter().any(|r| r.0 == mi) {
+						let text: Vec<&str> = stmts
+							.iter()
+							.enumerate()
+							.map(|(si, st)| {
+								acc.rewrites
+									.iter()
+									.find(|r| r.0 == mi && r.1 == si)
+									.map_or(st.sql.as_str(), |r| r.2.as_str())
+							})
+							.collect();
+						due.push((mi, text.join(";\n")));
+					}
 				}
 				Err(AnalyzeError::Unsupported(msg)) => {
 					return Ok(Plan::Refuse(route::Refusal {
@@ -1272,7 +1588,10 @@ impl Router {
 			index_owners,
 			copies,
 			claim,
+			msg: _,
+			rewrites: _,
 		} = acc;
+		self.rewrites_due = due;
 		if let Some(c) = claim {
 			// Set on every node the transaction (or session) reaches later as well.
 			let replay = Self::claim_replay(&c);
@@ -1540,6 +1859,7 @@ impl Router {
 		match plan {
 			Plan::Refuse(r) => self.refuse(r, &batch).await,
 			Plan::Gather { nodes, sql, on } => self.gather(nodes, sql, on, batch).await,
+			Plan::Join { sql, why } => self.answer_join(sql, batch, why).await,
 			Plan::EndTx { commit } => self.end_tx(commit, &batch).await,
 			Plan::Fanout(f) => self.fanout(f, batch).await,
 			Plan::Job(sql) => self.job(sql, batch).await,
@@ -1696,10 +2016,35 @@ impl Router {
 			out.push(Body::new().byte(b'S').cstr(&name).message(b'C'));
 			swallow.push_back(true);
 		}
-		for m in batch {
+		let binds = std::mem::take(&mut self.bind_rewrites);
+		for (mi, m) in batch.into_iter().enumerate() {
 			match m.tag {
+				b'B' if binds.contains_key(&mi) => {
+					// A statement on a chunked table bound to one chunk: its per-chunk copy, parsed
+					// on this node once per generation, under a name of Lepis's own.
+					let (portal, stmt) = bind_names(&m.body)?;
+					let Some(p) = self.statements.get(&stmt) else {
+						out.push(m);
+						continue;
+					};
+					let sql = &binds[&mi];
+					let name = derived_name(p.generation, sql);
+					let conn = self.conns.get_mut(&node).expect("ensured");
+					if conn.prepared.get(&name) != Some(&p.generation) {
+						out.push(parse_message_named(&name, sql, &p.types));
+						swallow.push_back(true);
+						conn.prepared.insert(name.clone(), p.generation);
+						let list = self.derived.entry(stmt.clone()).or_default();
+						if !list.contains(&name) {
+							list.push(name.clone());
+						}
+					}
+					self.portals.insert(portal, node);
+					out.push(Message::new(b'B', rename_bind(&m.body, &name)));
+				}
 				b'P' => {
 					let (name, sql) = parse_parse(&m.body)?;
+					self.forget_derived(&name);
 					self.generation += 1;
 					self.statements.insert(
 						name.clone(),
@@ -1746,6 +2091,7 @@ impl Router {
 				b'C' => {
 					if m.body.first() == Some(&b'S') {
 						let name = cstr(&m.body[1..]);
+						self.forget_derived(&name);
 						self.statements.remove(&name);
 						for (id, c) in self.conns.iter_mut() {
 							if c.prepared.remove(&name).is_some() && *id != node {
@@ -1784,9 +2130,67 @@ impl Router {
 				},
 				rolls_back,
 				retry: None,
+				sent: std::time::Instant::now(),
 			});
 		}
 		Ok(())
+	}
+
+	/// An INSERT a shell refused (`lepis_shell_insert`) that this session sent under an older
+	/// catalog than the router has now: the table became chunked while it was on its way (the
+	/// cutover's in-flight case), so it is a 40001 the client retries, as a moved range's write is.
+	/// Under a current catalog it stays what it is: node-local SQL writing the shell.
+	fn shell_refusal_as_retry(&self, m: Message) -> Message {
+		if m.tag != b'E' {
+			return m;
+		}
+		let fields = wire::parse_error_fields(&m.body);
+		let get = |k: u8| {
+			fields
+				.iter()
+				.find(|(x, _)| *x == k)
+				.map(|(_, v)| v.as_str())
+		};
+		// The shell's refusal; a chunk table renamed away by a cutover (`42P01` naming `_cNNN`);
+		// a statement the cutover cancelled because it waited on the pause.
+		let shell = get(b'C') == Some("23514") && get(b'n') == Some(chunk::SHELL_CONSTRAINT);
+		let renamed = get(b'C') == Some("42P01")
+			&& get(b'M').is_some_and(|m| {
+				m.split('"').any(|w| {
+					w.rsplit_once("_c")
+						.is_some_and(|(_, d)| d.len() >= 3 && d.bytes().all(|b| b.is_ascii_digit()))
+				})
+			});
+		let cancelled = get(b'C') == Some("57014");
+		if !(shell || renamed || cancelled) {
+			return m;
+		}
+		let newer = self
+			.app
+			.catalog()
+			.is_some_and(|c| c.epoch > self.catalog.epoch);
+		if !newer {
+			return m;
+		}
+		ErrorFields::error(
+			"40001",
+			"the table's chunks moved while this transaction ran; retry the transaction",
+		)
+		.message()
+	}
+
+	/// Closes, on every node that holds them, the per-chunk statements made from `stmt`.
+	fn forget_derived(&mut self, stmt: &str) {
+		let Some(names) = self.derived.remove(stmt) else {
+			return;
+		};
+		for c in self.conns.values_mut() {
+			for n in &names {
+				if c.prepared.remove(n).is_some() {
+					c.closes_owed.push(n.clone());
+				}
+			}
+		}
 	}
 
 	/// Lepis's own statement on a node, its answers dropped. Waits for it.
@@ -2050,6 +2454,7 @@ impl Router {
 					swallow: VecDeque::new(),
 					rolls_back: false,
 					retry: None,
+					sent: std::time::Instant::now(),
 				});
 			}
 			return Ok(());
@@ -2451,6 +2856,9 @@ impl Router {
 					(p.worker_sql.clone(), formats, Some(p))
 				}
 				Err(r) => {
+					if !explain && !self.in_join && !self.in_tx() && crate::join::answerable(&r) {
+						return self.answer_join(sql, batch, r).await;
+					}
 					let e = refusal_message(r.code, &r.message, &r.hint);
 					self.answer(
 						&batch,
@@ -2701,6 +3109,57 @@ impl Router {
 					b'T' => a.fields = Field::parse_all(&m.body)?,
 					b'D' => a.rows.push(wire::parse_data_row(&m.body)?),
 					b'C' => a.tag = cstr(&m.body),
+					b'E' => {
+						if error.is_none() {
+							error = Some(m);
+						}
+					}
+					b'N' | b'A' | b'S' => put_message(&mut self.out, &m),
+					b'Z' => break,
+					_ => {}
+				}
+			}
+			answers.push(a);
+		}
+		self.unspread_cancel();
+		Ok(match error {
+			Some(e) => Err(e),
+			None => Ok(answers),
+		})
+	}
+
+	/// Each node's several statements as one simple query (a chunked table's DDL and its
+	/// chunks' sync); each answer's tag is its `tag_at`th statement's.
+	async fn run_simple(
+		&mut self,
+		nodes: &[NodeId],
+		sqls: &[String],
+		tag_at: usize,
+	) -> Result<Result<Vec<Answer>, Message>, WireError> {
+		self.spread_cancel(nodes);
+		for (n, sql) in nodes.iter().zip(sqls) {
+			self.send(*n, &[wire::query(sql)]).await?;
+			self.conns
+				.get_mut(n)
+				.expect("connected")
+				.prepared
+				.remove("");
+		}
+		let mut answers = Vec::with_capacity(nodes.len());
+		let mut error = None;
+		for n in nodes {
+			let conn = self.conns.get_mut(n).expect("connected");
+			let mut a = Answer::default();
+			let mut tags = 0usize;
+			loop {
+				let m = conn.reader.next().await?;
+				match m.tag {
+					b'C' => {
+						if tags == tag_at {
+							a.tag = cstr(&m.body);
+						}
+						tags += 1;
+					}
 					b'E' => {
 						if error.is_none() {
 							error = Some(m);
@@ -3282,6 +3741,40 @@ fn parameter_description(types: &[u32]) -> Message {
 	b.message(b't')
 }
 
+/// The name of a statement's per-chunk copy: Lepis's own prefix, the generation of the client's
+/// Parse and the copy's text, so a new Parse of the name never meets an old copy.
+fn derived_name(generation: u64, sql: &str) -> String {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	sql.hash(&mut h);
+	format!("lepis_chunk_{generation}_{:016x}", h.finish())
+}
+
+/// A Parse of `sql` as statement `name`.
+fn parse_message_named(name: &str, sql: &str, types: &[u32]) -> Message {
+	let mut b = Body::new()
+		.cstr(name)
+		.cstr(sql)
+		.bytes(&(types.len() as u16).to_be_bytes());
+	for t in types {
+		b = b.u32(*t);
+	}
+	b.message(b'P')
+}
+
+/// A Bind's body with its statement name replaced.
+fn rename_bind(body: &[u8], stmt: &str) -> Vec<u8> {
+	let portal_end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
+	let rest = &body[portal_end + 1..];
+	let stmt_end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+	let mut out = Vec::with_capacity(body.len() + stmt.len());
+	out.extend_from_slice(&body[..=portal_end]);
+	out.extend_from_slice(stmt.as_bytes());
+	out.push(0);
+	out.extend_from_slice(&rest[(stmt_end + 1).min(rest.len())..]);
+	out
+}
+
 fn parse_message(sql: &str, types: &[u32]) -> Message {
 	let mut b = Body::new()
 		.cstr("")
@@ -3810,9 +4303,12 @@ impl Router {
 			.per_node
 			.clone()
 			.unwrap_or_else(|| vec![f.sql.clone(); f.nodes.len()]);
-		let answers = self
-			.run_each(&f.nodes, &sqls, &d.params, bind.as_ref(), &result_formats)
-			.await?;
+		let answers = if f.simple {
+			self.run_simple(&f.nodes, &sqls, f.tag_at).await?
+		} else {
+			self.run_each(&f.nodes, &sqls, &d.params, bind.as_ref(), &result_formats)
+				.await?
+		};
 		let fail = |this: &mut Self, error: Message| Outcome::Failed {
 			at_parse: false,
 			error: {
@@ -4164,6 +4660,15 @@ impl Router {
 				return Ok(());
 			}
 		};
+		// The chunked tables it changes (synced after it, below).
+		let names: Vec<crate::catalog::RelationName> = match &*self.analyze(&sql) {
+			Ok(stmts) => stmts
+				.iter()
+				.flat_map(|s| s.facts.tables.iter().map(|t| t.name.clone()))
+				.collect(),
+			Err(_) => Vec::new(),
+		};
+		let chunked = self.chunked_ddl(&names).unwrap_or_default();
 		self.spread_cancel(&nodes);
 		let mut parts: Vec<Recording> = self
 			.conns
@@ -4178,6 +4683,23 @@ impl Router {
 			.collect();
 		let states = ddl::run_job(&mut log, job, &sql, &mut parts).await;
 		spread::clear(self.cancel_pid);
+		// A chunked table's: its chunk tables made to match the shell, node by node.
+		if !chunked.is_empty() && parts.iter().all(|p| p.tag.is_some()) {
+			let sync: Vec<String> = chunked.iter().map(chunk::sync_sql).collect();
+			for p in parts.iter_mut() {
+				let mut part = p.part.lock().await;
+				for q in &sync {
+					if let Err(e) = part.execute_sql(q).await {
+						p.tag = None;
+						p.error = match e {
+							BackendError::Refused(m) => Some(m),
+							_ => None,
+						};
+						break;
+					}
+				}
+			}
+		}
 		let tag = parts.iter().find_map(|p| p.tag.clone());
 		let failed: Vec<(NodeId, Option<Message>)> = parts
 			.iter()
@@ -4982,6 +5504,8 @@ pub struct Settings {
 	pub route_claim_keyspace: Option<String>,
 	/// `read_replicas`: each node's read replica, by node name (replica.rs).
 	pub read_replicas: std::collections::BTreeMap<String, replica::Replica>,
+	/// The cluster's `join_*` caps (join.rs), as they were set.
+	pub join: serde_json::Value,
 }
 
 impl Settings {
@@ -4998,6 +5522,16 @@ impl Settings {
 			route_claim: s("route_claim"),
 			route_claim_keyspace: s("route_claim_keyspace"),
 			read_replicas: replica::from_settings(v.get("read_replicas")),
+			join: serde_json::Value::Object(
+				v.as_object()
+					.map(|o| {
+						o.iter()
+							.filter(|(k, _)| k.starts_with("join_"))
+							.map(|(k, v)| (k.clone(), v.clone()))
+							.collect()
+					})
+					.unwrap_or_default(),
+			),
 		}
 	}
 }
@@ -5328,6 +5862,8 @@ impl Router {
 
 /// Bytes of rows buffered for one node before they are sent.
 const COPY_CHUNK: usize = 64 * 1024;
+/// How much of one chunk's rows a COPY into a chunked table holds before sending them.
+const CHUNK_COPY_BUFFER: usize = 1 << 20;
 
 /// A COPY the router is splitting.
 struct CopySplit {
@@ -5342,6 +5878,24 @@ struct CopySplit {
 	implicit: bool,
 	/// The first problem with the data; the COPY fails at its end.
 	error: Option<Message>,
+	/// A chunked table's COPY: its rows by (node, chunk), each COPYed into its chunk table.
+	chunked: Option<ChunkedCopy>,
+}
+
+/// A COPY into a chunked table: a node can run one COPY at a time and holds
+/// many chunks, so rows wait by (node, chunk) and go as a COPY into that chunk table, in the
+/// node's transaction, whenever a buffer fills and at the end. No staging table: a temporary one
+/// would stop the two-phase commit (PREPARE refuses a transaction that used one).
+struct ChunkedCopy {
+	keyspace: crate::catalog::Keyspace,
+	table: crate::catalog::RelationName,
+	/// The client's COPY, renamed onto each chunk table as it is sent.
+	sql: String,
+	/// CopyData each chunk's COPY starts with (a header line, binary's header) and ends with.
+	header: Vec<u8>,
+	trailer: Vec<u8>,
+	buffers: HashMap<(NodeId, u32), Vec<u8>>,
+	rows: u64,
 }
 
 impl Router {
@@ -5427,6 +5981,24 @@ impl Router {
 			Some(v) => v.clone(),
 			None => all.iter().map(|(n, _)| n.clone()).collect(),
 		};
+		// A second key (Phase 5): its column too, and only into chunk tables.
+		let second_col = match self.catalog.second_keys.get(&table) {
+			Some(s) => match named.iter().position(|n| n == s) {
+				Some(i) => Some(i),
+				None => {
+					fail(
+						self,
+						route::NOT_ACROSS_NODES,
+						&format!(
+							"a COPY into {table} across nodes must include its second key column {s}"
+						),
+						"Add both distribution keys to the COPY's column list.",
+					);
+					return Ok(());
+				}
+			},
+			None => None,
+		};
 		let Some(key_col) = named.iter().position(|n| *n == key_column) else {
 			fail(
 				self,
@@ -5478,6 +6050,55 @@ impl Router {
 			}
 		} else if let Some(r) = self.enter_tx(&nodes).await? {
 			fail(self, r.code, &r.message, &r.hint);
+			return Ok(());
+		}
+		// A chunked table: no COPY starts on the nodes yet; the client is told to send its data
+		// by Lepis itself, and each chunk's rows go as they gather (`flush_chunk`).
+		if self.catalog.chunked.contains(&table)
+			&& let Some(ks) = self.catalog.keyspaces.get(&keyspace).cloned()
+		{
+			let mut g = Body::new()
+				.byte(u8::from(binary))
+				.bytes(&(named.len() as u16).to_be_bytes());
+			for _ in &named {
+				g = g.bytes(&u16::from(binary).to_be_bytes());
+			}
+			if !simple {
+				for m in &batch {
+					match m.tag {
+						b'P' => self
+							.out
+							.extend_from_slice(&Message::new(b'1', vec![]).encode()),
+						b'B' => self
+							.out
+							.extend_from_slice(&Message::new(b'2', vec![]).encode()),
+						b'D' => self
+							.out
+							.extend_from_slice(&Message::new(b'n', vec![]).encode()),
+						_ => {}
+					}
+				}
+			}
+			self.out.extend_from_slice(&g.message(b'G').encode());
+			self.spread_cancel(&nodes);
+			self.copy_split = Some(CopySplit {
+				nodes,
+				splitter: route::copy::Splitter::new(c.options, key_col).with_second(second_col),
+				keyspace,
+				pending: HashMap::new(),
+				simple,
+				implicit,
+				error: None,
+				chunked: Some(ChunkedCopy {
+					keyspace: ks,
+					table,
+					sql,
+					header: Vec::new(),
+					trailer: Vec::new(),
+					buffers: HashMap::new(),
+					rows: 0,
+				}),
+			});
 			return Ok(());
 		}
 		self.spread_cancel(&nodes);
@@ -5548,12 +6169,13 @@ impl Router {
 			.extend_from_slice(&copy_in.expect("checked").encode());
 		self.copy_split = Some(CopySplit {
 			nodes,
-			splitter: route::copy::Splitter::new(c.options, key_col),
+			splitter: route::copy::Splitter::new(c.options, key_col).with_second(second_col),
 			keyspace,
 			pending: HashMap::new(),
 			simple,
 			implicit,
 			error: None,
+			chunked: None,
 		});
 		Ok(())
 	}
@@ -5592,6 +6214,22 @@ impl Router {
 						if cs.pending.get(&n).is_some_and(|p| p.len() >= COPY_CHUNK) {
 							let bytes = cs.pending.remove(&n).unwrap_or_default();
 							self.send_raw(n, &bytes).await?;
+						}
+					}
+					let full: Vec<(NodeId, u32)> = cs
+						.chunked
+						.as_ref()
+						.map(|c| {
+							c.buffers
+								.iter()
+								.filter(|(_, b)| b.len() >= CHUNK_COPY_BUFFER)
+								.map(|(k, _)| *k)
+								.collect()
+						})
+						.unwrap_or_default();
+					for k in full {
+						if cs.error.is_none() {
+							self.flush_chunk(&mut cs, k).await?;
 						}
 					}
 				}
@@ -5633,6 +6271,68 @@ impl Router {
 			out.extend_from_slice(bytes);
 			out
 		};
+		if let Some(cc) = cs.chunked.as_mut() {
+			for p in pieces {
+				match p {
+					Piece::Everyone(bytes) => cc.header.extend(frame(&bytes)),
+					Piece::End(bytes) => cc.trailer.extend(frame(&bytes)),
+					Piece::Row { key, second, bytes } => {
+						let hashed = |t: crate::hash::KeyType, k: &Key, seed: u64| match k {
+							Key::Null => {
+								Err("a row's distribution key is NULL, so it has no chunk"
+									.to_string())
+							}
+							Key::Text(v) => t.hash_text_value(v, seed).map_err(|e| e.to_string()),
+							Key::Binary(v) => {
+								t.hash_binary_value(v, seed).map_err(|e| e.to_string())
+							}
+						};
+						let ks = &cc.keyspace;
+						// A second key is hashed with the first's hash as its seed (Phase 5).
+						let hash = hashed(ks.key_type, &key, ks.seed).and_then(|h| {
+							match (ks.second, &second) {
+								(Some(t), Some(s)) => hashed(t, s, h as u64),
+								(None, _) => Ok(h),
+								(Some(_), None) => {
+									Err("the COPY does not name the second key".to_string())
+								}
+							}
+						});
+						let at = hash.and_then(|h| {
+							let c = cc
+								.keyspace
+								.chunk_of_hash(h)
+								.ok_or_else(|| "the keyspace has no chunks".to_string())?;
+							Ok((cc.keyspace.owner_of_hash(h), c.number))
+						});
+						match at {
+							Ok((n, c)) if cs.nodes.contains(&n) => {
+								cc.buffers.entry((n, c)).or_default().extend(frame(&bytes));
+							}
+							Ok((n, _)) => {
+								cs.error = Some(refusal_message(
+									route::NOT_ACROSS_NODES,
+									&format!(
+										"a row belongs to {n}, which this COPY does not write"
+									),
+									"Try again: the cluster changed while the COPY ran.",
+								));
+								return;
+							}
+							Err(e) => {
+								cs.error = Some(refusal_message(
+									route::NOT_ACROSS_NODES,
+									&format!("COPY across nodes: {e}"),
+									"Give every row its distribution key.",
+								));
+								return;
+							}
+						}
+					}
+				}
+			}
+			return;
+		}
 		for p in pieces {
 			match p {
 				Piece::Everyone(bytes) | Piece::End(bytes) => {
@@ -5640,7 +6340,7 @@ impl Router {
 						cs.pending.entry(*n).or_default().extend(frame(&bytes));
 					}
 				}
-				Piece::Row { key, bytes } => {
+				Piece::Row { key, bytes, .. } => {
 					let owner = match &key {
 						Key::Null => {
 							Err("a row's distribution key is NULL, so it has no node".to_string())
@@ -5680,11 +6380,130 @@ impl Router {
 		}
 	}
 
+	/// One chunk's buffered rows as a COPY into its chunk table, in its node's transaction.
+	async fn flush_chunk(&mut self, cs: &mut CopySplit, k: (NodeId, u32)) -> Result<(), WireError> {
+		let Some(cc) = cs.chunked.as_mut() else {
+			return Ok(());
+		};
+		let Some(rows) = cc.buffers.remove(&k) else {
+			return Ok(());
+		};
+		let (node, number) = k;
+		let Some(sql) = chunk::copy_into_sql(&cc.sql, &chunk::chunk_relation(&cc.table, number))
+		else {
+			cs.error = Some(refusal_message(
+				route::NOT_ACROSS_NODES,
+				"Lepis could not read this COPY into a chunked table",
+				"COPY with a plain column list and options.",
+			));
+			return Ok(());
+		};
+		let mut bytes = cc.header.clone();
+		bytes.extend(rows);
+		self.send(node, &[wire::query(&sql)]).await?;
+		let conn = self.conns.get_mut(&node).expect("connected");
+		conn.prepared.remove("");
+		let mut error = None;
+		let mut started = false;
+		loop {
+			let m = conn.reader.next().await?;
+			match m.tag {
+				b'G' => {
+					started = true;
+					break;
+				}
+				b'E' => error = Some(m),
+				b'Z' => break,
+				b'N' => put_message(&mut self.out, &m),
+				_ => {}
+			}
+		}
+		if !started {
+			cs.error = error.or_else(|| {
+				Some(refusal_message(
+					"XX000",
+					"a node did not start the COPY",
+					"",
+				))
+			});
+			return Ok(());
+		}
+		let trailer = cs
+			.chunked
+			.as_ref()
+			.map(|c| c.trailer.clone())
+			.unwrap_or_default();
+		bytes.extend(trailer);
+		bytes.extend(Message::new(b'c', vec![]).encode());
+		self.send_raw(node, &bytes).await?;
+		let conn = self.conns.get_mut(&node).expect("connected");
+		loop {
+			let m = conn.reader.next().await?;
+			match m.tag {
+				b'C' => {
+					let n = cstr(&m.body)
+						.rsplit(' ')
+						.next()
+						.and_then(|v| v.parse::<u64>().ok())
+						.unwrap_or(0);
+					if let Some(cc) = cs.chunked.as_mut() {
+						cc.rows += n;
+					}
+				}
+				b'E' => {
+					cs.error.get_or_insert(m);
+				}
+				b'N' => put_message(&mut self.out, &m),
+				b'Z' => break,
+				_ => {}
+			}
+		}
+		Ok(())
+	}
+
+	/// The end of a COPY into a chunked table: the rest of every chunk's rows, then the nodes
+	/// commit together or none does, as for any COPY across nodes.
+	async fn copy_end_chunked(
+		&mut self,
+		mut cs: CopySplit,
+		fail: Option<String>,
+	) -> Result<(), WireError> {
+		if fail.is_none() && cs.error.is_none() {
+			let mut keys: Vec<(NodeId, u32)> = cs
+				.chunked
+				.as_ref()
+				.map(|c| c.buffers.keys().copied().collect())
+				.unwrap_or_default();
+			keys.sort();
+			for k in keys {
+				if cs.error.is_some() {
+					break;
+				}
+				self.flush_chunk(&mut cs, k).await?;
+			}
+		}
+		self.unspread_cancel();
+		let total = cs.chunked.as_ref().map_or(0, |c| c.rows);
+		let error = match (fail, cs.error.take()) {
+			(Some(why), _) => Some(refusal_message(
+				"57014",
+				&format!("COPY from stdin failed: {why}"),
+				"",
+			)),
+			(None, e) => e,
+		};
+		self.finish_copy(cs.nodes, cs.simple, cs.implicit, error, total)
+			.await
+	}
+
 	/// CopyDone (`fail` None) or CopyFail from the client: each node finishes, the nodes commit
 	/// together or none does, and the client gets one answer.
-	async fn copy_end(&mut self, cs: CopySplit, fail: Option<String>) -> Result<(), WireError> {
+	async fn copy_end(&mut self, mut cs: CopySplit, fail: Option<String>) -> Result<(), WireError> {
+		if cs.chunked.is_some() {
+			return self.copy_end_chunked(cs, fail).await;
+		}
 		let failing = fail.is_some() || cs.error.is_some();
-		let mut pending = cs.pending;
+		let mut pending = std::mem::take(&mut cs.pending);
 		for n in &cs.nodes {
 			let mut bytes = pending.remove(n).unwrap_or_default();
 			let end = if failing {
@@ -5730,18 +6549,32 @@ impl Router {
 			(None, Some(e)) => Some(e),
 			(None, None) => error,
 		};
+		self.finish_copy(cs.nodes, cs.simple, cs.implicit, error, total)
+			.await
+	}
+
+	/// A COPY across nodes' end: rolled back on an error, else committed together (two-phase),
+	/// and the client answered.
+	async fn finish_copy(
+		&mut self,
+		nodes: Vec<NodeId>,
+		simple: bool,
+		implicit: bool,
+		error: Option<Message>,
+		total: u64,
+	) -> Result<(), WireError> {
 		let error = match error {
 			Some(e) => {
-				if cs.implicit {
-					self.rollback_nodes(&cs.nodes).await;
+				if implicit {
+					self.rollback_nodes(&nodes).await;
 				} else {
 					self.tx_status = b'E';
 				}
 				Some(e)
 			}
-			None if cs.implicit => {
+			None if implicit => {
 				let coordinator = self.coordinator();
-				let nodes = cs.nodes.clone();
+				let nodes = nodes.clone();
 				let mut parts: Vec<Part> = self
 					.conns
 					.iter_mut()
@@ -5766,7 +6599,7 @@ impl Router {
 					.encode(),
 			),
 		}
-		if cs.simple {
+		if simple {
 			let z = Body::new().byte(self.tx_status_now()).message(b'Z');
 			self.out.extend_from_slice(&z.encode());
 		} else if sent_error {
@@ -5949,7 +6782,7 @@ impl Router {
 				}
 				_ => false,
 			},
-			route::KeyValue::Null => false,
+			route::KeyValue::Null | route::KeyValue::Pair(..) => false,
 		}
 	}
 
@@ -5991,6 +6824,23 @@ struct Acc {
 	copies: Vec<(Vec<NodeId>, String)>,
 	/// The JWT claim this batch set (`route_claim`).
 	claim: Option<Claim>,
+	/// The batch message being considered.
+	msg: usize,
+	/// (message, statement within it, the statement naming its chunk tables).
+	rewrites: Vec<(usize, usize, String)>,
+}
+
+/// What a statement on a chunked table needs (`Router::chunk_step`).
+enum ChunkStep {
+	/// As it is: no chunked table, or the shell answers it.
+	Plain,
+	/// Its text naming the chunk tables.
+	Rewrite(String),
+	/// An INSERT whose rows fall in several chunks: one statement per (node, chunk).
+	Split(Fanout),
+	/// A COPY FROM into a chunked table, split by row through the staging path.
+	Copy(Vec<NodeId>),
+	Refuse(route::Refusal),
 }
 
 /// A write several nodes run as it is (route.rs `Route::Fanout`).
@@ -6009,6 +6859,10 @@ struct Fanout {
 	rows: Option<Vec<Vec<usize>>>,
 	/// A schema change (ddl.rs): every node, one transaction each, committed together.
 	ddl: bool,
+	/// Each node's statement is several (a chunked table's DDL with its chunks' sync): sent as a
+	/// simple query, the client told the `tag_at`th's command tag.
+	simple: bool,
+	tag_at: usize,
 }
 
 enum Event {
@@ -6100,6 +6954,12 @@ enum Plan {
 	},
 	Local {
 		tx_verbs: Vec<TxVerb>,
+	},
+	/// A read that needs rows from several nodes at once (join.rs): copied where they are
+	/// needed, then answered; refused as `why` when it cannot be.
+	Join {
+		sql: String,
+		why: route::Refusal,
 	},
 	/// A read Lepis answers from several nodes' answers (or an EXPLAIN it annotates).
 	Gather {
@@ -6331,6 +7191,8 @@ mod tests {
 				seed: 0,
 				ranges: Keyspace::even_ranges(1, &[NodeId(1)]),
 				pins: HashMap::new(),
+				chunks: Vec::new(),
+				second: None,
 			},
 		);
 		c.relations.insert(

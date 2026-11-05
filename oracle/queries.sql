@@ -206,3 +206,47 @@ select distinct on (status) status, tenant_id from oracle.orders order by status
 
 -- name: union_across route=refuse
 select tenant_id from oracle.orders union select tenant_id from oracle.items;
+
+-- Reads that need rows from several nodes at once, answered by a
+-- broadcast of the smaller side or a gather onto the home node. Each must equal one Postgres.
+
+-- name: join_non_key_group ordered route=join
+select i.sku, count(*), sum(i.qty) from oracle.items i join oracle.orders o on o.order_id = i.line
+where o.tenant_id between 1 and 20 group by i.sku order by i.sku limit 20;
+
+-- name: join_other_keyspace route=join
+select t.country, count(*) from oracle.tenants t join oracle.events e on e.seq = t.tenant_id group by t.country;
+
+-- name: join_global_broadcast ordered route=join
+select p.name, count(*) from oracle.tenants t join oracle.plans p on p.id = t.plan_id group by p.name order by p.name;
+
+-- name: join_global_filtered ordered route=join
+select t.tenant_id, p.name, p.monthly_cents from oracle.tenants t join oracle.plans p on p.id = t.plan_id
+where t.tenant_id = 300;
+
+-- name: left_join_non_key ordered route=join
+select o.tenant_id, o.order_id, e.kind from oracle.orders o left join oracle.events e on e.seq = o.order_id
+where o.tenant_id < 5 order by o.tenant_id, o.order_id, e.kind nulls first limit 40;
+
+-- name: join_distinct ordered route=join
+select distinct o.status from oracle.orders o join oracle.tenants t on t.plan_id = o.order_id order by o.status;
+
+-- name: join_order_limit ordered route=join
+select o.tenant_id, o.order_id, t.name from oracle.orders o join oracle.tenants t on t.tenant_id = o.order_id
+order by o.total_cents desc, o.tenant_id, o.order_id limit 10;
+
+-- name: semi_join_subquery route=join
+select count(*) from oracle.orders o where exists (select 1 from oracle.events e where e.seq = o.order_id and e.kind = 'click');
+
+-- name: window_over_all ordered route=join
+select tenant_id, order_id, rank() over (order by total_cents desc, tenant_id, order_id) r from oracle.orders order by r limit 7;
+
+-- name: window_partitioned ordered route=join
+select status, tenant_id, order_id, row_number() over (partition by status order by total_cents, tenant_id, order_id) n
+from oracle.orders where tenant_id < 30 order by status, n limit 25;
+
+-- name: union_all_tables route=join
+select tenant_id from oracle.orders where tenant_id < 50 union select tenant_id from oracle.items where tenant_id < 60;
+
+-- name: subquery_avg route=join
+select count(*) from oracle.orders where total_cents > (select avg(total_cents) from oracle.orders);

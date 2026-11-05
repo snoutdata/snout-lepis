@@ -232,6 +232,98 @@ pub fn joins_on_keys(from_cols: &str, to_cols: &str, from_key: &str, to_key: &st
 		.any(|(f, t)| f == from_key && t == to_key)
 }
 
+/// What a second key needs: the column, of the keyspace's second type;
+/// both keys NOT NULL (a NULL would pass every chunk's fence); every primary or unique key holding
+/// both (a node checks uniqueness over its own rows); and no foreign key but one to a reference
+/// table (a referenced row would be on another node).
+/// Every unique index, primary key or exclusion constraint on `$1` that does not hold column
+/// `$2` (an expression index never does): a node can only check uniqueness over its own rows.
+/// Plain unique indexes are counted, not only constraints.
+const UNIQUE_WITHOUT_SQL: &str = "select coalesce(con.conname, ic.relname::text) from pg_index ix \
+	join pg_class ic on ic.oid = ix.indexrelid \
+	left join pg_constraint con on con.conindid = ix.indexrelid and con.conrelid = ix.indrelid \
+	where ix.indrelid = $1::regclass and (ix.indisunique or con.contype = 'x') \
+	and not exists (select from pg_attribute a where a.attrelid = ix.indrelid and a.attname = $2 \
+		and a.attnum = any(ix.indkey::int2[]))";
+
+pub async fn check_second_key(
+	pg: &mut Pg,
+	rel: &RelationName,
+	key: &str,
+	second: &str,
+	t: KeyType,
+) -> Result<(), OpError> {
+	let q = qualified(rel);
+	let refuse = |m: String| OpError::refused(Kind::TableNotShardable, m);
+	if second == key {
+		return Err(refuse(format!(
+			"{rel}: the second key must be another column than {key}"
+		)));
+	}
+	let rows = pg
+		.query(
+			"select format_type(atttypid, atttypmod), attnotnull from pg_attribute \
+			where attrelid = $1::regclass and attname = $2 and not attisdropped",
+			&[&q, second],
+		)
+		.await?;
+	let Some(r) = rows.first() else {
+		return Err(OpError::refused(
+			Kind::NoSuchColumn,
+			format!("{rel} has no column {second}"),
+		));
+	};
+	let ty = text(r, 0);
+	let base = ty.split('(').next().unwrap_or_default().trim().to_string();
+	if KeyType::from_sql_name(&base) != Some(t) {
+		return Err(refuse(format!(
+			"{rel}.{second} is {ty}, and the keyspace's second key is {}",
+			t.sql_name()
+		)));
+	}
+	for col in [key, second] {
+		let nn = pg
+			.value(
+				"select attnotnull::text from pg_attribute where attrelid = $1::regclass and attname = $2",
+				&[&q, col],
+			)
+			.await?;
+		if nn.as_deref() != Some("true") {
+			return Err(refuse(format!(
+				"{rel}.{col} may be NULL; both distribution keys must be NOT NULL"
+			)));
+		}
+	}
+	let missing = pg.query(UNIQUE_WITHOUT_SQL, &[&q, second]).await?;
+	if let Some(r) = missing.first() {
+		return Err(refuse(format!(
+			"unique index or constraint {} on {rel} does not include the second key {second}: a node can only check uniqueness over what it holds (L15)",
+			text(r, 0)
+		)));
+	}
+	let fks = pg
+		.query(
+			"select c.conname, (c.confrelid = $1::regclass), \
+			coalesce((select kind from lepis.relation r join pg_class k on k.relname = r.table_name \
+			join pg_namespace n on n.oid = k.relnamespace and n.nspname = r.schema_name \
+			where k.oid = c.confrelid), 'global') \
+			from pg_constraint c where c.contype = 'f' \
+			and (c.conrelid = $1::regclass or c.confrelid = $1::regclass)",
+			&[&q],
+		)
+		.await?;
+	for r in fks {
+		if text(&r, 1) == "f" && text(&r, 2) == "reference" {
+			continue;
+		}
+		return Err(refuse(format!(
+			"foreign key {} links {rel} to rows that a second key puts on other nodes: only a key to a reference table holds; drop it (L9)",
+			text(&r, 0)
+		)));
+	}
+	Ok(())
+}
+
 pub async fn check_movable(
 	pg: &mut Pg,
 	rel: &RelationName,
@@ -288,19 +380,12 @@ pub async fn check_movable(
 			),
 		));
 	}
-	let missing = pg
-		.query(
-			"select conname from pg_constraint c where conrelid = $1::regclass \
-			and contype in ('p', 'u') and not exists (select from unnest(c.conkey) k \
-			join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k where a.attname = $2)",
-			&[&t, key],
-		)
-		.await?;
+	let missing = pg.query(UNIQUE_WITHOUT_SQL, &[&t, key]).await?;
 	if let Some(r) = missing.first() {
 		return Err(OpError::refused(
 			Kind::TableNotShardable,
 			format!(
-				"constraint {} on {rel} does not include the distribution key {key}: a node can only check uniqueness over what it holds (L15)",
+				"unique index or constraint {} on {rel} does not include the distribution key {key}: a node can only check uniqueness over what it holds (L15)",
 				text(r, 0)
 			),
 		));

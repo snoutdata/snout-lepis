@@ -372,3 +372,97 @@ async fn table_auto_distributes_a_linked_schema_in_one_call() {
 		"{e}"
 	);
 }
+
+/// The design check (L24) against a real home node, before anything is distributed: a chain
+/// under the tenant table auto would choose is followed down its foreign keys, the table that cannot follow says why and what to add, a
+/// foreign key with no index is named with the index it needs, and `table.auto`'s plan carries
+/// the same findings before anything moves.
+#[tokio::test]
+async fn the_design_check_reads_the_chain_under_the_tenant() {
+	let b = need_bed!();
+	let home = connect(&b.home, "postgres", "x").await;
+	home.batch_execute(
+		"drop schema if exists checkx cascade;
+		create schema checkx;
+		create table checkx.customer (id bigint primary key, name text);
+		create table checkx.package (customer_id bigint not null references checkx.customer (id), id bigint not null,
+			primary key (customer_id, id), unique (id));
+		create table checkx.payment (id bigint not null, customer_id bigint not null, package_id bigint not null, primary key (customer_id, id),
+			foreign key (customer_id, package_id) references checkx.package (customer_id, id));
+		create table checkx.line (id bigint primary key, package_id bigint references checkx.package (id));",
+	)
+	.await
+	.unwrap();
+	// Nothing is distributed: the check reads the schema as it is being designed, from what
+	// table.auto would choose in each keyspace (customer, the tenant, by its id).
+	let (_app, admin) = admin_for(&b).await;
+
+	let (code, v) = admin.call("GET", "/v1/check?schemas=checkx", None).await;
+	assert_eq!(code, 200, "{v}");
+	let found = |code: &str, table: &str| {
+		v["findings"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|f| f["code"] == code && f["table"] == table)
+			.cloned()
+			.unwrap_or_else(|| panic!("no {code} for {table}: {v:#}"))
+	};
+	// package belongs with customer's rows and its unique (id) refuses it.
+	let p = found("blocked", "checkx.package");
+	assert!(
+		p["message"]
+			.as_str()
+			.unwrap()
+			.contains("does not include customer_id"),
+		"{p}"
+	);
+	// payment follows package by its customer_id, three tables down.
+	let pay = found("can_follow", "checkx.payment");
+	assert_eq!(
+		pay["operation"],
+		json!({"op": "table.distribute", "table": "checkx.payment", "column": "customer_id", "keyspace": "tenant"})
+	);
+	// line has no customer_id: add it, and its foreign key has no index.
+	let l = found("missing_key_column", "checkx.line");
+	assert!(
+		l["sql"]
+			.as_str()
+			.unwrap()
+			.contains("add column \"customer_id\" bigint"),
+		"{l}"
+	);
+	let ix = found("fk_not_indexed", "checkx.line");
+	assert_eq!(
+		ix["sql"],
+		"create index on \"checkx\".\"line\" (\"package_id\");"
+	);
+	assert_eq!(v["summary"]["tables"], 4, "{v:#}");
+
+	// The plan of table.auto carries the same check.
+	let (code, plan) = admin
+		.call(
+			"POST",
+			"/v1/plan",
+			Some(
+				&json!({"op": "table.auto", "keyspace": "tenant", "schemas": ["checkx"], "min_bytes": 0}),
+			),
+		)
+		.await;
+	assert_eq!(code, 200, "{plan}");
+	assert!(
+		plan["check"]["findings"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.any(|f| f["code"] == "missing_key_column" && f["table"] == "checkx.line"),
+		"{plan:#}"
+	);
+
+	// The router says it has the check, with its thresholds.
+	let (_, ops) = admin.call("GET", "/v1/ops", None).await;
+	assert!(ops["check"]["big_bytes"].as_u64().is_some(), "{ops}");
+	home.batch_execute("drop schema checkx cascade")
+		.await
+		.unwrap();
+}

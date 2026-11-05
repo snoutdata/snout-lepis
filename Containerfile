@@ -15,6 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 	&& rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# The image's version, which publish-image.sh passes: the guard and the witness say it (guard::BUILD),
+# and the control plane changes a guarded pair only when both guards and its witness carry the change.
+ARG BUILD=
+ENV LEPIS_BUILD=${BUILD}
 RUN cargo build --locked --release -p snout-lepis \
 	&& cp target/release/snout-lepis /snout-lepis
 

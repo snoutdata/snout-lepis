@@ -249,22 +249,31 @@ async fn every_refusal_has_its_code_and_its_fix() {
 	let lepis = start_lepis(&b).await;
 	let reference = connect(&b.reference, "lepis_app", "app-pw").await;
 	let c = connect(&lepis, "lepis_app", "app-pw").await;
-	let refused = [
+	// Answered by a gather onto the home node: as one Postgres.
+	for sql in [
 		"select tenant_id, rank() over (order by total_cents) from oracle.orders",
+		"select tenant_id from oracle.orders union all select tenant_id from oracle.items",
+		"select distinct on (status) status from oracle.orders",
+		"select count(*) from oracle.orders where total_cents > (select avg(total_cents) from oracle.orders)",
+		"select count(*) from (select distinct status from oracle.orders) s",
+		"select tenant_id from oracle.orders order by total_cents, tenant_id, order_id fetch first 3 rows with ties",
+		"select status, count(*) from oracle.orders group by rollup (status)",
+	] {
+		assert_eq!(
+			answer(&c, sql, false).await,
+			answer(&reference, sql, false).await,
+			"{sql}"
+		);
+	}
+	let refused = [
 		"select string_agg(name, ',') from oracle.tenants",
 		"select sum(value) from oracle.events",
 		"select avg(value) from oracle.events",
 		"select array_agg(status order by status) from oracle.orders",
 		"select oracle.mysum(total_cents) from oracle.orders",
-		"select tenant_id from oracle.orders union all select tenant_id from oracle.items",
-		"select distinct on (status) status from oracle.orders",
 		"select tenant_id from oracle.orders for update",
-		"select count(*) from oracle.orders where total_cents > (select avg(total_cents) from oracle.orders)",
-		"select count(*) from (select distinct status from oracle.orders) s",
 		"select upper(status) as status, count(*) from oracle.orders group by status",
 		"select tenant_id from oracle.orders order by total_cents using <",
-		"select tenant_id from oracle.orders order by total_cents fetch first 3 rows with ties",
-		"select status, count(*) from oracle.orders group by rollup (status)",
 		"select count(*) || 'x' from oracle.orders",
 		"select count(*) from oracle.orders having count(*)::text = '1'",
 		"explain (format json) select count(*) from oracle.orders",
@@ -498,4 +507,87 @@ async fn a_large_read_streams_through_the_merge() {
 		answer(&reference, sql, true).await
 	);
 	c.batch_execute("commit").await.unwrap();
+}
+
+/// Two distributed tables joined on columns that are not their
+/// keys, re-hashed on those columns, through the router and then node to node, each answer as
+/// one Postgres gives it; the shuffle leaves nothing behind on any node.
+#[tokio::test]
+async fn a_join_on_other_columns_is_repartitioned() {
+	let b = need_bed!();
+	let lepis = start_lepis(&b).await;
+	let reference = connect(&b.reference, "lepis_app", "app-pw").await;
+	let c = connect(&lepis, "lepis_app", "app-pw").await;
+	let reads = [
+		"select o.status, count(*), sum(o.total_cents) from oracle.orders o join oracle.events e on e.seq = o.order_id group by o.status order by 1",
+		"select i.sku, count(*) from oracle.items i join oracle.orders o on o.order_id = i.line group by i.sku order by 2 desc, 1 limit 10",
+		"select o.tenant_id, o.order_id, e.kind from oracle.orders o join oracle.events e on e.seq = o.order_id order by 1, 2, 3 limit 20",
+		"select p.name, count(*) from oracle.orders o join oracle.items i on i.line = o.order_id join oracle.plans p on p.id = i.line group by p.name order by 1",
+		"select distinct e.kind from oracle.events e, oracle.orders o where o.order_id = e.seq and o.total_cents > 100 order by 1",
+		"select count(*) from oracle.orders o join oracle.events e on e.device = o.ref",
+		"select count(*), count(e.seq) from oracle.orders o join oracle.events e on e.seq = o.order_id and e.kind <> o.status",
+	];
+	// Broadcast and gather out of the way (the four plans still fit a broadcast).
+	c.batch_execute(
+		"set lepis.join_broadcast_rows = 10; set lepis.join_gather_rows = 0; set lepis.join_shuffle_rows = 0",
+	)
+	.await
+	.unwrap();
+	for sql in reads {
+		let want = answer(&reference, sql, true).await;
+		assert!(want.is_ok(), "{sql}: {want:?}");
+		assert_eq!(
+			answer(&c, sql, true).await,
+			want,
+			"{sql} (through the router)"
+		);
+	}
+	c.batch_execute(
+		"set lepis.join_repartition_bytes = 0; set lepis.join_shuffle_rows = 1000000000",
+	)
+	.await
+	.unwrap();
+	for sql in reads {
+		let want = answer(&reference, sql, true).await;
+		assert_eq!(answer(&c, sql, true).await, want, "{sql} (node to node)");
+	}
+	// Each cap names itself when it is what stops the read.
+	c.batch_execute("set lepis.join_shuffle_rows = 1")
+		.await
+		.unwrap();
+	let e = c.simple_query(reads[0]).await.unwrap_err();
+	let d = e.as_db_error().unwrap();
+	assert_eq!(d.code().code(), "0A000");
+	assert!(
+		d.message().contains("lepis.join_shuffle_rows"),
+		"{}",
+		d.message()
+	);
+	// Every node was set up for it, and holds none of its tables now.
+	for (_, address) in node_ids(&b) {
+		let n = connect(&address, "postgres", "x").await;
+		let left = n
+			.query_one(
+				"select count(*) filter (where n.nspname is not null), \
+				count(*) filter (where c.relname is not null) \
+				from (select 1) x left join pg_namespace n on n.nspname = 'lepis_shuffle' \
+				left join pg_class c on c.relnamespace = n.oid and c.relkind in ('r', 'f')",
+				&[],
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			(left.get::<_, i64>(0), left.get::<_, i64>(1)),
+			(1, 0),
+			"{address}"
+		);
+		let super_ = n
+			.query_one(
+				"select rolsuper or rolinherit from pg_roles where rolname = 'lepis_shuffle'",
+				&[],
+			)
+			.await
+			.unwrap();
+		assert!(!super_.get::<_, bool>(0));
+	}
 }

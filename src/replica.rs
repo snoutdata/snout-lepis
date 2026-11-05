@@ -443,10 +443,10 @@ pub fn startup_read_from(startup: &[(String, String)]) -> Option<String> {
 				} else {
 					w.strip_prefix("-c").or_else(|| w.strip_prefix("--"))
 				};
-				if let Some((name, value)) = set.and_then(|s| s.split_once('=')) {
-					if name == "lepis.read_from" {
-						got = Some(value.to_string());
-					}
+				if let Some((name, value)) = set.and_then(|s| s.split_once('='))
+					&& name == "lepis.read_from"
+				{
+					got = Some(value.to_string());
 				}
 				i += 1;
 			}

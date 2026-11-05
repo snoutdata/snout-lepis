@@ -118,3 +118,23 @@ begin
 			execute function lepis.forget_dropped();
 	end if;
 end $$;
+
+-- Chunked storage. A keyspace's chunks: equal slices of the hash space
+-- (split in place later), each a table `<t>_cNNN` on the node that owns its range; every range is
+-- a set of whole chunks. A chunk's number is stable for its life and never reused.
+create table if not exists lepis.chunk (
+	keyspace text not null references lepis.keyspace (name),
+	number int not null check (number >= 0),
+	lo bigint not null,
+	hi bigint not null check (hi >= lo),
+	primary key (keyspace, number),
+	unique (keyspace, lo)
+);
+-- A sharded table stored as a shell and chunk tables on every node (false: one heap per node).
+alter table lepis.relation add column if not exists chunked boolean not null default false;
+
+-- A second key: a keyspace whose rows are placed by two columns, the
+-- second hashed with the first's hash as its seed, so one tenant's rows spread over every node. Its
+-- tables all name both; NULL: one key.
+alter table lepis.keyspace add column if not exists second_key_type text;
+alter table lepis.relation add column if not exists second_column text;

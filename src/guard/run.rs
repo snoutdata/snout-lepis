@@ -43,8 +43,10 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
-use super::decide::{Action, FENCED_NAME, Memory, Postgres, StandbySeen, SyncNames, decide};
-use super::witness::{Answer, Call};
+use super::decide::{
+	Action, Change, FENCED_NAME, Memory, Postgres, StandbySeen, SyncNames, decide,
+};
+use super::witness::{Answer, Call, RequestKind};
 use crate::backend::{self, Backend};
 use crate::config::{NodeAddress, SslMode};
 use crate::scram::ClientCredential;
@@ -168,6 +170,40 @@ pub fn quoted(name: &str) -> String {
 	format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Two standbys a commit waits for, both: a replacement's (`SyncNames::Both`).
+pub fn both(a: &str, b: &str) -> String {
+	format!("FIRST 2 ({}, {})", quoted(a), quoted(b))
+}
+
+/// The two names of a value `both` wrote, or `None`.
+pub fn both_names(value: &str) -> Option<(String, String)> {
+	let inner = value.trim().strip_prefix("FIRST 2 (")?.strip_suffix(')')?;
+	let mut names = Vec::new();
+	let mut rest = inner.trim();
+	while !rest.is_empty() {
+		let body = rest.strip_prefix('"')?;
+		let mut name = String::new();
+		let mut chars = body.char_indices();
+		let end = loop {
+			match chars.next()? {
+				(i, '"') if body[i + 1..].starts_with('"') => {
+					name.push('"');
+					chars.next();
+				}
+				(i, '"') => break i + 1,
+				(_, c) => name.push(c),
+			}
+		};
+		names.push(name);
+		rest = body[end..].trim_start();
+		rest = rest.strip_prefix(',').map_or(rest, str::trim_start);
+	}
+	match names.as_slice() {
+		[a, b] if a != b => Some((a.clone(), b.clone())),
+		_ => None,
+	}
+}
+
 /// The value read back, in `decide`'s terms. `None`: not a value this guard writes (someone else
 /// set it), which `facts` reads as the standby alone and gone, so `decide` clears `eligible` at the
 /// witness before commits can go on without it.
@@ -179,6 +215,8 @@ pub fn names_of(value: &str, peer: &str) -> Option<SyncNames> {
 		Some(SyncNames::Fenced)
 	} else if v == quoted(peer) || v == peer {
 		Some(SyncNames::Standby)
+	} else if both_names(v).is_some_and(|(a, b)| a == peer || b == peer) {
+		Some(SyncNames::Both)
 	} else {
 		None
 	}
@@ -201,7 +239,15 @@ pub fn timeout_settings(lease_ms: u64) -> [(&'static str, String); 3] {
 
 /// Whether `action` is a call to the witness (the rest act on this copy alone).
 pub fn calls_witness(action: Action) -> bool {
-	matches!(action, Action::Renew | Action::Eligible(_) | Action::Ask)
+	matches!(
+		action,
+		Action::Renew
+			| Action::Eligible(_)
+			| Action::Ask
+			| Action::Handover
+			| Action::Replace
+			| Action::Abandon(_)
+	)
 }
 
 /// A tick's actions as the runner takes them: what acts on this copy first, then the calls to the
@@ -381,27 +427,121 @@ pub fn push_script(command: &str, names: &[&str]) -> String {
 	)
 }
 
-/// The state file: the epoch, the only memory a guard keeps across a restart.
-pub fn read_epoch(path: &Path) -> Result<u64, String> {
+/// What a guard keeps across a restart: the epoch; the standby the witness last named (after a
+/// replacement the definition may still name the old one, and a fence ended on the old one's
+/// stream would acknowledge commits the witness's standby lacks); whether it was told a newer
+/// epoch has another primary (a handover's new primary may still stream from this copy, and a fence ended on that
+/// stream's word would let it commit again); a handover or a replacement sent and not yet answered
+/// (so a restart never reads the silence as "not done"). A witness that moved the pair elsewhere
+/// (`Answer::Moved`) is followed in memory only: a restarted guard asks the configured one again,
+/// which says so again, and the definition names the new one before the old one goes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuardState {
+	pub epoch: u64,
+	pub standby: Option<String>,
+	pub demoted: bool,
+	/// `(kind, id, to)` of the step sent.
+	pub sent: Option<(RequestKind, String, String)>,
+	/// The peer this guard's definition names; not written, but decides the form (`to_json`).
+	pub peer: Option<String>,
+}
+
+impl GuardState {
+	/// A demotion, a step sent, or a standby the witness named that this guard's definition does not
+	/// (a replacement its definition has not caught up with), is kept with the epoch under another
+	/// name (`epoch_held`): a guard from before them reads only `epoch`, and would end the fence on
+	/// the stream of a copy that is not, or no longer, the one the witness holds eligible. So it
+	/// refuses to start on this copy instead (an image rolled back), until the definition agrees.
+	pub fn to_json(&self) -> Value {
+		let stale_peer = self.standby.is_some() && self.peer.is_some() && self.standby != self.peer;
+		let key = if self.demoted || self.sent.is_some() || stale_peer {
+			"epoch_held"
+		} else {
+			"epoch"
+		};
+		let mut v = json!({ key: self.epoch });
+		if self.demoted {
+			v["demoted"] = json!(true);
+		}
+		if let Some(s) = &self.standby {
+			v["standby"] = json!(s);
+		}
+		if let Some((kind, id, to)) = &self.sent {
+			v["sent"] = json!({"kind": kind.as_str(), "id": id, "to": to});
+		}
+		v
+	}
+
+	pub fn from_json(v: &Value) -> Option<GuardState> {
+		let sent = v.get("sent").and_then(|s| {
+			Some((
+				RequestKind::parse(s.get("kind")?.as_str()?)?,
+				s.get("id")?.as_str()?.to_string(),
+				s.get("to")?.as_str()?.to_string(),
+			))
+		});
+		Some(GuardState {
+			epoch: v.get("epoch").or_else(|| v.get("epoch_held"))?.as_u64()?,
+			demoted: v.get("demoted").and_then(Value::as_bool).unwrap_or(false),
+			standby: v.get("standby").and_then(Value::as_str).map(str::to_string),
+			sent,
+			peer: None,
+		})
+	}
+
+	/// The step sent, as `decide` remembers it: any lease answered since this guard started (its
+	/// calls are numbered from 1) tells how it went.
+	pub fn change(&self) -> Option<Change> {
+		self.sent.as_ref().map(|(kind, id, to)| match kind {
+			RequestKind::Handover => Change::HandoverSent {
+				id: id.clone(),
+				from: 1,
+			},
+			RequestKind::Replace => Change::ReplaceSent {
+				id: id.clone(),
+				to: to.clone(),
+				from: 1,
+			},
+		})
+	}
+}
+
+/// The state file (`GuardState`). Missing: epoch 1 and nothing else.
+pub fn read_state(path: &Path) -> Result<GuardState, String> {
 	match std::fs::read_to_string(path) {
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GuardState {
+			epoch: 1,
+			..GuardState::default()
+		}),
 		Err(e) => Err(format!("{}: {e}", path.display())),
 		Ok(text) => serde_json::from_str::<Value>(&text)
 			.ok()
-			.and_then(|v| v.get("epoch").and_then(Value::as_u64))
+			.as_ref()
+			.and_then(GuardState::from_json)
 			.ok_or_else(|| format!("{}: not a guard state file", path.display())),
 	}
 }
 
-/// Written, fsynced, renamed into place and the directory fsynced: a promotion happens only after
-/// the epoch it was granted is on disk.
+/// The epoch alone, as `read_state` reads it.
+pub fn read_epoch(path: &Path) -> Result<u64, String> {
+	read_state(path).map(|s| s.epoch)
+}
+
+/// The epoch alone, the rest kept as it is on disk.
 pub fn write_epoch(path: &Path, epoch: u64) -> Result<(), String> {
+	let mut state = read_state(path).unwrap_or_default();
+	state.epoch = epoch;
+	write_state(path, &state)
+}
+
+/// Written, fsynced, renamed into place and the directory fsynced: a promotion happens only after
+/// the epoch it was granted is on disk, and a handover is sent only after it is.
+pub fn write_state(path: &Path, state: &GuardState) -> Result<(), String> {
 	let tmp = path.with_extension("tmp");
 	let fail = |e: std::io::Error| format!("{}: {e}", path.display());
 	{
 		let mut f = std::fs::File::create(&tmp).map_err(fail)?;
-		std::io::Write::write_all(&mut f, json!({ "epoch": epoch }).to_string().as_bytes())
-			.map_err(fail)?;
+		std::io::Write::write_all(&mut f, state.to_json().to_string().as_bytes()).map_err(fail)?;
 		f.sync_all().map_err(fail)?;
 	}
 	std::fs::rename(&tmp, path).map_err(fail)?;
@@ -592,6 +732,7 @@ fn status_json(g: &Guard, pg: &Postgres, now: u64) -> Value {
 				SyncNames::Standby => "standby",
 				SyncNames::Off => "off",
 				SyncNames::Fenced => "fenced",
+				SyncNames::Both => "both",
 			}),
 			Some(standby.is_some_and(|s| s.reply_age_ms < g.lease_ms / 2)),
 		),
@@ -615,7 +756,46 @@ fn status_json(g: &Guard, pg: &Postgres, now: u64) -> Value {
 		"demoted": g.mem.demoted,
 		"lease_left_ms": g.mem.renewed_at.map(|t| (t + g.lease_ms / 2).saturating_sub(now)),
 		"last_error": g.last_error,
+		// The witness it asks now (a moved witness's new address, before its definition says so),
+		// and the step of a change asked of the pair it is at, if any.
+		"witness": g.witness.to_string(),
+		"build": super::BUILD,
+		"change": g.mem.change.as_ref().map(|c| match c {
+			Change::Fencing { .. } => "handover-fencing",
+			Change::HandoverSent { .. } => "handover-sent",
+			Change::Both { .. } => "replace-both",
+			Change::ReplaceSent { .. } => "replace-sent",
+			Change::GivingUp { .. } => "giving-up",
+		}),
 	})
+}
+
+/// Where a witness said the pair moved (`host:port`), checked as the guard's own address is: the
+/// same TLS settings and CA, since a witness moves with its certificate's CA.
+pub fn moved_to(current: &NodeAddress, to: &str) -> Option<NodeAddress> {
+	let (host, port) = to.rsplit_once(':')?;
+	let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
+	let host_ok = !host.is_empty()
+		&& host.len() <= 253
+		&& host
+			.bytes()
+			.all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+	host_ok.then(|| NodeAddress {
+		host: host.to_string(),
+		port,
+		sslmode: current.sslmode,
+		ca_file: current.ca_file.clone(),
+	})
+}
+
+/// A barrier running: the names generation it started at, what it is for, and the task.
+type Barrier = (u64, BarrierFor, JoinHandle<Result<u64, String>>);
+
+/// Which barrier is running: the standby's (`sync_from_lsn`) or a replacement's (`candidate_from_lsn`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarrierFor {
+	Standby,
+	Candidate,
 }
 
 struct Guard {
@@ -623,10 +803,14 @@ struct Guard {
 	start: Instant,
 	lease_ms: u64,
 	mem: Memory,
+	/// What is on disk (`GuardState`).
+	state: GuardState,
+	/// The witness asked: the configured one, or where it said the pair moved.
+	witness: NodeAddress,
 	pg: Option<Backend>,
 	witness_tls: Option<Arc<rustls::ClientConfig>>,
-	/// The standby's `reply_time` as last read, and when this guard first saw that value.
-	reply: Option<(String, u64)>,
+	/// Each standby's `reply_time` as last read, and when this guard first saw that value.
+	replies: HashMap<String, (String, u64)>,
 	/// Since when the standby has heard nothing (its stream gone), on this guard's clock.
 	stream_gone_since: Option<u64>,
 	/// Standby: when the last message from the primary arrived, as last read while it streamed.
@@ -639,7 +823,7 @@ struct Guard {
 	/// Bumped by every change to `synchronous_standby_names`, so a barrier that finishes after a
 	/// later change is thrown away.
 	names_generation: u64,
-	barrier: Option<(u64, JoinHandle<Result<u64, String>>)>,
+	barrier: Option<Barrier>,
 	/// When the Ask that was granted went out (the new lease is counted from it).
 	asked_at: u64,
 	timeouts_set: bool,
@@ -649,6 +833,67 @@ struct Guard {
 impl Guard {
 	fn now(&self) -> u64 {
 		self.start.elapsed().as_millis() as u64
+	}
+
+	/// The standby this primary's commits wait for: the witness's, once it has said, else the
+	/// configured peer.
+	fn peer(&self) -> String {
+		self.mem
+			.standby
+			.clone()
+			.unwrap_or_else(|| self.cfg.peer.clone())
+	}
+
+	/// The copy a replacement brings in, while one is asked or under way.
+	fn candidate(&self) -> Option<String> {
+		match &self.mem.change {
+			Some(Change::Both { to, .. }) | Some(Change::ReplaceSent { to, .. }) => {
+				return Some(to.clone());
+			}
+			_ => {}
+		}
+		self.mem
+			.request
+			.as_ref()
+			.filter(|r| r.kind == RequestKind::Replace)
+			.map(|r| r.to.clone())
+	}
+
+	fn keep(&mut self) -> Result<(), String> {
+		self.state.peer = Some(self.cfg.peer.clone());
+		write_state(&self.cfg.state_file, &self.state)
+	}
+
+	/// The step sent and unanswered, on disk, follows memory: cleared once settled.
+	fn settle_sent(&mut self) {
+		let sent = matches!(
+			self.mem.change,
+			Some(Change::HandoverSent { .. }) | Some(Change::ReplaceSent { .. })
+		);
+		if !sent && self.state.sent.is_some() {
+			self.state.sent = None;
+			if let Err(m) = self.keep() {
+				self.trouble(format!("the guard's state: {m}"));
+			}
+		}
+	}
+
+	/// A standby's reading in `pg_stat_replication` (sync_state, flush, replay, reply_time).
+	fn seen(&mut self, name: &str, row: &[Option<String>], now: u64) -> StandbySeen {
+		let reply = row[3].clone().unwrap_or_default();
+		let since = match self.replies.get(name) {
+			Some((last, since)) if *last == reply => *since,
+			// Not seen moving yet: counted as half a lease old until it does.
+			None => now.saturating_sub(self.lease_ms / 2),
+			Some(_) => now,
+		};
+		self.replies.insert(name.to_string(), (reply, since));
+		StandbySeen {
+			reply_age_ms: now - since,
+			sync: row[0].as_deref() == Some("sync"),
+			flush_lsn: lsn(row.get(1)),
+			replay_lsn: lsn(row.get(2)),
+		}
 	}
 
 	fn trouble(&mut self, m: String) {
@@ -707,7 +952,7 @@ impl Guard {
 			.await?;
 		let row = head.first().ok_or("no row")?;
 		if row[0].as_deref() == Some("true") {
-			self.reply = None;
+			self.replies.clear();
 			let rx = self
 				.rows(
 					"SELECT (extract(epoch FROM clock_timestamp() - last_msg_receipt_time) * 1000)::bigint::text \
@@ -727,22 +972,19 @@ impl Guard {
 			});
 		}
 		let value = row[1].clone().unwrap_or_default();
-		let names = names_of(&value, &self.cfg.peer);
+		let peer = self.peer();
+		let names = names_of(&value, &peer);
 		if names.is_none() {
 			self.trouble(format!(
 				"synchronous_standby_names is {value:?}, which this guard did not set; read as the standby alone and gone"
 			));
 		}
 		let current = lsn(row.get(2));
-		let peer = self.cfg.peer.clone();
-		let rep = self
-			.rows(
-				"SELECT sync_state, pg_wal_lsn_diff(flush_lsn, '0/0')::text, reply_time::text \
-				 FROM pg_stat_replication WHERE application_name = $1 AND state = 'streaming' \
-				 ORDER BY reply_time DESC NULLS LAST LIMIT 1",
-				&[&peer],
-			)
-			.await?;
+		const REPLICATION: &str = "SELECT sync_state, pg_wal_lsn_diff(flush_lsn, '0/0')::text, \
+			 pg_wal_lsn_diff(replay_lsn, '0/0')::text, reply_time::text \
+			 FROM pg_stat_replication WHERE application_name = $1 AND state = 'streaming' \
+			 ORDER BY reply_time DESC NULLS LAST LIMIT 1";
+		let rep = self.rows(REPLICATION, &[&peer]).await?;
 		// The standby's flush as last read, kept when its row goes: what a fence lets the archive have.
 		// Flush only moves forward, so an old reading is a lower bound, never past the fork.
 		if let Some(r) = rep.first() {
@@ -750,55 +992,136 @@ impl Guard {
 			self.last_flush = Some(self.last_flush.map_or(flush, |f| f.max(flush)));
 		}
 		let standby = match rep.first() {
-			Some(r) if names.is_some() => {
-				let reply = r[2].clone().unwrap_or_default();
-				let since = match &self.reply {
-					Some((last, since)) if *last == reply => *since,
-					// Not seen moving yet: counted as half a lease old until it does.
-					None => now.saturating_sub(self.lease_ms / 2),
-					Some(_) => now,
-				};
-				self.reply = Some((reply, since));
-				Some(StandbySeen {
-					reply_age_ms: now - since,
-					sync: r[0].as_deref() == Some("sync"),
-					flush_lsn: lsn(r.get(1)),
-				})
-			}
+			Some(r) if names.is_some() => Some(self.seen(&peer, r, now)),
 			_ => {
-				self.reply = None;
+				self.replies.remove(&peer);
 				None
 			}
+		};
+		let candidate = match self.candidate().filter(|c| *c != peer) {
+			Some(name) => {
+				let row = self.rows(REPLICATION, &[&name]).await?;
+				match row.first() {
+					Some(r) => Some(self.seen(&name, r, now)),
+					None => {
+						self.replies.remove(&name);
+						None
+					}
+				}
+			}
+			None => None,
 		};
 		let archive = row.get(3).cloned().flatten().unwrap_or_default();
 		Ok(Postgres::Primary {
 			names: names.unwrap_or(SyncNames::Standby),
 			standby,
+			candidate,
 			lsn: current,
 			archive_fenced: (!archive.trim().is_empty()).then(|| archive_is_fenced(&archive)),
 		})
 	}
 
+	/// One call to the witness, numbered (`Memory::next_call`). A witness that moved the pair is
+	/// followed once, there and then.
 	async fn call(&mut self, call: Call, primary: bool) -> Option<Answer> {
+		self.mem.next_call();
+		let mut answer = self.exchange(&call).await?;
+		if let (_, Answer::Moved { witness }) = &answer {
+			let Some(to) = moved_to(&self.witness, witness) else {
+				self.trouble(format!(
+					"the witness says the pair moved to {witness:?}, not an address"
+				));
+				return None;
+			};
+			if to.to_string() == self.witness.to_string() {
+				self.trouble(format!(
+					"the witness says the pair moved to itself ({witness})"
+				));
+				return None;
+			}
+			tracing::warn!(from = %self.witness, to = %to, "the witness moved this pair: asking there");
+			self.witness = to;
+			answer = self.exchange(&call).await?;
+			if matches!(answer.1, Answer::Moved { .. }) {
+				self.trouble("the witness moved the pair twice in one call".into());
+				return None;
+			}
+		}
+		let (sent, answer) = answer;
+		match &answer {
+			Answer::Lease { lease_ms, .. } if *lease_ms != self.lease_ms => {
+				tracing::warn!(
+					witness = lease_ms,
+					configured = self.lease_ms,
+					"the witness's lease differs from LEPIS_GUARD_LEASE_MS; using the witness's"
+				);
+				self.lease_ms = *lease_ms;
+				self.timeouts_set = false;
+			}
+			Answer::Granted { epoch } => {
+				// On disk before this copy acts on it: a restart must not forget an epoch it holds.
+				self.state.epoch = *epoch;
+				self.state.demoted = false;
+				// Its standby now is the copy it replaces, which the next renewal names.
+				self.state.standby = None;
+				if let Err(m) = self.keep() {
+					self.trouble(format!("granted epoch {epoch} but could not keep it: {m}"));
+					return None;
+				}
+				self.asked_at = sent;
+				tracing::info!(epoch, "granted the primary's place");
+			}
+			Answer::Demoted { epoch, primary: p } if primary && !self.mem.demoted => {
+				tracing::warn!(epoch, primary = %p, "demoted: another copy is the primary");
+				self.hook(&self.cfg.on_demoted.clone(), "demoted");
+			}
+			Answer::Refused { reason } => self.trouble(format!("the witness refused: {reason}")),
+			_ => {}
+		}
+		self.mem.heard(sent, primary, &answer);
+		let standby = self.mem.standby.clone().filter(|_| primary);
+		if (self.mem.demoted && !self.state.demoted)
+			|| (standby.is_some() && standby != self.state.standby)
+		{
+			self.state.demoted |= self.mem.demoted;
+			if standby.is_some() {
+				self.state.standby = standby;
+			}
+			if let Err(m) = self.keep() {
+				self.trouble(format!(
+					"the guard could not keep what the witness said: {m}"
+				));
+			}
+		}
+		if !primary && let Answer::Demoted { epoch, .. } = answer {
+			// A standby that learned a newer epoch keeps it.
+			self.state.epoch = epoch;
+			let _ = self.keep();
+		}
+		Some(answer)
+	}
+
+	/// The request and its answer, with when it was sent; `None` (and said) when there is none.
+	async fn exchange(&mut self, call: &Call) -> Option<(u64, Answer)> {
 		let sent = self.now();
 		let body = call.to_json().to_string();
 		let request = format!(
 			"POST /v1/clusters/{}/call HTTP/1.1\r\nhost: {}\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
 			self.cfg.cluster,
-			self.cfg.witness.host,
+			self.witness.host,
 			self.cfg.token,
 			body.len()
 		);
-		let wait = Duration::from_millis(match &call {
+		let wait = Duration::from_millis(match call {
 			Call::Renew { .. } => renew_wait_ms(sent, self.mem.renewed_at, self.lease_ms),
 			_ => self.lease_ms / 4,
 		});
 		let got = tokio::time::timeout(
 			wait,
-			http(&self.cfg.witness, self.witness_tls.as_ref(), request),
+			http(&self.witness, self.witness_tls.as_ref(), request),
 		)
 		.await
-		.unwrap_or_else(|_| Err(format!("{}: no answer in {wait:?}", self.cfg.witness)));
+		.unwrap_or_else(|_| Err(format!("{}: no answer in {wait:?}", self.witness)));
 		let answer = match got {
 			Ok((200, v)) => Answer::from_json(&v),
 			Ok((status, v)) => {
@@ -815,42 +1138,13 @@ impl Guard {
 				return None;
 			}
 		};
-		let Some(answer) = answer else {
-			self.trouble("the witness's answer is not an answer".into());
-			return None;
-		};
-		match &answer {
-			Answer::Lease { lease_ms, .. } if *lease_ms != self.lease_ms => {
-				tracing::warn!(
-					witness = lease_ms,
-					configured = self.lease_ms,
-					"the witness's lease differs from LEPIS_GUARD_LEASE_MS; using the witness's"
-				);
-				self.lease_ms = *lease_ms;
-				self.timeouts_set = false;
+		match answer {
+			Some(a) => Some((sent, a)),
+			None => {
+				self.trouble("the witness's answer is not an answer".into());
+				None
 			}
-			Answer::Granted { epoch } => {
-				// On disk before this copy acts on it: a restart must not forget an epoch it holds.
-				if let Err(m) = write_epoch(&self.cfg.state_file, *epoch) {
-					self.trouble(format!("granted epoch {epoch} but could not keep it: {m}"));
-					return None;
-				}
-				self.asked_at = sent;
-				tracing::info!(epoch, "granted the primary's place");
-			}
-			Answer::Demoted { epoch, primary: p } if primary && !self.mem.demoted => {
-				tracing::warn!(epoch, primary = %p, "demoted: another copy is the primary");
-				self.hook(&self.cfg.on_demoted.clone(), "demoted");
-			}
-			Answer::Refused { reason } => self.trouble(format!("the witness refused: {reason}")),
-			_ => {}
 		}
-		self.mem.heard(sent, primary, &answer);
-		if !primary && let Answer::Demoted { epoch, .. } = answer {
-			// A standby that learned a newer epoch keeps it.
-			let _ = write_epoch(&self.cfg.state_file, epoch);
-		}
-		Some(answer)
 	}
 
 	fn hook(&self, command: &Option<String>, event: &str) {
@@ -874,6 +1168,22 @@ impl Guard {
 				Err(_) => tracing::warn!(%event, "hook took over 300 s and was stopped"),
 			}
 		});
+	}
+
+	/// Nothing commits (a name no standby has), new transactions read-only, every client session
+	/// ended: a backend waiting on its standby is told nothing, so no promise is lost.
+	async fn fence(&mut self) -> Result<(), String> {
+		self.names_generation += 1;
+		self.set(&[
+			("synchronous_standby_names", Some(FENCED_NAME.into())),
+			("default_transaction_read_only", Some("on".into())),
+		])
+		.await?;
+		self.run_sql(
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+			 WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()",
+		)
+		.await
 	}
 
 	async fn set(&mut self, settings: &[(&str, Option<String>)]) -> Result<(), String> {
@@ -958,17 +1268,20 @@ impl Guard {
 	async fn act(&mut self, action: Action, pg: &Postgres) -> Result<(), String> {
 		let (copy, epoch) = (self.cfg.copy.clone(), self.mem.epoch);
 		let primary = matches!(pg, Postgres::Primary { .. });
-		let peer = quoted(&self.cfg.peer);
+		let peer = quoted(&self.peer());
 		match action {
 			Action::Renew => {
 				self.call(Call::Renew { copy, epoch }, primary).await;
 			}
 			Action::Eligible(eligible) => {
+				// A vouch names whom it is for, which the witness checks against its standby.
+				let standby = eligible.then(|| self.peer());
 				self.call(
 					Call::Eligible {
 						copy,
 						epoch,
 						eligible,
+						standby,
 					},
 					primary,
 				)
@@ -1008,29 +1321,154 @@ impl Guard {
 				tracing::info!("the standby is back: commits wait for it again");
 			}
 			Action::Fence => {
-				self.names_generation += 1;
-				self.set(&[
-					("synchronous_standby_names", Some(FENCED_NAME.into())),
-					("default_transaction_read_only", Some("on".into())),
-				])
-				.await?;
-				self.run_sql(
-					"SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-					 WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()",
-				)
-				.await?;
+				self.fence().await?;
 				tracing::warn!("fenced: no lease and no standby");
 				self.hook(&self.cfg.on_fence.clone(), "fence");
 			}
 			Action::Unfence => {
+				// A replacement's answer still awaited: both stay named, as they were.
+				let names = match &self.mem.change {
+					Some(Change::ReplaceSent { to, .. }) => both(&self.peer(), to),
+					_ => peer,
+				};
 				self.names_generation += 1;
 				self.mem.sync_from_lsn = None;
 				self.set(&[
-					("synchronous_standby_names", Some(peer)),
+					("synchronous_standby_names", Some(names)),
 					("default_transaction_read_only", None),
 				])
 				.await?;
 				tracing::info!("unfenced: commits wait for the standby");
+			}
+			Action::HandoverFence => {
+				let id = self
+					.mem
+					.request
+					.as_ref()
+					.map(|r| r.id.clone())
+					.ok_or("no handover is asked")?;
+				self.fence().await?;
+				self.mem.change = Some(Change::Fencing {
+					id: id.clone(),
+					since: self.now(),
+				});
+				tracing::warn!(%id, "fenced for a handover: waiting for the standby to replay everything");
+			}
+			Action::Handover => {
+				let id = match &self.mem.change {
+					Some(Change::Fencing { id, .. }) | Some(Change::HandoverSent { id, .. }) => {
+						id.clone()
+					}
+					_ => return Err("no handover under way".into()),
+				};
+				// On disk first: from here a restart stays fenced until the witness says.
+				self.state.sent = Some((RequestKind::Handover, id.clone(), self.peer()));
+				self.keep()?;
+				// The handover's own answer is never a lease: one to a later renewal tells.
+				self.mem.change = Some(Change::HandoverSent {
+					id: id.clone(),
+					from: self.mem.calls + 2,
+				});
+				let answer = self
+					.call(
+						Call::Handover {
+							copy,
+							epoch,
+							id: id.clone(),
+						},
+						primary,
+					)
+					.await;
+				match answer {
+					Some(Answer::Demoted { .. }) => {
+						tracing::warn!(%id, "handed over: the standby is the primary now");
+					}
+					// Refused: never taken, and a late copy of the call would be refused too.
+					Some(Answer::Refused { .. }) => self.mem.change = None,
+					_ => {}
+				}
+				self.settle_sent();
+			}
+			Action::GoBoth => {
+				let r = self
+					.mem
+					.request
+					.clone()
+					.filter(|r| r.kind == RequestKind::Replace)
+					.ok_or("no replacement is asked")?;
+				self.names_generation += 1;
+				self.mem.candidate_from_lsn = None;
+				self.set(&[("synchronous_standby_names", Some(both(&self.peer(), &r.to)))])
+					.await?;
+				self.mem.change = Some(Change::Both {
+					id: r.id.clone(),
+					to: r.to.clone(),
+					since: self.now(),
+				});
+				tracing::info!(id = %r.id, to = %r.to, "a new standby named beside the standby: commits wait for both");
+			}
+			Action::Replace => {
+				let (id, to) = match &self.mem.change {
+					Some(Change::Both { id, to, .. })
+					| Some(Change::ReplaceSent { id, to, .. }) => (id.clone(), to.clone()),
+					_ => return Err("no replacement under way".into()),
+				};
+				// On disk first: from here a restart keeps both named until the witness says.
+				self.state.sent = Some((RequestKind::Replace, id.clone(), to.clone()));
+				self.keep()?;
+				self.mem.change = Some(Change::ReplaceSent {
+					id: id.clone(),
+					to: to.clone(),
+					from: self.mem.calls + 1,
+				});
+				let answer = self
+					.call(
+						Call::Replace {
+							copy,
+							epoch,
+							id: id.clone(),
+						},
+						primary,
+					)
+					.await;
+				if let Some(Answer::Refused { .. }) = answer {
+					self.mem.change = None;
+					self.settle_sent();
+				}
+			}
+			Action::Abandon(reason) => {
+				let Some(id) = self.mem.request.as_ref().map(|r| r.id.clone()) else {
+					return Ok(());
+				};
+				self.mem.change = Some(Change::GivingUp {
+					id: id.clone(),
+					reason,
+				});
+				tracing::warn!(%id, reason = reason.text(), "a change asked of the pair given up");
+				self.call(
+					Call::Abandon {
+						copy,
+						epoch,
+						id,
+						reason: reason.text().into(),
+					},
+					primary,
+				)
+				.await;
+			}
+			Action::Resolved => {
+				self.mem.change = None;
+				self.settle_sent();
+			}
+			Action::EndStreams => {
+				let peer = self.peer();
+				self.rows(
+					"SELECT count(pg_terminate_backend(pid))::text FROM pg_stat_replication \
+					 WHERE application_name = $1",
+					&[&peer],
+				)
+				.await?;
+				tracing::info!(%peer, "ended the stream of the standby reading from this demoted copy");
 			}
 			Action::FenceArchive => {
 				let flush = self
@@ -1117,7 +1555,7 @@ impl Guard {
 	/// is missing of the timeline left (`open` is the unguarded `archive_command`).
 	fn promoted(&mut self, epoch: u64, open: String) {
 		self.mem = Memory::promoted(epoch, self.asked_at);
-		self.reply = None;
+		self.replies.clear();
 		self.names_generation += 1;
 		tracing::warn!(epoch, "promoted: this copy is the primary");
 		self.hook(&self.cfg.on_promote.clone(), "promote");
@@ -1142,31 +1580,57 @@ impl Guard {
 	/// Starts the barrier when the standby is named and its starting LSN is unknown, and takes the
 	/// result of one that finished for the current names.
 	async fn barrier(&mut self, pg: &Postgres) {
-		let named = matches!(
-			pg,
-			Postgres::Primary {
-				names: SyncNames::Standby,
-				..
+		let names = match pg {
+			Postgres::Primary { names, .. } => Some(*names),
+			_ => None,
+		};
+		// What the barrier is for now, and the value it waits to see in force.
+		let wanted = match (names, &self.mem.change) {
+			(Some(SyncNames::Standby), _) => Some((BarrierFor::Standby, quoted(&self.peer()))),
+			(Some(SyncNames::Both), Some(Change::Both { to, .. })) => {
+				Some((BarrierFor::Candidate, both(&self.peer(), to)))
 			}
-		);
-		if self.barrier.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-			let (generation, handle) = self.barrier.take().expect("just seen");
+			_ => None,
+		};
+		if self
+			.barrier
+			.as_ref()
+			.is_some_and(|(_, _, h)| h.is_finished())
+		{
+			let (generation, kind, handle) = self.barrier.take().expect("just seen");
 			let result = handle.await.unwrap_or_else(|e| Err(e.to_string()));
+			let current = generation == self.names_generation
+				&& wanted.as_ref().is_some_and(|(k, _)| *k == kind);
 			match result {
-				Ok(lsn) if generation == self.names_generation && named => {
+				Ok(lsn) if current && kind == BarrierFor::Standby => {
 					self.mem.sync_from_lsn = Some(lsn);
 					tracing::info!(
 						lsn,
 						"the standby is vouched for once it has flushed past this"
 					);
 				}
+				Ok(lsn) if current => {
+					self.mem.candidate_from_lsn = Some(lsn);
+					tracing::info!(
+						lsn,
+						"the new standby has every acknowledged commit once it has flushed past this"
+					);
+				}
 				Ok(_) => {}
 				Err(m) => self.trouble(format!("sync barrier: {m}")),
 			}
 		}
-		if named && self.mem.sync_from_lsn.is_none() && self.barrier.is_none() {
-			let handle = tokio::spawn(sync_barrier(self.cfg.clone(), quoted(&self.cfg.peer)));
-			self.barrier = Some((self.names_generation, handle));
+		let unknown = match wanted.as_ref().map(|(k, _)| *k) {
+			Some(BarrierFor::Standby) => self.mem.sync_from_lsn.is_none(),
+			Some(BarrierFor::Candidate) => self.mem.candidate_from_lsn.is_none(),
+			None => false,
+		};
+		if unknown
+			&& self.barrier.is_none()
+			&& let Some((kind, expect)) = wanted
+		{
+			let handle = tokio::spawn(sync_barrier(self.cfg.clone(), expect));
+			self.barrier = Some((self.names_generation, kind, handle));
 		}
 	}
 
@@ -1248,6 +1712,7 @@ impl Guard {
 				failed = true;
 			}
 		}
+		self.settle_sent();
 		if !failed && self.last_error.is_some() && !matches!(pg, Postgres::Down) {
 			self.last_error = None;
 		}
@@ -1258,7 +1723,13 @@ impl Guard {
 /// Runs until stopped. A primary renews once before its first decision, so a restart does not
 /// fence a healthy copy for want of a lease it simply has not asked for yet.
 pub async fn run_guard(cfg: GuardConfig) -> Result<(), String> {
-	let epoch = read_epoch(&cfg.state_file)?;
+	let mut state = read_state(&cfg.state_file)?;
+	let epoch = state.epoch;
+	// Written again in the form this definition calls for (a definition that caught up with a
+	// replacement lets a guard from before it start here again).
+	state.peer = Some(cfg.peer.clone());
+	write_state(&cfg.state_file, &state)?;
+	let witness = cfg.witness.clone();
 	// The client config speaks Postgres's ALPN; the witness's listener offers HTTP/1.1.
 	let tls_for = |a: &NodeAddress, alpn: &[u8]| -> Result<_, String> {
 		Ok(crate::tls::client_config(a)?.map(|c| {
@@ -1274,10 +1745,15 @@ pub async fn run_guard(cfg: GuardConfig) -> Result<(), String> {
 		start: Instant::now(),
 		mem: Memory {
 			epoch,
+			demoted: state.demoted,
+			standby: state.standby.clone(),
+			change: state.change(),
 			..Memory::default()
 		},
+		state,
+		witness,
 		pg: None,
-		reply: None,
+		replies: HashMap::new(),
 		stream_gone_since: None,
 		last_receipt_at: None,
 		witness_silent: false,
@@ -1288,7 +1764,7 @@ pub async fn run_guard(cfg: GuardConfig) -> Result<(), String> {
 		timeouts_set: false,
 		last_error: None,
 	};
-	tracing::info!(copy = %g.cfg.copy, cluster = %g.cfg.cluster, epoch, witness = %g.cfg.witness, "snout-lepis guard starting");
+	tracing::info!(copy = %g.cfg.copy, cluster = %g.cfg.cluster, epoch, witness = %g.witness, change = ?g.mem.change, "snout-lepis guard starting");
 	let now = g.now();
 	let pg = g.facts(now).await;
 	// A guard stopped between a promotion's reload and its end left RESTORE_GUARD on: off it comes.
@@ -1366,6 +1842,38 @@ mod tests {
 		// A keeper could stand in for the standby: never read as the standby alone.
 		assert_eq!(names_of("FIRST 1 (toronto, keeper)", "toronto"), None);
 		assert_eq!(names_of("*", "toronto"), None);
+		// A replacement's two, read back whichever of them the witness holds the standby.
+		let two = both("toronto", "sd-new");
+		assert_eq!(two, "FIRST 2 (\"toronto\", \"sd-new\")");
+		assert_eq!(both_names(&two), Some(("toronto".into(), "sd-new".into())));
+		assert_eq!(names_of(&two, "toronto"), Some(SyncNames::Both));
+		assert_eq!(names_of(&two, "sd-new"), Some(SyncNames::Both));
+		assert_eq!(names_of(&two, "keeper"), None);
+		assert_eq!(
+			both_names(&both("a\"b", "c")),
+			Some(("a\"b".into(), "c".into()))
+		);
+		assert_eq!(both_names("FIRST 2 (\"a\", \"a\")"), None);
+		assert_eq!(both_names("FIRST 2 (\"a\")"), None);
+	}
+
+	#[test]
+	fn a_moved_witness_is_followed_with_the_same_tls_and_a_bad_address_is_not() {
+		let c = GuardConfig::from_map(&env(&[])).unwrap();
+		let to = moved_to(&c.witness, "10.99.0.7:7446").unwrap();
+		assert_eq!(
+			(to.host.as_str(), to.port, to.sslmode),
+			("10.99.0.7", 7446, c.witness.sslmode)
+		);
+		for bad in [
+			"10.99.0.7",
+			"10.99.0.7:0",
+			":7445",
+			"a b:7445",
+			"10.99.0.7:99999",
+		] {
+			assert!(moved_to(&c.witness, bad).is_none(), "{bad}");
+		}
 	}
 
 	const PUSH: &str = "snoutpod-pgbackrest archive-push %p";
@@ -1613,6 +2121,23 @@ mod tests {
 			[Action::Unfence, Action::UnfenceArchive, Action::Renew]
 		);
 		assert!(calls_witness(Action::Ask) && !calls_witness(Action::Promote(2)));
+		// A handover's fence comes before the renewal; its step after it.
+		assert_eq!(
+			in_tick_order(vec![Action::Renew, Action::HandoverFence]),
+			[Action::HandoverFence, Action::Renew]
+		);
+		assert_eq!(
+			in_tick_order(vec![
+				Action::Renew,
+				Action::Unfence,
+				Action::Abandon(super::super::decide::Reason::Behind)
+			]),
+			[
+				Action::Unfence,
+				Action::Renew,
+				Action::Abandon(super::super::decide::Reason::Behind)
+			]
+		);
 	}
 
 	#[test]
@@ -1664,6 +2189,41 @@ mod tests {
 	}
 
 	#[test]
+	fn the_status_file_says_the_build_and_the_witness_asked() {
+		let cfg = GuardConfig::from_map(&env(&[])).unwrap();
+		let g = Guard {
+			witness: cfg.witness.clone(),
+			lease_ms: cfg.lease_ms,
+			cfg,
+			start: Instant::now(),
+			mem: Memory::default(),
+			state: GuardState::default(),
+			pg: None,
+			witness_tls: None,
+			replies: HashMap::new(),
+			stream_gone_since: None,
+			last_receipt_at: None,
+			witness_silent: false,
+			last_flush: None,
+			names_generation: 0,
+			barrier: None,
+			asked_at: 0,
+			timeouts_set: false,
+			last_error: None,
+		};
+		let v = status_json(
+			&g,
+			&Postgres::Standby {
+				receive_age_ms: None,
+			},
+			0,
+		);
+		assert_eq!(v["build"], json!(crate::guard::BUILD));
+		assert!(!crate::guard::BUILD.is_empty());
+		assert_eq!(v["witness"], json!("10.99.0.3:7445"));
+	}
+
+	#[test]
 	fn the_epoch_survives_on_disk_and_starts_at_one() {
 		let dir = std::env::temp_dir().join(format!("lepis-guard-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
@@ -1674,6 +2234,25 @@ mod tests {
 		assert_eq!(read_epoch(&f).unwrap(), 7);
 		std::fs::write(&f, "{}").unwrap();
 		assert!(read_epoch(&f).is_err());
+		// A demotion and a step sent are kept beside it, and the epoch alone leaves them be.
+		let state = GuardState {
+			epoch: 3,
+			demoted: true,
+			standby: Some("sd-new".into()),
+			sent: Some((RequestKind::Handover, "x".into(), "toronto".into())),
+			peer: None,
+		};
+		write_state(&f, &state).unwrap();
+		write_epoch(&f, 4).unwrap();
+		let back = read_state(&f).unwrap();
+		assert_eq!(back, GuardState { epoch: 4, ..state });
+		assert_eq!(
+			back.change(),
+			Some(Change::HandoverSent {
+				id: "x".into(),
+				from: 1
+			})
+		);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

@@ -208,8 +208,11 @@ pub async fn read(b: &mut Conn) -> Result<Option<Catalog>, String> {
 		let ranges = one(b, catalog::LOAD_RANGES).await?;
 		let pins = one(b, catalog::LOAD_PINS).await?;
 		let relations = one(b, catalog::LOAD_RELATIONS).await?;
-		Catalog::from_rows(epoch, &nodes, &keyspaces, &ranges, &pins, &relations)
-			.map_err(|e| format!("the catalog is not usable: {e}"))
+		let chunks = one(b, catalog::LOAD_CHUNKS).await?;
+		Catalog::from_rows(
+			epoch, &nodes, &keyspaces, &ranges, &pins, &relations, &chunks,
+		)
+		.map_err(|e| format!("the catalog is not usable: {e}"))
 	}
 	.await;
 	let _ = one(b, "rollback").await;
