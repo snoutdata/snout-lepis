@@ -601,6 +601,9 @@ async fn verify(cx: &mut StepCtx, h: &mut Pg, keyspace: Option<&str>) -> Result<
 	for n in c.nodes.values().filter(|n| n.state != NodeState::Removed) {
 		let mut pg = connect_node(&cx.app, &c, n.id).await?;
 		let v = version(&mut pg).await?;
+		// A joining standby is a whole copy of its source until a move promotes it: every chunk
+		// is there by replay, owned or not, and it gives back what it does not own afterwards.
+		let whole_copy = super::physical::standby_of(h, n.id).await?.is_some();
 		for (rel, kind) in &names {
 			let in_scope = match (kind, keyspace) {
 				(RelationKind::Sharded { keyspace: k, .. }, Some(want)) => k == want,
@@ -665,7 +668,7 @@ async fn verify(cx: &mut StepCtx, h: &mut Pg, keyspace: Option<&str>) -> Result<
 					let owned = number
 						.and_then(|n| all.iter().find(|x| x.number == n))
 						.is_some_and(|x| ks.owner_of_hash(x.lo) == n.id);
-					if !owned {
+					if !owned && !whole_copy {
 						ok = false;
 					}
 					let r = pg

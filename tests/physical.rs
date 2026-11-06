@@ -287,9 +287,11 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	admin
 		.op(json!({"op": "keyspace.create", "name": "acct", "key_type": "bigint", "seed": SEED, "ranges": 2, "nodes": [1]}))
 		.await;
+	// Chunked tables by default, as a cluster makes them; heap tables with LEPIS_PHYS_HEAP set.
+	let heap = env("LEPIS_PHYS_HEAP").is_some();
 	admin
 		.op(
-			json!({"op": "table.distribute", "table": "physx.ledger", "column": "acct", "keyspace": "acct"}),
+			json!({"op": "table.distribute", "table": "physx.ledger", "column": "acct", "keyspace": "acct", "heap": heap}),
 		)
 		.await;
 
@@ -352,16 +354,18 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	// the job with 25006 until 0.1.6 (found live on 2026-10-11, the dashboard's "spread a table").
 	let j = admin
 		.op(
-			json!({"op": "table.distribute", "table": "physx.notes", "column": "acct", "keyspace": "acct"}),
+			json!({"op": "table.distribute", "table": "physx.notes", "column": "acct", "keyspace": "acct", "heap": heap}),
 		)
 		.await;
-	let fences = j["steps"]
-		.as_array()
-		.unwrap()
-		.iter()
-		.find(|s| s["kind"] == "fences")
-		.unwrap();
-	assert_eq!(fences["detail"]["standbys_passed"], json!([2]), "{j:#}");
+	if heap {
+		let fences = j["steps"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find(|s| s["kind"] == "fences")
+			.unwrap();
+		assert_eq!(fences["detail"]["standbys_passed"], json!([2]), "{j:#}");
+	}
 	admin.op(json!({"op": "verify", "keyspace": "acct"})).await;
 	admin.op(json!({"op": "cleanup"})).await;
 	assert_eq!(one(&home, "select count(*) from physx.notes").await, "2000");
@@ -385,6 +389,7 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 	assert_eq!(d["phase"], "cleaned", "{j:#}");
 	for v in d["verify"].as_array().unwrap() {
 		assert_eq!(v["equal"], true, "{v}");
+		assert_ne!(v["source_rows"], "0", "verify compared nothing: {v}");
 	}
 	eprintln!("physical cutover: {}", d["cutover"]);
 	eprintln!("cleanup: {}", d["cleanup"]);
@@ -457,6 +462,11 @@ async fn a_standby_takes_half_a_keyspace_by_promotion() {
 		"{} committed rows are missing, e.g. {lost:?}",
 		want.difference(&all).count()
 	);
+
+	// Cleanup dropped what each side gave up.
+	let retired = "select count(*) from pg_class where relname like 'lepis_retired_%'";
+	assert_eq!(one(&home, retired).await, "0");
+	assert_eq!(one(&sb, retired).await, "0");
 
 	// The promoted node: its copy of the global table and of Lepis's catalog are gone, its
 	// fence refuses a key it does not own, and the old owner's fence refuses the moved keys.

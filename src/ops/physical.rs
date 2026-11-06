@@ -728,13 +728,15 @@ async fn verify(
 	let mut equal = true;
 	for rel in &t.tables {
 		let slice = owns_expr(&c, rel, target, v, &|col| quote_ident(col))?;
-		let sum = format!(
-			"select count(*), coalesce(sum(hashtextextended(lepis_row::text, 0)::numeric), 0) \
-			from {} lepis_row where {slice}",
-			qualified(rel)
-		);
-		let a = held.source.simple(&sum).await;
-		let b = held.target.simple(&sum).await;
+		let sum = |from: &str| {
+			format!(
+				"select count(*), coalesce(sum(hashtextextended(lepis_row::text, 0)::numeric), 0) from {from}"
+			)
+		};
+		let on_target = format!("{} lepis_row where {slice}", qualified(rel));
+		let on_source = given_up(&c, rel, target).unwrap_or_else(|| on_target.clone());
+		let a = held.source.simple(&sum(&on_source)).await;
+		let b = held.target.simple(&sum(&on_target)).await;
 		let (a, b) = match (a, b) {
 			(Ok(a), Ok(b)) => (a, b),
 			(Err(e), _) | (_, Err(e)) => {
@@ -768,6 +770,30 @@ async fn verify(
 		json!({"phase": if equal { "verified" } else { "verify_failed" }, "verify": results}),
 	)
 	.await
+}
+
+/// The source's side of a chunked table's slice: the chunks it gave up, by their retired names.
+/// A snapshot keeps the rows but not the tree: which tables a query on the shell reads comes from
+/// the catalog as it is now, and those chunks have left the shell. None for a heap table.
+fn given_up(c: &Catalog, rel: &RelationName, target: NodeId) -> Option<String> {
+	let Some(RelationKind::Sharded { keyspace, .. }) = c.relations.get(rel) else {
+		return None;
+	};
+	let ks = c.keyspaces.get(keyspace)?;
+	let tables: Vec<String> = c
+		.chunks_of(rel)?
+		.iter()
+		.filter(|x| ks.owner_of_hash(x.lo) == target)
+		.map(|x| {
+			let live = crate::chunk::chunk_relation(rel, x.number);
+			format!(
+				"select * from {}.{}",
+				quote_ident(&live.schema),
+				quote_ident(&crate::chunk::retired_name(&live.table))
+			)
+		})
+		.collect();
+	(!tables.is_empty()).then(|| format!("({}) lepis_row", tables.join(" union all ")))
 }
 
 /// The promoted node stops looking like the source: every fence from the catalog, and the

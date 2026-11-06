@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # L8's physical move (Phase 6) against real Postgres: a primary, and a streaming
 # standby of it made with pg_basebackup, then tests/physical.rs moves half a keyspace onto the
-# standby by promoting it, under a write load through Lepis.
+# standby by promoting it, under a write load through Lepis. It runs twice: chunked tables, then heap.
 #
 #   bash scripts/it-physical.sh          postgres:18
 #   bash scripts/it-physical.sh 17       postgres:17
@@ -14,6 +14,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 stack="$(cd "$here/.." && pwd)"
 engine="${STACK_ENGINE:-docker}"
 major="${1:-18}"
+# Both kinds of table, each on its own primary and standby: a promotion can happen once.
+if [ -z "${LEPIS_PHYS_MODE:-}" ]; then
+	LEPIS_PHYS_MODE=chunks bash "${BASH_SOURCE[0]}" "$major"
+	LEPIS_PHYS_MODE=heap exec bash "${BASH_SOURCE[0]}" "$major"
+fi
 run="lepis-phys-$$"
 net="$run-net"
 primary="$run-p"
@@ -94,5 +99,9 @@ until [ "$("$engine" exec "$replica" psql -U postgres -h 127.0.0.1 -Atc 'select 
 done
 echo "== $replica is streaming from $standby" >&2
 
-STACK_DEV_ARGS="--network $net -e LEPIS_PHYS_PRIMARY=$primary:5432 -e LEPIS_PHYS_STANDBY=$standby:5432 -e LEPIS_PHYS_REPLICA=$replica:5432" \
+heap_arg=""
+if [ "$LEPIS_PHYS_MODE" = heap ]; then
+	heap_arg="-e LEPIS_PHYS_HEAP=1"
+fi
+STACK_DEV_ARGS="--network $net -e LEPIS_PHYS_PRIMARY=$primary:5432 -e LEPIS_PHYS_STANDBY=$standby:5432 -e LEPIS_PHYS_REPLICA=$replica:5432 $heap_arg" \
 	bash "$stack/scripts/dev.sh" cargo test -p snout-lepis --test physical -- --nocapture
