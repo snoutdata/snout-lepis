@@ -86,6 +86,9 @@ struct Conn {
 	closes_owed: Vec<String>,
 	/// How many of the open transaction's SETs this node has run.
 	tx_applied: usize,
+	/// Its node's slot, given back when this closes (`gate.rs`). None outside transaction mode.
+	#[allow(dead_code)] // Held for its Drop.
+	slot: Option<crate::gate::Slot>,
 }
 
 /// A statement the client prepared (Parse), kept so it can be parsed again on another node.
@@ -238,6 +241,7 @@ impl Router {
 		startup: Vec<(String, String)>,
 		client: BoxStream,
 		home: Backend,
+		slot: Option<crate::gate::Slot>,
 		home_id: NodeId,
 		cancel_pid: i32,
 		cancel_key: Vec<u8>,
@@ -258,6 +262,7 @@ impl Router {
 				sets_applied: 0,
 				closes_owed: Vec::new(),
 				tx_applied: 0,
+				slot,
 			},
 		);
 		Router {
@@ -1838,7 +1843,9 @@ impl Router {
 				begin: None,
 				join: false,
 			}),
-			(None, None) if statements == 0 && !data && !tx_verbs.is_empty() && sessions.is_empty() => {
+			(None, None)
+				if statements == 0 && !data && !tx_verbs.is_empty() && sessions.is_empty() =>
+			{
 				// Only transaction control, with no node yet: Lepis answers. Not a statement that
 				// names no table, in the batch with its BEGIN (pgJDBC's way): that has rows to return.
 				Ok(Plan::Local { tx_verbs })
@@ -2254,9 +2261,10 @@ impl Router {
 			self.conns.insert(node, c);
 			return Ok(());
 		}
-		if self.take_pooled(node).await? {
-			return Ok(());
-		}
+		let slot = match self.slot_for(node).await? {
+			Turn::Taken => return Ok(()),
+			Turn::Open(slot) => slot,
+		};
 		let n = self.node_of(node);
 		let Some(n) = n else {
 			return Err(WireError::Protocol(format!("{node} is not in the catalog")));
@@ -2293,6 +2301,7 @@ impl Router {
 				sets_applied: 0,
 				closes_owed: Vec::new(),
 				tx_applied: 0,
+				slot,
 			},
 		);
 		Ok(())
@@ -5662,6 +5671,35 @@ mod pool {
 	/// (node address and database, role).
 	pub type Key = (String, String);
 
+	/// Every idle backend past its time is closed, whoever asks. Each gives back its node's slot.
+	pub(super) fn close_old() {
+		let mut p = pools().lock().expect("pool");
+		p.retain(|_, idle| {
+			idle.retain(|(at, _, _)| at.elapsed() < IDLE_FOR);
+			!idle.is_empty()
+		});
+	}
+
+	/// Closes the longest-idle backend on this node, of any role. False if it holds none.
+	pub(super) fn evict(node: &str) -> bool {
+		let mut p = pools().lock().expect("pool");
+		let oldest = p
+			.iter()
+			.filter(|((address, _), idle)| address == node && !idle.is_empty())
+			.min_by_key(|(_, idle)| idle[0].0)
+			.map(|(key, _)| key.clone());
+		let Some(key) = oldest else {
+			return false;
+		};
+		if let Some(idle) = p.get_mut(&key) {
+			idle.remove(0);
+			if idle.is_empty() {
+				p.remove(&key);
+			}
+		}
+		true
+	}
+
 	/// Idle backends kept per key; more are closed.
 	const MAX_IDLE: usize = 64;
 	/// An idle backend older than this is closed rather than handed out.
@@ -5700,6 +5738,64 @@ mod pool {
 	/// How many idle backends the pool holds for `key` (tests).
 	pub fn idle(key: &Key) -> usize {
 		pools().lock().expect("pool").get(key).map_or(0, Vec::len)
+	}
+}
+
+/// How often idle backends past their time are closed.
+const CLOSE_OLD_IDLE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Closes idle backends past their time, for as long as the router runs, so they stop counting
+/// against the node when nobody is asking for one.
+pub async fn close_old_idle() {
+	loop {
+		tokio::time::sleep(CLOSE_OLD_IDLE_EVERY).await;
+		pool::close_old();
+	}
+}
+
+/// What a client's turn at a node's gate came to.
+enum Turn {
+	/// It has a backend from the pool, in `conns`.
+	Taken,
+	/// It may open one, holding this slot; None when nothing limits it.
+	Open(Option<crate::gate::Slot>),
+}
+
+/// A client that waited its whole turn at a gate is told so, and its connection ends.
+fn pool_full_error(wait: std::time::Duration) -> crate::wire::ErrorFields {
+	crate::wire::ErrorFields::fatal(
+		"53300",
+		format!(
+			"no database connection came free within {} seconds",
+			wait.as_secs()
+		),
+	)
+	.with_hint("Connect again and retry. A long transaction keeps its connection from other clients until it ends.")
+}
+
+/// A slot of the home node for a client signing in to a pooled session: its turn in line, closing an
+/// idle backend of any role if that makes room. None when nothing limits it.
+pub async fn sign_in_slot(
+	app: &crate::server::App,
+	node: &str,
+) -> Result<Option<crate::gate::Slot>, crate::wire::ErrorFields> {
+	let Some(gate) = app.gates.of(node) else {
+		return Ok(None);
+	};
+	let deadline = tokio::time::Instant::now() + app.gates.wait;
+	let ticket = gate.join();
+	loop {
+		if ticket.first() {
+			if let Some(slot) = gate.try_slot() {
+				return Ok(Some(slot));
+			}
+			if pool::evict(node) {
+				continue;
+			}
+		}
+		if !ticket.wait(deadline).await {
+			return Err(pool_full_error(app.gates.wait));
+		}
 	}
 }
 
@@ -5759,7 +5855,11 @@ impl Router {
 		}
 		for (node, c) in std::mem::take(&mut self.parked) {
 			if let Some(key) = self.pool_key(node) {
+				let gate = self.app.gates.of(&key.0);
 				pool::put(key, self.cancel_pid, c);
+				if let Some(gate) = gate {
+					gate.wake();
+				}
 			}
 		}
 		// A cancel now reaches no backend (pid 0 is nobody's).
@@ -5782,6 +5882,47 @@ impl Router {
 			);
 		}
 		self.cancel_node = NodeId(i32::MIN);
+	}
+
+	/// This client's turn at the node's gate: a backend from the pool, or a slot to open one with,
+	/// closing an idle backend of another role if that makes room. Waits its turn in line.
+	async fn slot_for(&mut self, node: NodeId) -> Result<Turn, WireError> {
+		let gate = if self.pooled() {
+			self.pool_key(node)
+				.and_then(|key| self.app.gates.of(&key.0).map(|gate| (gate, key.0)))
+		} else {
+			None
+		};
+		let Some((gate, address)) = gate else {
+			return Ok(if self.take_pooled(node).await? {
+				Turn::Taken
+			} else {
+				Turn::Open(None)
+			});
+		};
+		let wait = self.app.gates.wait;
+		let deadline = tokio::time::Instant::now() + wait;
+		let ticket = gate.join();
+		loop {
+			if ticket.first() {
+				if self.take_pooled(node).await? {
+					return Ok(Turn::Taken);
+				}
+				if let Some(slot) = gate.try_slot() {
+					return Ok(Turn::Open(Some(slot)));
+				}
+				if pool::evict(&address) {
+					continue;
+				}
+			}
+			if !ticket.wait(deadline).await {
+				self.end_with = Some(pool_full_error(wait).message());
+				return Err(WireError::Protocol(format!(
+					"waited {} seconds for a connection to {node}",
+					wait.as_secs()
+				)));
+			}
+		}
 	}
 
 	/// A backend from the pool, set up as this client's: its startup parameters first (DISCARD
@@ -7265,6 +7406,7 @@ mod tests {
 			],
 			Box::new(router_side),
 			home,
+			None,
 			NodeId(1),
 			1,
 			vec![0; 4],

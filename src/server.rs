@@ -26,6 +26,8 @@ pub struct App {
 	pub verifiers: VerifierSource,
 	pub cancels: cancel::Registry,
 	pub clients: Arc<Semaphore>,
+	/// Each node's connections in transaction mode, and the line for them (`gate.rs`).
+	pub gates: crate::gate::Gates,
 	/// The current catalog snapshot; None when the cluster has no `lepis` schema (live.rs).
 	catalog: RwLock<Option<Arc<Catalog>>>,
 	/// When the home node last answered, and whether the catalog may still be routed by.
@@ -47,6 +49,7 @@ impl App {
 		Ok(Arc::new(App {
 			verifiers: VerifierSource::new(config.clone(), node_tls.clone()),
 			clients: Arc::new(Semaphore::new(config.max_clients)),
+			gates: crate::gate::Gates::new(config.pool_size, config.queue_wait),
 			config,
 			tls_acceptor,
 			channel_binding,
@@ -85,6 +88,7 @@ pub async fn serve_with(
 	// A home that is a set of copies starts on the one that takes writes, and follows it.
 	crate::follow::settle(&app, std::time::Duration::from_secs(30)).await;
 	tokio::spawn(crate::follow::run(app.clone()));
+	tokio::spawn(crate::router::close_old_idle());
 	// Not after the catalog: the pass-through never reads it, so a home whose catalog cannot be
 	// read is no reason to keep auth and storage waiting.
 	let passthrough = async {

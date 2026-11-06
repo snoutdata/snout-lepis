@@ -51,6 +51,8 @@ struct Opened {
 	user: String,
 	client_key: ClientSecret,
 	backend: backend::Backend,
+	/// The home node's slot, for a client that will be pooled (`gate.rs`).
+	slot: Option<crate::gate::Slot>,
 	minor: u32,
 }
 
@@ -204,6 +206,28 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 		Err(fields) => return refuse(&mut client, fields).await.map(|_| None),
 	};
 
+	// A client that will be pooled takes its turn for this connection. Anything else keeps what it
+	// connects with, and the node's own limit is the one that applies.
+	let slot = {
+		let database = Startup::param(&params, "database").unwrap_or(&user);
+		let pooled = !app.config.session_roles.contains(&user)
+			&& crate::router::settings::get(app).await.transaction_pool;
+		let gate_node = app
+			.catalog()
+			.filter(|_| pooled && database == app.config.service.database)
+			.and_then(|c| {
+				c.home()
+					.map(|n| format!("{}:{}/{}", n.host, n.port, n.dbname))
+			});
+		match gate_node {
+			Some(node) => match crate::router::sign_in_slot(app, &node).await {
+				Ok(slot) => slot,
+				Err(fields) => return refuse(&mut client, fields).await.map(|_| None),
+			},
+			None => None,
+		}
+	};
+
 	// The same session on the home node, as the same role.
 	let node = &app.config.home();
 	let backend = match backend::connect(
@@ -237,6 +261,7 @@ async fn open(app: &Arc<App>, tcp: TcpStream) -> Result<Option<Opened>, WireErro
 		user,
 		client_key,
 		backend,
+		slot,
 		minor,
 	}))
 }
@@ -257,6 +282,7 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 		user,
 		client_key,
 		backend,
+		slot,
 		minor,
 	}) = opened
 	else {
@@ -305,6 +331,7 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 					params,
 					client,
 					backend,
+					slot,
 					home,
 					pid,
 					key.clone(),

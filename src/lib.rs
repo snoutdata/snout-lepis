@@ -15,6 +15,7 @@ pub mod cron;
 pub mod ddl;
 pub mod follow;
 pub mod frame;
+pub mod gate;
 pub mod guard;
 pub mod hash;
 pub mod join;

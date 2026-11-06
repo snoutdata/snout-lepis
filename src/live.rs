@@ -39,6 +39,12 @@ const RETRY: Duration = Duration::from_secs(2);
 /// (`ops::transfer::wait_acks`).
 pub const ROUTER_FRESH: Duration = Duration::from_secs(15);
 
+/// How long a row of `lepis.router` stays once its heartbeat has stopped, for `/v1/status` to show
+/// it as not heard from. A remade router leaves one behind under a new id for good otherwise.
+/// Removing it is safe at any age past ROUTER_FRESH: a cutover no longer counts that router, which
+/// has already stopped routing, and a router that comes back writes its row again.
+const ROUTER_FORGOTTEN_AFTER: Duration = Duration::from_secs(3600);
+
 /// How long a router goes on routing by its catalog after it last heard from the home node,
 /// unless `LEPIS_CATALOG_MAX_AGE_MS` says otherwise (`Freshness`).
 ///
@@ -267,12 +273,29 @@ async fn watch_once(app: &Arc<App>, id: &str) -> Result<(), String> {
 			app.set_catalog(fresh);
 		}
 		app.freshness.heard(sent);
+		let mut moved = forget_gone_routers(&mut b).await;
 		// The ack: this router now routes with this epoch.
-		if heartbeat(app, &mut b, id, app.catalog().map_or(0, |c| c.epoch)).await {
+		moved |= heartbeat(app, &mut b, id, app.catalog().map_or(0, |c| c.epoch)).await;
+		if moved {
+			notified = true;
 			continue;
 		}
 		notified = wait(&mut b).await?;
 	}
+}
+
+/// Removes the rows of routers long gone, once per catalog read. Its own statement, so a role that
+/// may not delete keeps its heartbeat. Returns whether a notification arrived while it ran.
+async fn forget_gone_routers(b: &mut Conn) -> bool {
+	let sql = format!(
+		"delete from lepis.router where seen_at < now() - interval '{} seconds'",
+		ROUTER_FORGOTTEN_AFTER.as_secs()
+	);
+	let mut notified = false;
+	if let Err(e) = exchange(b, &sql, &mut notified).await {
+		tracing::debug!("forgetting gone routers: {e}");
+	}
+	notified
 }
 
 /// Waits for a notification (true) or the heartbeat interval (false).

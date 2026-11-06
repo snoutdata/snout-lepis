@@ -58,6 +58,37 @@ async fn transaction_pooling_is_the_default_and_session_is_a_choice() {
 	clear_settings(&b).await;
 }
 
+/// A router gone for an hour leaves `lepis.router`; one gone for less stays, to be shown as not
+/// heard from, and the running router keeps its own row.
+#[tokio::test]
+async fn a_router_long_gone_leaves_the_list() {
+	let b = need_bed!();
+	let home = connect(&b.home, "postgres", "x").await;
+	home.batch_execute(
+		"insert into lepis.router (id, epoch, seen_at) values
+			('gone-for-two-hours', 1, now() - interval '2 hours'),
+			('gone-for-five-minutes', 1, now() - interval '5 minutes')
+		on conflict (id) do update set seen_at = excluded.seen_at",
+	)
+	.await
+	.unwrap();
+	let _lepis = start_lepis(&b).await;
+	tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+	let ids: Vec<String> = home
+		.query("select id from lepis.router", &[])
+		.await
+		.unwrap()
+		.iter()
+		.map(|r| r.get(0))
+		.collect();
+	assert!(!ids.iter().any(|i| i == "gone-for-two-hours"), "{ids:?}");
+	assert!(ids.iter().any(|i| i == "gone-for-five-minutes"), "{ids:?}");
+	assert!(ids.iter().any(|i| !i.starts_with("gone-")), "{ids:?}");
+	home.batch_execute("delete from lepis.router where id = 'gone-for-five-minutes'")
+		.await
+		.unwrap();
+}
+
 async fn clear_settings(b: &Bed) {
 	connect(&b.home, "postgres", "x")
 		.await

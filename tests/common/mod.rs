@@ -330,7 +330,13 @@ pub async fn distribute(b: &Bed) {
 }
 
 pub async fn start_lepis(b: &Bed) -> String {
-	let config: HashMap<String, String> = [
+	start_lepis_with(b, &[]).await
+}
+
+/// A router with more of its settings named.
+#[allow(dead_code)]
+pub async fn start_lepis_with(b: &Bed, more: &[(&str, &str)]) -> String {
+	let mut config: HashMap<String, String> = [
 		("LEPIS_HOME", b.home.clone()),
 		("LEPIS_HOME_SSLMODE", "disable".into()),
 		("LEPIS_SERVICE_USER", "postgres".into()),
@@ -339,6 +345,9 @@ pub async fn start_lepis(b: &Bed) -> String {
 	.into_iter()
 	.map(|(k, v)| (k.to_string(), v))
 	.collect();
+	for (k, v) in more {
+		config.insert(k.to_string(), v.to_string());
+	}
 	let app = App::new(Config::from_map(&config).expect("config")).expect("app");
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let address = listener.local_addr().unwrap().to_string();

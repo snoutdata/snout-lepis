@@ -316,6 +316,8 @@ routers can run with the same five lines.
 | `LEPIS_ADMIN_ADDR` | none: no admin API | | `host:port` for the admin API (HTTP and JSON, what `snoutdata cluster` calls). Off loopback it needs `LEPIS_TLS_CERT`, and is then HTTPS with that certificate; plain HTTP is refused anywhere but loopback |
 | `LEPIS_ADMIN_TOKEN` | required with `LEPIS_ADMIN_ADDR` | yes | the bearer token every admin call but `/v1/health` must send; at least 16 characters |
 | `LEPIS_MAX_CLIENTS` | `1000` | | connections over this are closed at once, not queued |
+| `LEPIS_POOL_SIZE` | `80` | | connections this router may hold on each node in transaction mode, `0` for no limit; a client past it waits its turn |
+| `LEPIS_QUEUE_WAIT_MS` | `30000` | | how long a client waits its turn for a connection, then a FATAL `53300` |
 | `LEPIS_CATALOG_MAX_AGE_MS` | `10000` | | how long the router routes by its catalog after it last heard from the home node. Past it, a statement that reads or writes a table is refused with SQLSTATE `57P03` until the home answers again, since a router that cannot reach the home cannot learn that a range moved. Must be under 15000, the heartbeat age past which a move stops waiting for a router; `0` turns the limit off |
 | `LEPIS_LOG` | `info` | | a `tracing` filter: `warn`, `debug`, `lepis=debug,info`, … |
 

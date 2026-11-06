@@ -144,6 +144,11 @@ pub struct Config {
 	/// Returns one row with one column, the role's `rolpassword`, for `$1` = the role name.
 	pub verifier_query: String,
 	pub max_clients: usize,
+	/// Connections this router may hold on one node in transaction mode (`LEPIS_POOL_SIZE`, 80 by
+	/// default; 0 for no limit). Several routers on one cluster each hold this many (`gate.rs`).
+	pub pool_size: usize,
+	/// How long a client waits for one of them (`LEPIS_QUEUE_WAIT_MS`, 30 s by default).
+	pub queue_wait: Duration,
 	/// How long the router routes by its catalog after it last heard from the home node; zero
 	/// for no limit (live.rs `Freshness`).
 	pub catalog_max_age: Duration,
@@ -254,6 +259,19 @@ impl Config {
 				.parse()
 				.map_err(|_| ConfigError(format!("LEPIS_MAX_CLIENTS: {v}")))?,
 		};
+		let pool_size = match get("LEPIS_POOL_SIZE") {
+			None => 80,
+			Some(v) => v
+				.parse()
+				.map_err(|_| ConfigError(format!("LEPIS_POOL_SIZE: {v}")))?,
+		};
+		let queue_wait = match get("LEPIS_QUEUE_WAIT_MS") {
+			None => Duration::from_secs(30),
+			Some(v) => Duration::from_millis(
+				v.parse()
+					.map_err(|_| ConfigError(format!("LEPIS_QUEUE_WAIT_MS: {v}")))?,
+			),
+		};
 		let session_roles = get("LEPIS_SESSION_ROLES")
 			.map_or_else(|| "authenticator".to_string(), |v| v.to_string())
 			.split(',')
@@ -328,6 +346,8 @@ impl Config {
 			verifier_query: get("LEPIS_VERIFIER_QUERY")
 				.unwrap_or_else(|| DEFAULT_VERIFIER_QUERY.into()),
 			max_clients,
+			pool_size,
+			queue_wait,
 			catalog_max_age,
 			session_roles,
 			catalog,
