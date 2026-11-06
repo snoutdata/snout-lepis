@@ -940,7 +940,7 @@ impl Router {
 		params: &[ParamValue],
 	) -> Option<route::Refusal> {
 		for (si, s) in stmts.iter().enumerate() {
-			if self.settings.transaction_pool
+			if self.pooled()
 				&& let Some(what) = s.session_bound
 			{
 				return Some(route::Refusal {
@@ -1838,8 +1838,9 @@ impl Router {
 				begin: None,
 				join: false,
 			}),
-			(None, None) if !data && !tx_verbs.is_empty() && sessions.is_empty() => {
-				// Only transaction control, with no node yet: Lepis answers.
+			(None, None) if statements == 0 && !data && !tx_verbs.is_empty() && sessions.is_empty() => {
+				// Only transaction control, with no node yet: Lepis answers. Not a statement that
+				// names no table, in the batch with its BEGIN (pgJDBC's way): that has rows to return.
 				Ok(Plan::Local { tx_verbs })
 			}
 			(None, None) => {
@@ -5482,8 +5483,7 @@ fn bind_portal(
 // ---------------------------------------------------------------------------------------------
 // Transaction pooling, and the cluster's settings.
 //
-// In session mode (the default) a client keeps its node sessions for as long as it is connected,
-// as with one Postgres. With the cluster setting `pool_mode` = `transaction`, a client holds node
+// In transaction mode (the default) a client holds node
 // sessions only while a transaction (or an unfinished batch) needs them: whenever it is idle
 // they go back to a pool per (node, role), and the next statement takes one from there (the
 // one this client left, when it is still there), or connects. A backend another session left is
@@ -5491,12 +5491,14 @@ fn bind_portal(
 // backend it lands on: its startup parameters, its SETs (the same replay a new node gets) and its
 // prepared statements (parsed again where they are missing, as on any node). What cannot be put
 // back (LISTEN, a temporary table, a cursor WITH HOLD, SQL PREPARE, a session advisory lock,
-// LOAD) is refused in transaction mode, with the setting named.
+// LOAD) is refused in transaction mode, with the setting named. With the cluster setting
+// `pool_mode` = `session`, a client keeps its node sessions for as long as it is connected, as with
+// one Postgres, and each client holds a backend on every node it has touched.
 
 /// The cluster's settings the router reads (`lepis.cluster.settings`, a JSON object).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-	/// `pool_mode` = `transaction`.
+	/// `pool_mode` is not `session`.
 	pub transaction_pool: bool,
 	/// `route_claim`: the JWT claim (in `request.jwt.claims`) that holds a transaction's shard key.
 	pub route_claim: Option<String>,
@@ -5506,6 +5508,18 @@ pub struct Settings {
 	pub read_replicas: std::collections::BTreeMap<String, replica::Replica>,
 	/// The cluster's `join_*` caps (join.rs), as they were set.
 	pub join: serde_json::Value,
+}
+
+impl Default for Settings {
+	fn default() -> Settings {
+		Settings {
+			transaction_pool: true,
+			route_claim: None,
+			route_claim_keyspace: None,
+			read_replicas: Default::default(),
+			join: serde_json::Value::Null,
+		}
+	}
 }
 
 impl Settings {
@@ -5518,7 +5532,7 @@ impl Settings {
 				.map(str::to_string)
 		};
 		Settings {
-			transaction_pool: s("pool_mode").as_deref() == Some("transaction"),
+			transaction_pool: s("pool_mode").as_deref() != Some("session"),
 			route_claim: s("route_claim"),
 			route_claim_keyspace: s("route_claim_keyspace"),
 			read_replicas: replica::from_settings(v.get("read_replicas")),
@@ -5580,7 +5594,7 @@ pub(crate) mod settings {
 	/// The cluster's settings. A reading is shared by every session of the process for a
 	/// second; then the first session to ask reads them again (over the connection the last
 	/// reading kept) while the others go on with the reading they have. A cluster without the
-	/// column, or a home node that does not answer, has the defaults.
+	/// column has the defaults, and a home node that does not answer leaves the last reading.
 	pub async fn get(app: &Arc<App>) -> Arc<Settings> {
 		let key = format!("{}/{}", app.config.home(), app.config.service.database);
 		let conn = {
@@ -5619,8 +5633,12 @@ pub(crate) mod settings {
 		if fresh.is_none() {
 			conn = None;
 		}
-		let settings = Arc::new(fresh.unwrap_or_default());
+		// A home that does not answer changes nothing: a session-mode cluster stays one through a failover.
 		let mut c = cache().lock().expect("settings");
+		let settings = match fresh {
+			Some(s) => Arc::new(s),
+			None => c.get(&key).map(|e| e.settings.clone()).unwrap_or_default(),
+		};
 		c.insert(
 			key,
 			Entry {
@@ -5691,6 +5709,11 @@ pub fn pooled(node: &str, role: &str) -> usize {
 }
 
 impl Router {
+	/// Whether this client's sessions are pooled: the cluster's setting, and not a role that keeps its own.
+	fn pooled(&self) -> bool {
+		self.settings.transaction_pool && !self.app.config.session_roles.contains(&self.role)
+	}
+
 	fn pool_key(&self, node: NodeId) -> Option<pool::Key> {
 		let n = self.node_of(node)?;
 		Some((
@@ -5702,7 +5725,7 @@ impl Router {
 	/// Whether every node session can go back to the pool now: nothing in flight or waiting, no
 	/// transaction, no COPY.
 	fn can_release(&self) -> bool {
-		self.settings.transaction_pool
+		self.pooled()
 			&& !self.conns.is_empty()
 			&& self.inflight.is_empty()
 			&& self.queued.is_empty()
@@ -5764,7 +5787,7 @@ impl Router {
 	/// A backend from the pool, set up as this client's: its startup parameters first (DISCARD
 	/// ALL put the pooled backend's own back).
 	async fn take_pooled(&mut self, node: NodeId) -> Result<bool, WireError> {
-		if !self.settings.transaction_pool {
+		if !self.pooled() {
 			return Ok(false);
 		}
 		let Some(key) = self.pool_key(node) else {

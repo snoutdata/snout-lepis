@@ -673,6 +673,9 @@ mod tests {
 			shown,
 			json!({"pool_mode": "transaction", "route_claim": "tenant_id", "route_claim_keyspace": null, "read_replicas": {}})
 		);
+		// Transaction pooling unless the cluster chose session.
+		assert_eq!(router_settings_json(&json!({}))["pool_mode"], "transaction");
+		assert_eq!(router_settings_json(&json!({"pool_mode": "session"}))["pool_mode"], "session");
 		let shown = router_settings_json(
 			&json!({"read_replicas": {"n2": {"host": "h", "port": 6432, "sslmode": "require"}}}),
 		);

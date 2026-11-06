@@ -147,6 +147,10 @@ pub struct Config {
 	/// How long the router routes by its catalog after it last heard from the home node; zero
 	/// for no limit (live.rs `Freshness`).
 	pub catalog_max_age: Duration,
+	/// Roles whose clients keep their sessions whatever `pool_mode` says (`LEPIS_SESSION_ROLES`,
+	/// comma separated; the data API's `authenticator` by default): PostgREST pools for itself and
+	/// LISTENs for its schema reloads.
+	pub session_roles: Vec<String>,
 	/// Whether the router reads the home's catalog and does what goes with it: routing by it,
 	/// in-doubt recovery and the job runner (`LEPIS_CATALOG`, `on` by default). `off` is a copy's
 	/// router (Metis Phase 10): every session relayed to the home as it is, nothing of `lepis` read,
@@ -250,6 +254,13 @@ impl Config {
 				.parse()
 				.map_err(|_| ConfigError(format!("LEPIS_MAX_CLIENTS: {v}")))?,
 		};
+		let session_roles = get("LEPIS_SESSION_ROLES")
+			.map_or_else(|| "authenticator".to_string(), |v| v.to_string())
+			.split(',')
+			.map(str::trim)
+			.filter(|role| !role.is_empty())
+			.map(str::to_string)
+			.collect();
 		let catalog_max_age = match get("LEPIS_CATALOG_MAX_AGE_MS") {
 			None => crate::live::DEFAULT_CATALOG_MAX_AGE,
 			Some(v) => {
@@ -318,6 +329,7 @@ impl Config {
 				.unwrap_or_else(|| DEFAULT_VERIFIER_QUERY.into()),
 			max_clients,
 			catalog_max_age,
+			session_roles,
 			catalog,
 		})
 	}

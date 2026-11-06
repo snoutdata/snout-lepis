@@ -280,13 +280,18 @@ async fn serve(app: Arc<App>, tcp: TcpStream, limit: Duration) -> Result<(), Wir
 	}
 	opening.extend_from_slice(&wire::backend_key_data(pid, &key).encode());
 	opening.extend_from_slice(&backend.ready.encode());
-	// The cluster's database with a catalog that distributes something goes through the
-	// router (Phase 1); anything else is relayed as it is (Phase 0).
+	// The cluster's database goes through the router (Phase 1) when its catalog distributes
+	// something, or when this client is pooled, whatever the catalog holds; anything else is
+	// relayed as it is (Phase 0).
 	let database = Startup::param(&params, "database")
 		.unwrap_or(&user)
 		.to_string();
+	let pooled = !app.config.session_roles.contains(&user)
+		&& crate::router::settings::get(&app).await.transaction_pool;
 	let routed = app.catalog().filter(|c| {
-		!c.relations.is_empty() && c.home().is_some() && database == app.config.service.database
+		(pooled || !c.relations.is_empty())
+			&& c.home().is_some()
+			&& database == app.config.service.database
 	});
 	let relayed = async {
 		wire::write_all(&mut client, &opening).await?;

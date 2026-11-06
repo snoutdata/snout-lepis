@@ -22,6 +22,42 @@ async fn setting(b: &Bed, name: &str, value: &str) {
 	tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
 }
 
+/// A cluster with no setting pools by transaction; `session` keeps what a client's session holds.
+#[tokio::test]
+async fn transaction_pooling_is_the_default_and_session_is_a_choice() {
+	let b = need_bed!();
+	clear_settings(&b).await;
+	let lepis = start_lepis(&b).await;
+	let a = connect_as(&lepis, "default-mode").await;
+	assert_eq!(code(&a, "listen somewhere").await, "0A000", "LISTEN under the default");
+
+	// A statement that names no table, in one batch with its BEGIN, is run and answered.
+	assert_eq!(one(&a, "begin; select 'answered'").await, "answered");
+	a.batch_execute("rollback").await.unwrap();
+
+	// A role that keeps its session whatever the setting: the data API's, which LISTENs.
+	connect(&b.home, "postgres", "x")
+		.await
+		.batch_execute("drop role if exists authenticator; create role authenticator login password 'app-pw'; grant usage on schema oracle to authenticator")
+		.await
+		.unwrap();
+	connect(&lepis, "authenticator", "app-pw")
+		.await
+		.batch_execute("listen pgrst")
+		.await
+		.unwrap();
+
+	setting(&b, "pool_mode", "\"session\"").await;
+	let a = connect_as(&lepis, "session-mode").await;
+	a.batch_execute("listen somewhere").await.unwrap();
+	a.batch_execute("select pg_advisory_lock(42)").await.unwrap();
+	a.batch_execute("create temp table kept (x int); insert into kept values (1)")
+		.await
+		.unwrap();
+	assert_eq!(one(&a, "select count(*)::text from kept").await, "1");
+	clear_settings(&b).await;
+}
+
 async fn clear_settings(b: &Bed) {
 	connect(&b.home, "postgres", "x")
 		.await

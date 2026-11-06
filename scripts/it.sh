@@ -27,9 +27,12 @@ ref="$run-ref"
 cluster=("$run-c1" "$run-c2" "$run-c3")
 # The home node's streaming standby, the read replica of tests/cluster_replica.rs.
 replica="$run-c1r"
+# The one-node cluster pgJDBC goes through.
+jdbc_home="$run-jdbc"
+jdbc_router="$run-jdbc-router"
 
 cleanup() {
-	"$engine" rm -fv "$pg" "$ref" "$router" "$replica" "${cluster[@]}" >/dev/null 2>&1 || true
+	"$engine" rm -fv "$pg" "$ref" "$router" "$replica" "$jdbc_home" "$jdbc_router" "${cluster[@]}" >/dev/null 2>&1 || true
 	"$engine" network rm "$net" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -90,6 +93,13 @@ if [ -n "${LEPIS_IT_SKIP_PSQL:-}" ]; then
 	exit 0
 fi
 
+# What the checks below connect as and read, here too when LEPIS_IT_ONLY skipped the tests that make it.
+"$engine" exec "$pg" psql -U postgres -q -c "do \$\$ begin
+	if not exists (select from pg_roles where rolname = 'lepis_app') then
+		create role lepis_app login password 'app-pw';
+	end if;
+end \$\$" >&2
+
 # The router as a process, for psql. A self-signed certificate makes TLS testable.
 echo "== psql through the router" >&2
 STACK_DEV_ARGS="-d --name $router --network $net -e LEPIS_HOME=$pg:5432 -e LEPIS_HOME_SSLMODE=disable \
@@ -143,5 +153,39 @@ if [ "$major" -ge 18 ]; then
 		| grep -i 'protocol version' | grep -o '3\.[0-9]' || true)"
 	check "protocol 3.2" "3.2" "$got"
 fi
+
+# The real pgJDBC, in the router's default transaction mode (PgjdbcCheck.java says what it checks),
+# through a one-node cluster whose catalog distributes nothing, which is pooled like any other.
+pgjdbc_version=42.7.4
+echo "== pgJDBC ${pgjdbc_version} through a cluster's router" >&2
+"$engine" run -d --name "$jdbc_home" --network "$net" -e POSTGRES_PASSWORD=x \
+	-e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
+	"docker.io/library/postgres:$major" -c password_encryption=scram-sha-256 -c max_prepared_transactions=64 -c max_connections=200 >/dev/null
+for _ in 1 2; do
+	until "$engine" exec "$jdbc_home" psql -U postgres -Atc 'select 1' >/dev/null 2>&1; do sleep 1; done
+	sleep 2
+done
+cat "$here/../src/catalog.sql" "$here/../src/catalog_2pc.sql" "$here/../src/catalog_jobs.sql" "$here/../src/catalog_cron.sql" \
+	| "$engine" exec -i "$jdbc_home" psql -U postgres -q -v ON_ERROR_STOP=1 >/dev/null
+"$engine" exec "$jdbc_home" psql -U postgres -q -v ON_ERROR_STOP=1 \
+	-c "insert into lepis.node (id, name, host, port, dbname, sslmode, kind, state) values (1, 'n1', '$jdbc_home', 5432, 'postgres', 'disable', 'home', 'active')" \
+	-c "create role lepis_app login password 'app-pw'" \
+	-c "create table pgjdbc_check (id int primary key, v text)" \
+	-c "grant all on pgjdbc_check to lepis_app" \
+	-c "select lepis.bump()" >/dev/null
+STACK_DEV_ARGS="-d --name $jdbc_router --network $net -e LEPIS_HOME=$jdbc_home:5432 -e LEPIS_HOME_SSLMODE=disable \
+-e LEPIS_SERVICE_USER=postgres -e LEPIS_SERVICE_PASSWORD=x" bash "$stack/scripts/dev.sh" bash -c '
+	cargo build -q --release -p snout-lepis && exec /cache/target/release/snout-lepis' >/dev/null
+until "$engine" logs "$jdbc_router" 2>&1 | grep -q "snout-lepis listening"; do
+	if ! "$engine" ps -q -f "name=$jdbc_router" | grep -q .; then
+		"$engine" logs "$jdbc_router" >&2 || true
+		echo "the cluster's router did not start" >&2
+		exit 1
+	fi
+	sleep 1
+done
+"$engine" run --rm --network "$net" -v "$here/PgjdbcCheck.java:/check/PgjdbcCheck.java:ro" eclipse-temurin:21-jdk bash -c \
+	"curl -fsSL -o /tmp/postgresql.jar https://repo1.maven.org/maven2/org/postgresql/postgresql/${pgjdbc_version}/postgresql-${pgjdbc_version}.jar \
+	&& java -cp /tmp/postgresql.jar /check/PgjdbcCheck.java $jdbc_router 5432 lepis_app app-pw postgres" >&2 || fail=1
 
 exit "$fail"
