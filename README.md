@@ -6,7 +6,7 @@ sees one database. Underneath, its large tables are split by a shard key across 
 **nodes**); the router sends each statement to the node that holds its rows, and moves, splits
 and merges that data online.
 
-The nodes are stock Postgres 17 or 18, anywhere: your own machines, a managed service, a
+The nodes are stock Postgres 17, 18, or 19, anywhere: your own machines, a managed service, a
 laptop. Nothing is installed in them. What Lepis needs inside a node is plain SQL it can write
 itself: a schema for its catalog on one node, and a CHECK constraint per sharded table on each.
 
